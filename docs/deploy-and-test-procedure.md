@@ -1,5 +1,11 @@
 # Deploy and test procedure
 
+Terse checklist for someone who already knows the ground. For a full walkthrough
+see [INSTALL.md](../INSTALL.md).
+
+Note: the crate is still named `tricore-panel` internally, so the build artefact
+filename below is correct and unchanged by the rebrand to Trinity Panel.
+
 ## 1. Build release WASM
 from the repo root run:
 - cargo build --target wasm32-unknown-unknown --release

@@ -57,6 +57,7 @@ npm-debug.log*
 yarn-error.log*
 .pnpm-store/
 Cargo.lock.bak
+*.bak
 **/*.rs.bk
 .rustc_info.json
 

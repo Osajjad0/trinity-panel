@@ -1,12 +1,16 @@
 # Documentation Index
 
-A Cloudflare-hosted proxy panel with an XHTTP-first transport layer and a config translation
-layer that emits Xray, sing-box and mihomo configurations from one source of truth.
+Trinity Panel — a Cloudflare-hosted proxy panel with an XHTTP-first transport layer
+and a config translation layer that emits Xray, sing-box and mihomo configurations
+from one source of truth.
 
 ## Start here
 
 | Document | Contents |
 |---|---|
+| **[README](../README.md)** | What Trinity Panel is, the honest feature list, architecture overview, and the quick start |
+| **[INSTALL](../INSTALL.md)** | Beginner-friendly installation: prerequisites, the wasm-bindgen version trap, Cloudflare token creation, every binding explained |
+| **[Known issues](../KNOWN_ISSUES.md)** | What is not working or not verified, and which limitations are deliberate |
 | **[Project state](PROGRESS.md)** | What is built, what is *proven* versus what merely compiles, every key decision and why, stage-by-stage status, and the toolchain quirks this machine needs. Kept current as work lands. |
 
 ## Research and design
@@ -18,12 +22,14 @@ layer that emits Xray, sing-box and mihomo configurations from one source of tru
 
 ## User documentation
 
-*Written as each stage completes.*
+| Document | Contents |
+|---|---|
+| [Installation and first deployment](../INSTALL.md) | Done — prerequisites through first client connection |
+| [Known issues](../KNOWN_ISSUES.md) | Done |
 
-- Installation and first deployment — pending
 - Every parameter, explained plainly — pending
 - Getting a subscription onto a phone — pending
-- Troubleshooting and FAQ — pending
+- Troubleshooting and FAQ — partly covered by [INSTALL §11](../INSTALL.md#11-troubleshooting)
 
 ## Developer documentation
 

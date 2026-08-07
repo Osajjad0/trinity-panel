@@ -120,7 +120,7 @@ pub async fn subscription(req: &Request, env: &Env, rest: &str) -> Result<Respon
     // Subscriptions are polled; a cached one hides an edit the user just made.
     headers.set("Cache-Control", "no-store")?;
     // What every subscription-aware client reads to name the profile.
-    headers.set("Profile-Title", target.name())?;
+    headers.set("Profile-Title", "Trinity Panel")?;
     set_download_name(headers, &rendered.filename, shape)?;
     Ok(out)
 }
