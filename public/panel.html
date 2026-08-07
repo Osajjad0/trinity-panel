@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Connection settings</title>
+<style>
+/* Everything is inline. The page is served from inside the Worker binary and a
+   deployment may upload no static assets at all, so a stylesheet or a font
+   fetched from anywhere else would simply be missing. */
+:root{
+  --bg:#f6f7f9; --panel:#fff; --ink:#1a1d21; --dim:#5d6470; --line:#dde1e7;
+  --accent:#2f6df6; --accent-ink:#fff; --ok:#12855b; --warn:#9a6700;
+  --bad:#c0392b; --fatal:#8e1f13; --chip:#eef1f5;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#14171c; --panel:#1b1f26; --ink:#e8eaed; --dim:#98a0ad; --line:#2c323c;
+    --accent:#5b8dff; --accent-ink:#0b1020; --ok:#3ecf8e; --warn:#e3b341;
+    --bad:#ff7b6b; --fatal:#ff9c8f; --chip:#232932;
+  }
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+a{color:var(--accent)}
+h1,h2,h3{line-height:1.25;margin:0 0 .4rem}
+h1{font-size:1.3rem} h2{font-size:1.05rem} h3{font-size:.95rem}
+p{margin:0 0 .7rem}
+.wrap{max-width:960px;margin:0 auto;padding:1rem}
+.card{
+  background:var(--panel); border:1px solid var(--line); border-radius:12px;
+  padding:1rem; margin-bottom:1rem;
+}
+.muted{color:var(--dim);font-size:.87rem}
+.row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+.spread{display:flex;justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap}
+button{
+  font:inherit; padding:.45rem .8rem; border-radius:8px; cursor:pointer;
+  border:1px solid var(--line); background:var(--panel); color:var(--ink);
+}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+button.danger{color:var(--bad)}
+button:disabled{opacity:.5;cursor:not-allowed}
+input,select,textarea{
+  font:inherit; width:100%; padding:.45rem .6rem; border-radius:8px;
+  border:1px solid var(--line); background:var(--bg); color:var(--ink);
+}
+textarea{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.82rem;min-height:9rem}
+input[type=checkbox]{width:auto}
+label{display:block;font-weight:600;margin-bottom:.15rem}
+code,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.85rem;word-break:break-all}
+.tabs{display:flex;gap:.4rem;margin-bottom:1rem;flex-wrap:wrap}
+.tabs button[aria-selected=true]{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+.chip{
+  display:inline-block;padding:.1rem .45rem;border-radius:999px;
+  background:var(--chip);font-size:.75rem;color:var(--dim);
+}
+.sev-degraded,.sev-untranslatable{color:var(--warn)}
+.sev-broken{color:var(--bad)} .sev-fatal{color:var(--fatal)}
+.ok{color:var(--ok)}
+.grid{display:grid;gap:.8rem;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
+.field{margin-bottom:.9rem}
+.field .help{color:var(--dim);font-size:.83rem;margin:.2rem 0 .35rem}
+.finding{border-left:3px solid var(--line);padding:.15rem 0 .15rem .6rem;margin:.35rem 0}
+.finding.sev-broken,.finding.sev-fatal{border-color:var(--bad)}
+.finding.sev-degraded,.finding.sev-untranslatable{border-color:var(--warn)}
+details summary{cursor:pointer}
+table{border-collapse:collapse;width:100%;font-size:.87rem}
+th,td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid var(--line);vertical-align:top}
+.qr{background:#fff;padding:.4rem;border-radius:8px;width:190px;height:190px}
+.hidden{display:none}
+.split{display:grid;gap:1rem;grid-template-columns:220px 1fr}
+@media (max-width:760px){.split{grid-template-columns:1fr}}
+.nodelist button{width:100%;text-align:left;margin-bottom:.3rem}
+.nodelist button[aria-current=true]{border-color:var(--accent)}
+.toast{
+  position:fixed;left:50%;bottom:1rem;transform:translateX(-50%);
+  background:var(--ink);color:var(--bg);padding:.5rem .9rem;border-radius:8px;
+  font-size:.87rem;opacity:0;transition:opacity .2s;pointer-events:none;
+}
+.toast.show{opacity:1}
+.banner{border:1px solid var(--warn);border-radius:8px;padding:.6rem .8rem;margin-bottom:1rem}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <!-- Sign in ------------------------------------------------------------- -->
+  <section id="signin" class="card hidden" style="max-width:420px;margin:12vh auto">
+    <h1>Sign in</h1>
+    <p class="muted">This panel can read every credential this deployment serves.</p>
+    <form id="signin-form">
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button class="primary" type="submit">Sign in</button>
+      <p id="signin-error" class="sev-broken" role="alert"></p>
+    </form>
+  </section>
+
+  <!-- Panel ---------------------------------------------------------------- -->
+  <main id="app" class="hidden">
+    <div class="spread" style="margin-bottom:1rem">
+      <div>
+        <h1>Connection settings</h1>
+        <div class="muted mono" id="host"></div>
+      </div>
+      <button id="signout">Sign out</button>
+    </div>
+
+    <div id="banner"></div>
+
+    <nav class="tabs" role="tablist">
+      <button role="tab" id="tab-simple" aria-selected="true">Get connected</button>
+      <button role="tab" id="tab-advanced" aria-selected="false">Advanced</button>
+    </nav>
+
+    <!-- Simple ------------------------------------------------------------- -->
+    <section id="view-simple">
+      <div class="card">
+        <h2>Two steps</h2>
+        <p>Find your app below, copy its link, and paste it into the app's
+           subscription or profile screen. Everything else on this page is
+           optional.</p>
+        <p class="muted" id="source-note"></p>
+      </div>
+      <div id="clients" class="grid"></div>
+
+      <details class="card">
+        <summary><strong>Add one server by hand instead</strong></summary>
+        <p class="muted">Some apps take a single link rather than a subscription.
+           Each connection below is shown as its own link, in the form the app
+           you pick expects.</p>
+        <div class="field" style="max-width:320px">
+          <label for="link-client">Show links for</label>
+          <select id="link-client"></select>
+        </div>
+        <div id="links"></div>
+      </details>
+    </section>
+
+    <!-- Advanced ----------------------------------------------------------- -->
+    <section id="view-advanced" class="hidden">
+      <div class="card">
+        <div class="spread">
+          <div>
+            <h2>Advanced</h2>
+            <p class="muted" style="margin:0">Every setting, what it does, and
+               which of your apps can actually use it. Options that cannot work
+               are switched off with the reason attached.</p>
+          </div>
+          <div class="row">
+            <button id="add-node">Add connection</button>
+            <button id="save" class="primary" disabled>Save</button>
+          </div>
+        </div>
+        <p id="save-note" class="muted" style="margin:.6rem 0 0"></p>
+      </div>
+
+      <div class="split">
+        <aside>
+          <div class="card">
+            <h3>Connections</h3>
+            <div id="nodelist" class="nodelist"></div>
+          </div>
+        </aside>
+
+        <div>
+          <div class="card">
+            <div class="field" style="max-width:320px">
+              <label for="editor-client">Checking against</label>
+              <div class="help">Pick the app you actually use. The warnings and
+                 the disabled options below are that app's, not a generic list.</div>
+              <select id="editor-client"></select>
+            </div>
+            <div id="findings"></div>
+          </div>
+
+          <div class="card">
+            <h3>Settings</h3>
+            <div id="controls"></div>
+            <div class="row" style="margin-top:.6rem">
+              <button id="delete-node" class="danger">Delete this connection</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>What each app does with this connection</h3>
+            <p class="muted">One connection, described once. This is what each
+               app would actually receive.</p>
+            <table id="matrix"></table>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Preview what an app receives</h3>
+        <div class="row" style="margin-bottom:.6rem">
+          <div style="min-width:200px;flex:1"><select id="export-client"></select></div>
+          <div style="min-width:200px;flex:1">
+            <select id="export-shape">
+              <option value="base64">Subscription body (what the URL returns)</option>
+              <option value="links">Share links, one per line</option>
+              <option value="config">Full configuration file</option>
+            </select>
+          </div>
+          <button id="export-run">Show</button>
+          <button id="export-copy">Copy</button>
+        </div>
+        <div id="export-note" class="muted"></div>
+        <textarea id="export-body" readonly spellcheck="false"></textarea>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+// The panel lives under a secret prefix, so every request is built from the
+// path this page was served on rather than from a hardcoded root.
+const BASE = location.pathname.replace(/\/+$/, "");
+const api = (p) => `${BASE}/api/${p}`;
+
+let STATE = null;      // last /api/state response
+let NODES = [];        // working copy; saved as a whole
+let CURRENT = 0;       // index into NODES
+let DIRTY = false;
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, kids = []) => {
+  const n = Object.assign(document.createElement(tag), props);
+  for (const k of [].concat(kids)) n.append(k);
+  return n;
+};
+
+function toast(message) {
+  const t = $("toast");
+  t.textContent = message;
+  t.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove("show"), 1800);
+}
+
+async function copy(text, what) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`${what} copied`);
+  } catch {
+    // Clipboard access is refused outside a secure context and in some
+    // embedded browsers. Selecting the text is a worse experience but one the
+    // user can still complete, which silence is not.
+    const box = el("textarea", { value: text, style: "position:fixed;opacity:0" });
+    document.body.append(box);
+    box.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    box.remove();
+    toast(ok ? `${what} copied` : "Copy it by hand — the browser refused");
+  }
+}
+
+function copyButton(text, what, label = "Copy") {
+  const b = el("button", { textContent: label });
+  b.onclick = () => copy(text, what);
+  return b;
+}
+
+// A QR toggle, used for both subscription links and single connections.
+function qrToggle(query, alt) {
+  const box = el("div", { style: "margin-top:.6rem" });
+  const btn = el("button", { textContent: "Show QR" });
+  btn.onclick = () => {
+    if (box.firstChild) {
+      box.textContent = "";
+      btn.textContent = "Show QR";
+      return;
+    }
+    box.append(el("img", { className: "qr", alt, src: api(`qr?${query}`) }));
+    btn.textContent = "Hide QR";
+  };
+  return { btn, box };
+}
+
+// ---- requests --------------------------------------------------------------
+
+async function send(path, options = {}) {
+  const res = await fetch(api(path), {
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  let body = null;
+  try { body = await res.json(); } catch { /* the decoy page, or no body */ }
+  if (!res.ok) throw new Error(body?.error || "That did not work.");
+  return body;
+}
+
+// ---- sign in ---------------------------------------------------------------
+
+$("signin-form").onsubmit = async (e) => {
+  e.preventDefault();
+  $("signin-error").textContent = "";
+  try {
+    await send("login", {
+      method: "POST",
+      body: JSON.stringify({ password: $("password").value }),
+    });
+    $("password").value = "";
+    await boot();
+  } catch (err) {
+    $("signin-error").textContent = err.message;
+  }
+};
+
+$("signout").onclick = async () => {
+  DIRTY = false;
+  try { await send("logout", { method: "POST" }); } catch { /* leaving anyway */ }
+  location.reload();
+};
+
+// ---- boot ------------------------------------------------------------------
+
+async function boot() {
+  try {
+    STATE = await send("state");
+  } catch {
+    $("app").classList.add("hidden");
+    $("signin").classList.remove("hidden");
+    $("password").focus();
+    return;
+  }
+  $("signin").classList.add("hidden");
+  $("app").classList.remove("hidden");
+
+  NODES = structuredClone(STATE.nodes);
+  CURRENT = 0;
+  DIRTY = false;
+  $("save").disabled = true;
+
+  $("host").textContent = STATE.host;
+  $("source-note").textContent = STATE.source === "derived"
+    ? "These are the connections this deployment was set up with. Saving in Advanced makes them yours to edit."
+    : "These are the connections you saved.";
+
+  const banner = $("banner");
+  banner.textContent = "";
+  if (STATE.warning) {
+    banner.append(el("div", { className: "banner sev-degraded", textContent: STATE.warning }));
+  }
+
+  fillClientSelects();
+  renderClients();
+  renderNodeList();
+  await renderEditor();
+}
+
+function fillClientSelects() {
+  for (const id of ["link-client", "editor-client", "export-client"]) {
+    const sel = $(id);
+    const keep = sel.value;
+    sel.textContent = "";
+    for (const c of STATE.clients) {
+      sel.append(el("option", { value: c.slug, textContent: c.name }));
+    }
+    if (keep) sel.value = keep;
+  }
+}
+
+// ---- simple view -----------------------------------------------------------
+
+function renderClients() {
+  const box = $("clients");
+  box.textContent = "";
+
+  for (const c of STATE.clients) {
+    const card = el("div", { className: "card" });
+    card.append(el("h3", { textContent: c.name }));
+    card.append(el("div", { className: "muted", textContent: `Runs ${c.core}` }));
+
+    if (!c.subscription) {
+      card.append(el("p", {
+        className: "sev-broken", style: "margin-top:.6rem",
+        textContent: "None of your connections work in this app.",
+      }));
+      card.append(skippedList(c.skipped));
+      box.append(card);
+      continue;
+    }
+
+    card.append(el("p", {
+      className: "mono", style: "margin:.6rem 0 .4rem", textContent: c.subscription,
+    }));
+
+    const qr = qrToggle(
+      `kind=sub&client=${encodeURIComponent(c.slug)}`,
+      `QR code for the ${c.name} subscription link`,
+    );
+    const row = el("div", { className: "row" }, [
+      copyButton(c.subscription, "Subscription link", "Copy link"),
+      qr.btn,
+    ]);
+    if (c.config) {
+      row.append(el("a", {
+        href: c.config, textContent: "Download config file",
+        className: "chip", style: "padding:.45rem .8rem",
+      }));
+    }
+    card.append(row);
+    card.append(qr.box);
+
+    card.append(el("div", {
+      className: "muted", style: "margin-top:.5rem",
+      textContent: `${c.included} of your ${STATE.nodes.length} connection(s) work here.`,
+    }));
+    card.append(skippedList(c.skipped));
+    box.append(card);
+  }
+}
+
+function skippedList(skipped) {
+  const wrap = el("div");
+  if (!skipped.length) return wrap;
+  const d = el("details", { style: "margin-top:.4rem" });
+  d.append(el("summary", {
+    className: "muted", textContent: `${skipped.length} left out — why?`,
+  }));
+  for (const s of skipped) {
+    d.append(el("div", { className: "finding sev-degraded" }, [
+      el("strong", { textContent: s.tag }),
+      el("div", { className: "muted", textContent: s.reason }),
+    ]));
+  }
+  wrap.append(d);
+  return wrap;
+}
+
+$("link-client").onchange = renderLinks;
+
+function renderLinks() {
+  const slug = $("link-client").value;
+  const box = $("links");
+  box.textContent = "";
+
+  for (const view of STATE.views) {
+    const link = view.links.find((l) => l.client === slug);
+    const card = el("div", { className: "card" });
+    card.append(el("div", { className: "spread" }, [
+      el("strong", { textContent: view.tag }),
+      el("span", { className: "chip", textContent: `${view.protocol} over ${view.transport}` }),
+    ]));
+
+    if (!link) {
+      card.append(el("p", {
+        className: "sev-broken", style: "margin:.5rem 0 0",
+        textContent: "This app cannot import this connection.",
+      }));
+      box.append(card);
+      continue;
+    }
+
+    card.append(el("p", { className: "mono", style: "margin:.5rem 0", textContent: link.uri }));
+    const qr = qrToggle(
+      `kind=node&client=${encodeURIComponent(slug)}&tag=${encodeURIComponent(view.tag)}`,
+      `QR code for ${view.tag}`,
+    );
+    card.append(el("div", { className: "row" }, [copyButton(link.uri, "Link"), qr.btn]));
+    card.append(qr.box);
+    box.append(card);
+  }
+}
+
+// ---- tabs ------------------------------------------------------------------
+
+function showTab(which) {
+  const simple = which === "simple";
+  $("tab-simple").setAttribute("aria-selected", String(simple));
+  $("tab-advanced").setAttribute("aria-selected", String(!simple));
+  $("view-simple").classList.toggle("hidden", !simple);
+  $("view-advanced").classList.toggle("hidden", simple);
+  if (simple) renderLinks();
+}
+$("tab-simple").onclick = () => showTab("simple");
+$("tab-advanced").onclick = () => showTab("advanced");
+
+// ---- editor ----------------------------------------------------------------
+
+function renderNodeList() {
+  const box = $("nodelist");
+  box.textContent = "";
+  NODES.forEach((node, i) => {
+    const b = el("button", { textContent: node.tag || "(unnamed)" });
+    b.setAttribute("aria-current", String(i === CURRENT));
+    b.onclick = async () => { CURRENT = i; renderNodeList(); await renderEditor(); };
+    box.append(b);
+  });
+  if (!NODES.length) {
+    box.append(el("p", { className: "muted", textContent: "No connections yet." }));
+  }
+}
+
+// Ask the server what this node looks like, optionally applying one edit first.
+// The server owns both the edit and the verdict, so what the editor disables
+// and what saving produces cannot drift apart — and this page never needs to
+// know how a connection is shaped internally.
+async function renderEditor(edit) {
+  const node = NODES[CURRENT];
+  if (!node) {
+    $("controls").textContent = "";
+    $("findings").textContent = "";
+    $("matrix").textContent = "";
+    return;
+  }
+
+  let result;
+  try {
+    result = await send("check", {
+      method: "POST",
+      body: JSON.stringify({ node, client: $("editor-client").value, edit: edit || null }),
+    });
+  } catch (err) {
+    toast(err.message);
+    return;
+  }
+
+  if (edit) {
+    NODES[CURRENT] = result.node;
+    markDirty();
+    renderNodeList();
+  }
+
+  renderFindings(result.findings);
+  renderControls(result.controls);
+  renderMatrix(result.matrix);
+}
+
+function markDirty() {
+  DIRTY = true;
+  $("save").disabled = false;
+  $("save-note").textContent = "Unsaved changes.";
+}
+
+function renderFindings(findings) {
+  const box = $("findings");
+  box.textContent = "";
+  if (!findings.length) {
+    box.append(el("p", { className: "ok", textContent: "No problems for this app." }));
+    return;
+  }
+  for (const f of findings) {
+    const d = el("details", { className: `finding sev-${f.severity}` });
+    d.append(el("summary", {}, [
+      el("strong", { textContent: f.summary }),
+      el("span", { className: "chip", style: "margin-left:.4rem", textContent: f.severity }),
+    ]));
+    d.append(el("div", { className: "muted", textContent: f.detail }));
+    box.append(d);
+  }
+}
+
+function renderControls(controls) {
+  const box = $("controls");
+  box.textContent = "";
+
+  for (const c of controls) {
+    const field = el("div", { className: "field" });
+    const id = `f-${c.field}`;
+    field.append(el("label", { htmlFor: id, textContent: c.label }));
+    field.append(el("div", { className: "help", textContent: c.help }));
+
+    let input;
+    if (c.kind === "select") {
+      input = el("select", { id });
+      for (const ch of c.choices) {
+        const opt = el("option", {
+          value: ch.value,
+          // The reason travels in the label as well as the tooltip. A disabled
+          // option a user cannot hover — on a phone — would otherwise be a dead
+          // end with no explanation.
+          textContent: ch.blocked ? `${ch.label} — ${ch.reason}` : ch.label,
+          disabled: ch.blocked,
+          title: ch.detail || "",
+        });
+        opt.selected = ch.value === c.current;
+        input.append(opt);
+      }
+      input.onchange = () => renderEditor({ field: c.field, value: input.value });
+    } else if (c.kind === "toggle") {
+      input = el("input", { id, type: "checkbox", checked: c.current === "true" });
+      input.onchange = () => renderEditor({ field: c.field, value: String(input.checked) });
+    } else {
+      input = el("input", {
+        id,
+        type: c.kind === "number" ? "number" : "text",
+        value: c.current,
+      });
+      // On change rather than on input: every edit is a round trip, and
+      // re-checking on each keystroke would be one request per character.
+      input.onchange = () => renderEditor({ field: c.field, value: input.value });
+    }
+    field.append(input);
+
+    // A caveat that does not block still belongs beside the control it is
+    // about, not only in the list above.
+    const note = c.choices.find((ch) => ch.value === c.current && ch.reason && !ch.blocked);
+    if (note) {
+      field.append(el("div", { className: "muted sev-degraded", textContent: note.reason }));
+    }
+    box.append(field);
+  }
+}
+
+function renderMatrix(matrix) {
+  const table = $("matrix");
+  table.textContent = "";
+  const head = el("tr");
+  for (const h of ["App", "Core", "Receives it", "Why not / caveats"]) {
+    head.append(el("th", { textContent: h }));
+  }
+  table.append(head);
+
+  for (const v of matrix) {
+    const tr = el("tr");
+    tr.append(el("td", { textContent: v.client }));
+    tr.append(el("td", { className: "muted", textContent: v.core }));
+    tr.append(el("td", {
+      className: v.exportable ? "ok" : "sev-broken",
+      textContent: v.exportable ? "yes" : "no",
+    }));
+    const why = el("td");
+    if (!v.findings.length) {
+      why.append(el("span", { className: "muted", textContent: "—" }));
+    }
+    for (const f of v.findings) {
+      why.append(el("div", { className: `sev-${f.severity}`, textContent: f.summary }));
+    }
+    tr.append(why);
+    table.append(tr);
+  }
+}
+
+$("editor-client").onchange = () => renderEditor();
+
+$("add-node").onclick = async () => {
+  const fresh = structuredClone(STATE.blank);
+  // Names identify a connection in every export, so a duplicate has to be
+  // avoided here rather than reported after the fact.
+  const base = fresh.tag;
+  let n = 1;
+  while (NODES.some((x) => x.tag === fresh.tag)) fresh.tag = `${base} ${++n}`;
+  NODES.push(fresh);
+  CURRENT = NODES.length - 1;
+  markDirty();
+  renderNodeList();
+  await renderEditor();
+};
+
+$("delete-node").onclick = async () => {
+  const node = NODES[CURRENT];
+  if (!node) return;
+  if (!confirm(`Delete "${node.tag}"? Anyone using it will lose that connection.`)) return;
+  NODES.splice(CURRENT, 1);
+  CURRENT = Math.max(0, CURRENT - 1);
+  markDirty();
+  renderNodeList();
+  await renderEditor();
+};
+
+$("save").onclick = async () => {
+  $("save").disabled = true;
+  const keep = CURRENT;
+  try {
+    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES }) });
+    if (body && body.ok && body.state) {
+      STATE = body.state;
+      NODES = structuredClone(STATE.nodes);
+      CURRENT = Math.min(keep, Math.max(0, NODES.length - 1));
+      renderNodeList();
+      await renderEditor();
+      renderClients();
+      showTab("advanced");
+      $("save-note").textContent = "Saved. Apps will pick this up the next time they refresh.";
+    } else {
+      DIRTY = false;
+      await boot();
+      CURRENT = Math.min(keep, Math.max(0, NODES.length - 1));
+      renderNodeList();
+      await renderEditor();
+      showTab("advanced");
+      $("save-note").textContent = "Saved. Apps will pick this up the next time they refresh.";
+    }
+  } catch (err) {
+    $("save-note").textContent = err.message;
+    $("save").disabled = false;
+  }
+};
+
+window.addEventListener("beforeunload", (e) => {
+  if (DIRTY) { e.preventDefault(); e.returnValue = ""; }
+});
+
+// ---- export preview --------------------------------------------------------
+
+$("export-run").onclick = async () => {
+  const client = encodeURIComponent($("export-client").value);
+  const shape = encodeURIComponent($("export-shape").value);
+  $("export-note").textContent = "";
+  try {
+    const out = await send(`export?client=${client}&shape=${shape}`);
+    $("export-body").value = out.body;
+    const skipped = out.skipped.map((s) => `${s.tag}: ${s.reason}`).join(" · ");
+    $("export-note").textContent =
+      `${out.filename} — ${out.included} connection(s) included` +
+      (skipped ? `. Left out — ${skipped}` : ".");
+  } catch (err) {
+    $("export-body").value = "";
+    $("export-note").textContent = err.message;
+  }
+};
+
+$("export-copy").onclick = () => {
+  const text = $("export-body").value;
+  if (text) copy(text, "Export"); else toast("Nothing to copy yet");
+};
+
+boot();
+</script>
+</body>
+</html>

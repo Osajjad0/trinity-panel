@@ -1,0 +1,56 @@
+[package]
+name = "tricore-panel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "XHTTP-first proxy panel for the Cloudflare Workers runtime with a three-core config translation layer"
+publish = false
+
+[lib]
+# cdylib is what wasm32-unknown-unknown links; rlib keeps the crate usable by
+# integration tests and the schema-dump binary that runs on the host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aes = { version = "0.8.4", default-features = false }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+# Zero-copy buffers for the relay hot path — cloning a `Bytes` bumps a
+# refcount rather than copying the payload, so forwarding never allocates.
+bytes = "1.12.1"
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+futures-channel = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
+futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
+hmac = { version = "0.12.1", default-features = false }
+md-5 = { version = "0.10.6", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = { version = "0.10.9", default-features = false }
+sha3 = { version = "0.10.9", default-features = false }
+tokio = { version = "1.53.1", features = ["io-util"] }
+
+[profile.release]
+# Size matters more than raw speed here: the module is instantiated on every
+# cold start, and the relay hot path is dominated by I/O wait, not by compute.
+# `opt-level = "s"` rather than "z" because "z" disables loop vectorisation,
+# which measurably hurts the AEAD paths in VMess and Shadowsocks-2022.
+opt-level = "s"
+lto = true
+codegen-units = 1
+# A panic inside a WASM isolate is unrecoverable and takes the connection with
+# it, so there is nothing to unwind for. Aborting removes the landing pads and
+# the formatting machinery they pull in.
+panic = "abort"
+strip = true
+
+[profile.release.package."*"]
+opt-level = "s"
+
+# The Workers SDK is pulled in only for the wasm target. That is what lets the
+# protocol parsers, the XHTTP wire layer and the conflict engine compile and
+# test on the host in milliseconds, with no WASM harness and no deployment.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = "0.8.5"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["io-util", "macros", "rt"] }

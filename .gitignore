@@ -1,0 +1,73 @@
+# ---- secrets & local environment ----
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.secret
+secrets.json
+.wrangler/
+.cloudflare/
+store.json
+
+# ---- build output ----
+dist/
+build/
+target/
+pkg/
+worker/
+*.wasm
+!docs/**/*.wasm
+
+# ---- test artifacts, benchmarks, generated configs ----
+/tmp/
+/tmp*
+tmp/
+temp/
+scratch/
+benchmarks/
+test-output/
+test-artifacts/
+generated-configs/
+captured/
+*.log
+*.pcap
+*.har
+
+# ---- core binaries (never commit; supplied by the operator) ----
+xray
+xray.exe
+sing-box
+sing-box.exe
+mihomo
+mihomo.exe
+mihomo-*.exe
+v2ray
+v2ray.exe
+*.dat
+!docs/**/*.dat
+geoip*
+geosite*
+cache.db
+
+# ---- language / tooling ----
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+Cargo.lock.bak
+**/*.rs.bk
+.rustc_info.json
+
+# ---- agent tooling scratch (worktrees, transcripts) ----
+.claude/
+
+# ---- editors & OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
