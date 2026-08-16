@@ -9,9 +9,8 @@ from one source of truth.
 | Document | Contents |
 |---|---|
 | **[README](../README.md)** | What Trinity Panel is, the honest feature list, architecture overview, and the quick start |
-| **[INSTALL](../INSTALL.md)** | Beginner-friendly installation: prerequisites, the wasm-bindgen version trap, Cloudflare token creation, every binding explained |
+| **[INSTALL](../INSTALL.md)** | Beginner-friendly installation: prerequisites, the wasm-bindgen version trap, Cloudflare token creation, every binding explained — and the manual CLI path the wizard wraps |
 | **[Known issues](../KNOWN_ISSUES.md)** | What is not working or not verified, and which limitations are deliberate |
-| **[Project state](PROGRESS.md)** | What is built, what is *proven* versus what merely compiles, every key decision and why, stage-by-stage status, and the toolchain quirks this machine needs. Kept current as work lands. |
 
 ## Research and design
 
@@ -24,7 +23,7 @@ from one source of truth.
 
 | Document | Contents |
 |---|---|
-| [Installation and first deployment](../INSTALL.md) | Done — prerequisites through first client connection |
+| [Installation and first deployment](../INSTALL.md) | Done — the setup wizard plus the manual CLI path, prerequisites through first client connection |
 | [Known issues](../KNOWN_ISSUES.md) | Done |
 
 - Every parameter, explained plainly — pending
@@ -44,8 +43,7 @@ from one source of truth.
 ## Reading order for a newcomer
 
 Start with the [Phase 0 report](research/phase-0-report.md). Sections 2 and 3 explain why this
-project makes transport choices that differ from every other panel in this space, and section 5
-explains why the deployment story has two paths rather than one. The
+project makes transport choices that differ from every other panel in this space. The
 [parameter inventory](research/parameter-inventory.md) is the specification the translation
 layer is built from and is the reference to reach for when a generated config is rejected by a
 core.

@@ -57,6 +57,7 @@ use super::wire::{self, Class};
 use super::{UploadQueue, DEFAULT_MAX_BUFFERED_POSTS, DEFAULT_MAX_POST_BYTES};
 use crate::protocol::codec::{Decoder, Encoder};
 use crate::protocol::{detect, Credentials, ProtocolError};
+use crate::relay::outbound::OutboundConfig;
 use crate::relay::{self, connect};
 
 /// Total bytes the reorder buffer may hold for one session.
@@ -263,7 +264,21 @@ impl XhttpSession {
                 };
                 inner.uplink = Some(tx);
                 // Tied to the object, not to this request.
-                self.state.wait_until(own_session(rx, down, self.credentials()));
+                //
+                // The outbound config is loaded inside `own_session` rather
+                // than here on purpose. Reading it needs an await, and this
+                // block holds a `RefCell` borrow of the session state: a
+                // concurrent POST reaching `borrow_mut` while this one was
+                // suspended on KV would panic, and a panic in a WASM isolate
+                // takes every connection on it down. The owner task has to
+                // wait for header bytes before it can dial anyway, so it
+                // loads the config there at no cost.
+                self.state.wait_until(own_session(
+                    rx,
+                    down,
+                    self.credentials(),
+                    self.env.clone(),
+                ));
             }
 
             // A clone is an independent handle to the same queue, so the
@@ -320,7 +335,17 @@ fn now_secs() -> u64 {
 /// Everything that touches the socket happens here, sequentially. No request
 /// handler ever holds it, so no interleaving of requests can corrupt it and no
 /// cancelled request can lose it.
-async fn own_session(mut uplink: mpsc::Receiver<Bytes>, down: DownSender, creds: Credentials) {
+async fn own_session(mut uplink: mpsc::Receiver<Bytes>, down: DownSender, creds: Credentials, env: Env) {
+    // Load outbound config once, outside any borrow. Falls back to Off mode
+    // if KV is unavailable or the settings document is missing.
+    let outbound_cfg = match env.kv("SETTINGS") {
+        Ok(kv) => match kv.get(crate::panel::store::KEY).text().await {
+            Ok(Some(raw)) => crate::relay::outbound::from_settings_json(&raw),
+            _ => OutboundConfig::default(),
+        },
+        Err(_) => OutboundConfig::default(),
+    };
+
     // Accumulate until a complete header parses. A header CAN arrive split
     // across chunks — transport framing does not align with protocol framing,
     // and a small scMaxEachPostBytes or an edge flush boundary is enough to
@@ -361,7 +386,12 @@ async fn own_session(mut uplink: mpsc::Receiver<Bytes>, down: DownSender, creds:
                 else {
                     return;
                 };
-                let Ok(sock) = connect::open(&target) else { return };
+                // Route through the outbound layer using the session's loaded
+                // config. In Off mode this is a single direct candidate; with
+                // Proxy IP or NAT64 each candidate's handshake is verified
+                // before the session commits to it.
+                let plan = outbound_cfg.resolve(&target);
+                let Ok(sock) = connect::open_with_plan(&plan).await else { return };
                 opened = Some((sock, decoder, encoder, Bytes::copy_from_slice(req.payload)));
             }
         }

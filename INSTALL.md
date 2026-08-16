@@ -1,8 +1,17 @@
 # Installing Trinity Panel
 
-This guide assumes you have **never used Cloudflare Workers and never used Rust**.
-Every step is spelled out. If you already know this ground, the summary in
-[README.md](README.md#quick-start) is faster.
+The recommended way to install is the setup wizard — it builds the Worker, talks to
+the Cloudflare API on your behalf, generates every credential, and returns a
+private panel link. If you just want to get running:
+
+```bash
+python scripts/install.py
+```
+
+This guide is the **manual CLI path** the wizard wraps. It is here for when you
+want every step spelled out, every binding explained, or a deploy you script
+yourself. It assumes you have **never used Cloudflare Workers and never used
+Rust**.
 
 Deploying takes about 30 minutes the first time, most of it waiting for Rust to
 compile. Everything here fits inside Cloudflare's free plan.
@@ -399,10 +408,10 @@ live deployment. The deploy script sets all of them.
 A malformed entry in a user list is skipped rather than failing the whole list —
 one bad paste should cost you one user, not every user.
 
-> **Note on `.dev.vars.example`:** it documents `PANEL_PASSWORD_HASH` and
-> `SESSION_SIGNING_KEY`. **The code reads neither.** It reads plaintext
-> `PANEL_PASSWORD` and derives the session key from it via BLAKE3. That file is
-> stale; this table is accurate. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+> **Note on `.dev.vars.example`:** it documents `PANEL_PASSWORD` only, matching the
+> table above. The Worker reads plaintext `PANEL_PASSWORD` and derives the
+> session-signing key from it via BLAKE3 — there is no `PANEL_PASSWORD_HASH` or
+> `SESSION_SIGNING_KEY` binding, despite what older copies of this file said.
 
 ### Plain-text variables (`plain_text` — visible in the dashboard)
 
@@ -547,11 +556,13 @@ npx wrangler secret put PANEL_PASSWORD
 npx wrangler deploy
 ```
 
-Note that `wrangler.jsonc` also references `npm run build`,
-`npm run hash-password` and `npm run gen-key` — **none of which exist**, since
+Note that `wrangler.jsonc` does not reference `npm run build` or any npm script —
 there is no `package.json` in this repository. Build with
-`python scripts/build.py`; generate a password with any password manager. Its
-`build.command` runs `worker-build`, which may not install on your host (see
-[2.5](#25-what-you-do-not-need)).
+`python scripts/build.py`; generate a panel password with any password manager.
+The `wrangler.jsonc` `main` points at `build/worker/shim.mjs`, which that build
+produces; `worker-build` (the tool behind `build.command` in older configs) may not
+install on your host (see [2.5](#25-what-you-do-not-need)), which is why the Python
+build path exists.
 
-The Python path in [section 6](#6-deploy) is the tested one. Prefer it.
+The Python path in [section 6](#6-deploy) is the tested one; the wizard wraps it.
+Prefer either over `wrangler`.

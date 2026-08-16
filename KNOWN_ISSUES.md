@@ -1,9 +1,7 @@
 # Known issues
 
-Current as of the initial public release. Everything here is drawn from the
-project's own record in [docs/PROGRESS.md](docs/PROGRESS.md) and from reading the
-code — **nothing in this file has been investigated or fixed**, by instruction. It
-documents the state as found.
+Current as of the initial public release. Everything here is drawn from reading
+the code and from a live deployment. It documents the state as found.
 
 The project's own verification vocabulary is used throughout:
 
@@ -20,48 +18,18 @@ The project's own verification vocabulary is used throughout:
 
 ### 1. The panel UI is unverified end-to-end
 
-`docs/PROGRESS.md` lists "panel UI" as the outstanding half of its stage 3 and
-records `panel::auth` as "host-tested; **not yet reachable**", with `Route::Panel`
-still wired to the decoy pending the UI.
-
-The code has moved past that note — `Route::Panel` now dispatches to
-`panel::serve::panel`, a `PANEL_PASSWORD` binding exists on the live deployment, and
-the panel path returns the 26 KB panel HTML rather than the 68-byte decoy. So it is
-served and gated. What has **not** happened is verification: no record exists of
-signing in, saving settings, and confirming persistence against a live deployment.
-The panel's own backend calls (`/api/state`, `/api/nodes`, `/api/check`,
-`/api/export`, `/api/qr`) are host-tested as pure functions only.
+The code wires `Route::Panel` to `panel::serve::panel`, a `PANEL_PASSWORD`
+binding exists on the live deployment, and the panel path returns the 26 KB panel
+HTML rather than the 68-byte decoy. So it is served and gated. What has **not**
+happened is verification: no record exists of signing in, saving settings, and
+confirming persistence against a live deployment. The panel's own backend calls
+(`/api/state`, `/api/nodes`, `/api/check`, `/api/export`, `/api/qr`) are host-tested
+as pure functions only.
 
 Treat the panel as unproven. Subscription serving is independent of it and *is*
 proven.
 
-### 2. `.dev.vars.example` documents secrets the code does not read
-
-The file describes two secrets:
-
-- `PANEL_PASSWORD_HASH` — "Argon2id hash of the admin panel password"
-- `SESSION_SIGNING_KEY` — "32 random bytes, base64, used to sign admin session cookies"
-
-**Neither name appears anywhere in the source.** What `src/panel/serve.rs` actually
-reads is a **plaintext** `PANEL_PASSWORD` binding, and `src/panel/auth.rs` derives
-the session key from that password via BLAKE3 — which is what makes a password
-change invalidate every session for free.
-
-There is no Argon2 dependency in `Cargo.toml`. Anyone following
-`.dev.vars.example` will deploy a Worker with no panel at all, because
-`PANEL_PASSWORD` will be empty and an empty password means the panel does not
-exist.
-
-[INSTALL.md](INSTALL.md#9-every-binding-explained) has the accurate list. The
-example file has not been corrected here, only documented.
-
-### 3. Referenced npm scripts do not exist
-
-`.dev.vars.example` tells you to run `npm run hash-password` and `npm run gen-key`.
-`wrangler.jsonc` refers to `npm run build`. **There is no `package.json` in this
-repository**, so all three fail.
-
-### 4. WebSocket transport: compiles only, and its relay path is suspect
+### 2. WebSocket transport: compiles only, and its relay path is suspect
 
 `src/transport/websocket.rs` compiles for `wasm32` and has never been enabled on a
 deployment. It is off by default, which is a deliberate security decision, not
@@ -77,7 +45,7 @@ Note that the live deployment has `WS_ENABLED=true` and `WS_PATH=/ws` set, so th
 WebSocket route is reachable there — on an unproven code path with a suspected
 relay bug.
 
-### 5. XHTTP `stream-up` and `stream-one` are not implemented
+### 3. XHTTP `stream-up` and `stream-one` are not implemented
 
 Only `packet-up` works. `src/entry.rs` returns the decoy for `StreamOne` and
 `StreamUp` requests, with the comment "Not yet implemented; it stays behind the
@@ -89,39 +57,55 @@ genuinely unresolved, and the available evidence is contradictory (see
 exists to measure it on a real deployment rather than guess. **It has not been
 run.** Until it is, the two streaming modes stay unavailable.
 
-### 6. Durable Object concurrency is enforced by reading, not by a test
+### 4. Durable Object concurrency is enforced by reading, not by a test
 
-`docs/PROGRESS.md` flags this: the `RefCell`-not-held-across-`await` discipline is
-maintained by code review, not by any test. Overlapping requests for one session
-are the normal case for `packet-up`.
+The `RefCell`-not-held-across-`await` discipline in `XhttpSession` is maintained by
+code review, not by any test. Overlapping requests for one session are the normal
+case for `packet-up`.
 
 Partial mitigation exists — 12 simultaneous tunnelled requests were measured
 succeeding on a live deployment, with a request after the burst still working. That
 is real evidence, but it is one measurement rather than a regression test, so a
 future change can break it silently.
 
-### 7. Measurements are incomplete
+### 5. Measurements are incomplete
 
 Measured on a live deployment: 20/20 sequential requests, p50 891 ms, p95 1661 ms,
 and the 12-request concurrency burst above.
 
 **Not measured:** sustained throughput, cold-start time, and the obfuscation on/off
-delta. `docs/PROGRESS.md` marks these outstanding and insists the numbers come from
-measurement rather than estimation. They are therefore absent from the README
-rather than guessed.
+delta. These are absent from the README rather than guessed; the project reports
+only numbers that come from measurement.
 
-### 8. Not started
+### 6. NAT64 outbound mode does not work on `workers.dev`
 
-From the project's own stage list:
+**Unverified → measured negative.** The mode is implemented, host-tested, and
+ships **disabled** (`mode: "off"` is the default and the only default). It was
+tested end to end on a live deployment on 2026-08-16 and does not achieve
+anything there. Two runtime limits stack:
 
-- **Installer wizard** (Linux + Windows CMD + Android). The stated bar is that it
-  be genuinely double-clickable and tested by completing a real deployment with
-  nothing typed into a terminal.
+- **Domains cannot be synthesised.** NAT64 rewrites an IPv4 address into an
+  IPv6 one. A domain destination has no IPv4 address until it is resolved, and
+  the runtime exposes no DNS API, so domain targets fall through to a direct
+  dial. This is the common case for real client traffic.
+- **IPv6 literals do not appear to be dialable at all.** With the mode Off, a
+  native IPv6 literal that answers from an ordinary host was measured as
+  unreachable through the relay, while the same operator's IPv4 literal
+  answered: `[2620:fe::fe]` → no connection vs `9.9.9.9` → HTTP 505;
+  `[2001:4860:4860::8888]` → no connection vs `8.8.8.8` → HTTP 302. Since NAT64
+  can only ever produce an IPv6 target, it has nothing to succeed with.
+
+It is kept rather than deleted because it costs nothing when unused (Off mode
+takes a separate single-candidate path) and because IPv6 egress is a runtime
+capability that may change. **Use Proxy IP mode instead** — that path is proven
+on a live deployment across all four protocols.
+
+### 7. Not built
+
 - **Standalone single-file `worker.js`.** The honest limitation on this one is not
   the language but the **absence of `packet-up`**: a drag-and-drop Pages target
   cannot hold cross-request state, so a JS build gets WebSocket and `stream-one`
-  only.
-- **User and developer documentation** beyond this file, README.md and INSTALL.md.
+  only. Install via [the wizard](README.md#quick-start) instead.
 
 ---
 
@@ -166,39 +150,28 @@ rather than emitting a config that will not load.
 
 Deliberate. The server declines body modes it cannot frame correctly, so the client
 reports a clean failure rather than establishing a tunnel that silently garbles
-everything through it. `docs/PROGRESS.md` records the refusal as a passing test
-case, not a gap.
+everything through it. The refusal is covered by a passing test case, not a gap.
 
 ---
 
 ## Repository hygiene
 
-Noted during the pre-publication audit, not acted on:
-
-- **Two stale `.bak` files exist on disk but are not published.**
-  `public/panel.html.bak` and `src/panel/serve.rs.bak` are leftover copies that
-  predate the current files — the live `panel.html` is 26,231 bytes against the
-  backup's 25,074, and `serve.rs` is 13,714 against 14,260. Neither is referenced by
-  the build. They are excluded from this repository via a `*.bak` rule in
-  `.gitignore`, so a clone will not contain them.
-- **`wrangler.jsonc` ships `XHTTP_PATH` and `PANEL_PATH` as `"/"`.** These are
-  placeholders that `scripts/deploy.py` overwrites. Deploying with `wrangler`
-  without editing them serves the transport on the root path, defeating the
-  random-prefix design. The file also omits `SUB_PATH` entirely.
-- **`wrangler.jsonc` sets `WS_ENABLED: "false"` while `scripts/deploy.py` sets it
-  to `"true"`.** The two deploy paths disagree, and the comment in `wrangler.jsonc`
-  explaining why WebSocket is off by default is the one the script contradicts.
-- **`docs/deploy-and-test-procedure.md` still names `tricore_panel.wasm`.** That is
-  correct — the crate name in `Cargo.toml` is unchanged, so the build artefact
-  genuinely still has that filename. Renaming the crate was out of scope.
+- **`wrangler.jsonc` ships path placeholders (`/`) and `WS_ENABLED: "false"`.**
+  Both are overwritten by [the wizard](README.md#quick-start) and by
+  `scripts/deploy.py`; deploying with `wrangler` without editing them first serves
+  the transport on the root path and leaves an unproven transport disabled.
+  Prefer the wizard or the CLI script. The path placeholders and the
+  `WS_ENABLED` disagreement with `deploy.py` (which sets `"true"`) are deliberate
+  defaults in the file so a `wrangler`-only user does not accidentally enable an
+  unproven transport on the root path.
+- **The crate in `Cargo.toml` is still named `tricore_panel`.** The build artefact
+  is therefore `tricore_panel.wasm`. Renaming the crate was out of scope; the
+  rebrand is user-facing only.
 
 ---
 
 ## Where to look next
 
-- [docs/PROGRESS.md](docs/PROGRESS.md) — per-module verification table, every design
-  decision with reasoning, and §1's "defects that only deployment could find",
-  which is the most useful page in the repository for anyone extending this.
 - [docs/research/phase-0-report.md](docs/research/phase-0-report.md) — the runtime
   constraints behind most of the limitations above.
 - [docs/research/parameter-inventory.md](docs/research/parameter-inventory.md) — the

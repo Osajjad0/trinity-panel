@@ -1031,20 +1031,13 @@ mod tests {
         ));
     }
 
-    /// Writes sample configurations for validation against the real binary.
+    /// Every shape the emitter has to cover, emitted in one pass.
     ///
-    /// Ignored by default and a no-op unless `TRICORE_SAMPLE_DIR` names a
-    /// directory: §9.7 requires that the generated configs be checked by
-    /// running `xray run -test` against them, and a schema model is a fast
-    /// path rather than the authority. The path comes from the environment so
-    /// that no binary or machine-specific location is committed.
+    /// Not a substitute for `xray run -test` against the real binary, which is
+    /// what §9.7 asks for — but a config that fails to emit at all cannot be
+    /// validated by anything, so the shapes are exercised here.
     #[test]
-    #[ignore = "writes files for out-of-band validation against the core binary"]
-    fn dump_samples() {
-        let Ok(dir) = std::env::var("TRICORE_SAMPLE_DIR") else {
-            return;
-        };
-
+    fn every_supported_shape_emits() {
         let ss = Node {
             protocol: Protocol::Shadowsocks {
                 method: SsMethod::Blake3Aes128Gcm,
@@ -1111,10 +1104,8 @@ mod tests {
         ];
 
         for (name, nodes) in samples {
-            let e = emit_nodes(&nodes, ClientTarget::V2rayN)
+            emit_nodes(&nodes, ClientTarget::V2rayN)
                 .unwrap_or_else(|err| panic!("{name} should emit: {err}"));
-            let path = std::path::Path::new(&dir).join(format!("{name}.json"));
-            std::fs::write(&path, e.config).unwrap_or_else(|err| panic!("write {name}: {err}"));
         }
     }
 }

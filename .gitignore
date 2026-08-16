@@ -61,14 +61,12 @@ Cargo.lock.bak
 **/*.rs.bk
 .rustc_info.json
 
-# ---- agent tooling scratch (worktrees, transcripts) ----
-.claude/
-
 # ---- editors & OS ----
 .vscode/
 .idea/
 *.swp
 *.swo
+.claude/
 .DS_Store
 Thumbs.db
 desktop.ini

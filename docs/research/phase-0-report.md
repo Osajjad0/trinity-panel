@@ -299,7 +299,7 @@ Durable Object migrations must use `new_sqlite_classes`; since 2026-07-09 the KV
 | **Dashboard drag-and-drop → Pages** | Pure-JS single-file `_worker.js`, WebSocket and `stream-one` only | **No** — but no `packet-up`, since Pages cannot host the DO |
 | **wrangler** | Full build | Yes — developer path |
 
-Deliverable **C** (the standalone `worker.js`) is therefore not a consolation prize: it is what
+The standalone `worker.js` is therefore not a consolation prize: it is what
 makes the drag-and-drop path real, and its honest limitation is not the language but the
 **absence of `packet-up`**, because the platform it lands on cannot hold cross-request state.
 

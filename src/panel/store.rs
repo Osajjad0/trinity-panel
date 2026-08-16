@@ -32,6 +32,7 @@ use crate::config::model::{
     Endpoint, Flow, Mux, Node, Protocol, Security, SsMethod, TlsSettings, Transport, VmessCipher,
     XhttpMode,
 };
+use crate::relay::outbound::OutboundConfig;
 
 /// KV key holding the settings document.
 pub const KEY: &str = "panel:settings";
@@ -49,11 +50,15 @@ pub const VERSION: u32 = 1;
 pub struct Settings {
     pub version: u32,
     pub nodes: Vec<Node>,
+    /// Outbound routing configuration (Proxy IP / NAT64).
+    /// Defaults to Off when absent from stored JSON.
+    #[serde(default)]
+    pub outbound: OutboundConfig,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { version: VERSION, nodes: Vec::new() }
+        Self { version: VERSION, nodes: Vec::new(), outbound: OutboundConfig::default() }
     }
 }
 
@@ -93,15 +98,6 @@ impl Settings {
             mode: XhttpMode::PacketUp,
             path: deployment.xhttp_path.to_owned(),
             host: Some(deployment.host.to_owned()),
-        };
-        let ws_transport = if !deployment.ws_path.is_empty() {
-            Some(Transport::WebSocket {
-                path: deployment.ws_path.to_owned(),
-                host: Some(deployment.host.to_owned()),
-                heartbeat_secs: 30,
-            })
-        } else {
-            None
         };
         // The edge terminates TLS, so SNI is the hostname and ALPN is decided
         // by the shared emitter defaults rather than guessed here.
@@ -170,7 +166,7 @@ impl Settings {
             }
         }
 
-        Self { version: VERSION, nodes }
+        Self { version: VERSION, nodes, outbound: OutboundConfig::default() }
     }
 
     /// Parse a stored document, rejecting one from a future schema.

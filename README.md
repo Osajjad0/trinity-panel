@@ -11,8 +11,9 @@ Free tier is enough. One `wasm` module, one KV namespace, one Durable Object.
 
 ## Quick Start
 
-The fastest path from nothing to a working deployment. Every step is expanded in
-**[INSTALL.md](INSTALL.md)** — read that instead if any line below is unfamiliar.
+The fastest path from nothing to a working deployment. The setup wizard builds
+the Worker, talks to the Cloudflare API for you, generates every credential, and
+hands you back a private link.
 
 ```bash
 # 1. Prerequisites: Rust, the wasm32 target, and a version-matched wasm-bindgen
@@ -21,30 +22,22 @@ cargo install wasm-bindgen-cli --version 0.2.126   # MUST match Cargo.lock exact
 ```
 
 ```bash
-# 2. Clone and build
+# 2. Clone and run the wizard
 git clone https://github.com/Osajjad0/trinity-panel.git
 cd trinity-panel
-python scripts/build.py
+python scripts/install.py
 ```
 
-```bash
-# 3. Point the deploy script at your Cloudflare account
-export CLOUDFLARE_API_TOKEN=...    # Workers Scripts: Edit + Workers KV Storage: Edit + Account Settings: Read
-export CLOUDFLARE_ACCOUNT_ID=...
-```
+A browser tab opens. Follow the four steps: verify your Cloudflare account, create
+an API token (the wizard links you to a pre-filled token page with the permissions
+it needs), paste it back, and confirm. The wizard compiles, uploads, and returns
+your panel URL, panel password, subscription URL and every protocol credential.
 
-```bash
-# 4. Deploy. Credentials and secret paths are generated and printed ONCE.
-python scripts/deploy.py --name my-worker --build-dir build/worker
-```
+**Copy them immediately — they are not written to disk and cannot be recovered.**
+Open the panel URL, sign in, and copy a subscription link into your client.
 
-The script prints your panel URL, panel password, subscription URL and every
-protocol credential. **Copy them immediately — they are not written to disk and
-cannot be recovered.** Open the panel URL, sign in, and copy a subscription link
-into your client.
-
-Full walkthrough, token creation with screenshots-worth of detail, and every
-binding explained: **[INSTALL.md](INSTALL.md)**.
+Prefer the manual CLI deploy path, or need every binding explained? See
+**[INSTALL.md](INSTALL.md)**.
 
 ---
 
@@ -96,8 +89,7 @@ the host in seconds without a WASM harness or a live deployment.
 ## Features
 
 Status is reported honestly, using the project's own verification levels. See
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the full picture and
-[docs/PROGRESS.md](docs/PROGRESS.md) for per-module detail.
+[KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the full picture.
 
 | | Status |
 |---|---|
@@ -115,8 +107,10 @@ Status is reported honestly, using the project's own verification levels. See
 | **QR codes** for share links and subscriptions | Host-tested against independent vectors |
 | **Decoy page** on every negative outcome | Proven live — `/`, `/robots.txt` and any unknown path return identical bytes |
 | **Durable Object session store** | Proven, including 12 simultaneous tunnelled requests |
+| **Proxy IP outbound fallback** (optional, off by default) | Proven on a live deployment: reaches Cloudflare-fronted destinations that a direct dial cannot, on all four protocols. Fallback ordering proven by an isolation control |
+| **NAT64 outbound mode** (optional, off by default) | Implemented and host-tested, **measured not to work** on `workers.dev` — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Use Proxy IP instead |
 | **gRPC / `httpupgrade`** transports | Not implemented, and cannot be — see below |
-| Installer wizard, standalone single-file `worker.js` | Not started |
+| **Installer wizard** | Done — `python scripts/install.py` opens a four-step wizard that builds, deploys, and returns a private panel link. A standalone single-file `worker.js` is not built: Pages cannot host the Durable Object, so it would lack `packet-up` |
 
 Measured on a live deployment: 20/20 sequential requests succeeded, p50 891 ms,
 p95 1661 ms. Sustained throughput, cold-start time and the obfuscation on/off delta
@@ -171,16 +165,11 @@ compile and test on the host in milliseconds.
 
 Depth:
 
-- **[docs/PROGRESS.md](docs/PROGRESS.md)** — per-module verification status, every
-  key design decision with its reasoning, and the defects that only a real
-  deployment could surface.
 - **[docs/research/phase-0-report.md](docs/research/phase-0-report.md)** — survey of
   ten existing panels, the Cloudflare runtime constraints, and why the transport
   choices here differ from everyone else's.
 - **[docs/research/parameter-inventory.md](docs/research/parameter-inventory.md)** —
   cross-core parameter tables and the incompatibility matrix the emitters enforce.
-- **[docs/deploy-and-test-procedure.md](docs/deploy-and-test-procedure.md)** — the
-  terse build/deploy/verify checklist.
 
 ---
 
@@ -190,14 +179,15 @@ Summarised here; the full list with detail is in
 **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)**.
 
 - **The panel UI has not been verified against a live deployment.** It is served
-  and password-gated, but the project's own status notes record the UI as the
-  outstanding half of its stage. Treat it as unproven.
-- **`.dev.vars.example` documents secrets the code does not read.** It describes
-  `PANEL_PASSWORD_HASH` and `SESSION_SIGNING_KEY`; the code reads a plaintext
-  `PANEL_PASSWORD` binding and derives the session key from it. Follow
-  [INSTALL.md](INSTALL.md), not that file.
-- **It references `npm run hash-password` and `npm run gen-key`, which do not
-  exist.** There is no `package.json` in this repository.
+  and password-gated, but end-to-end use — signing in, saving settings, confirming
+  persistence — has not been recorded. Treat it as unproven. The panel's own
+  save/load API was exercised live while verifying outbound routing, but the HTML
+  form itself was not driven by a browser.
+- **NAT64 outbound mode does not work on `workers.dev`.** It ships off, and
+  measurement says leave it off: domain destinations cannot be synthesised (no DNS
+  API in the runtime) and IPv6 literals were measured as undialable from a Worker,
+  which is the only kind of address NAT64 produces. Proxy IP mode is the one that
+  is proven.
 - **WebSocket is unproven and its relay path is suspect.** A source comment
   records that the WS relay path gives EOF, which is why the derived Trojan node
   uses XHTTP rather than WebSocket. It is off by default.
@@ -206,9 +196,11 @@ Summarised here; the full list with detail is in
 - **Adding or removing a proxy user is a redeploy, not a panel edit.** Credentials
   live in secret bindings read on the request path, by design. The panel owns
   everything client-side, not the credential set.
-- Two `wrangler.jsonc` defaults (`XHTTP_PATH` / `PANEL_PATH` set to `/`) are
-  placeholders that the deploy script replaces. Deploying via `wrangler` without
-  changing them serves the transport on the root path.
+- **`wrangler.jsonc` ships path placeholders (`/`) and an unproven-transport
+  toggle (`WS_ENABLED`).** They are overwritten by the wizard and by
+  `scripts/deploy.py`; deploying with `wrangler` without editing them first serves
+  the transport on the root path. Prefer [the wizard](#quick-start) or the CLI
+  script.
 
 ---
 

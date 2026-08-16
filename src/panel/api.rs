@@ -27,6 +27,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::model::{ClientTarget, Node};
+use crate::relay::outbound::{OutboundConfig, ProxyMode};
 use crate::subscription::bundle::{self, Shape, Skipped};
 
 use super::store::Settings;
@@ -87,6 +88,9 @@ pub struct LoginRequest {
 #[derive(Deserialize, Debug)]
 pub struct SaveRequest {
     pub nodes: Vec<Node>,
+    /// Outbound routing config. Defaults to Off when absent (old clients).
+    #[serde(default)]
+    pub outbound: OutboundConfig,
 }
 
 /// What the browser posts to re-check a draft.
@@ -174,6 +178,8 @@ pub struct State {
     /// every other node. The browser adding one of its own would be a second
     /// place that knows the model's shape.
     pub blank: Node,
+    /// Outbound routing configuration (Proxy IP / NAT64).
+    pub outbound: OutboundConfig,
 }
 
 /// Where the settings a request is serving came from.
@@ -214,6 +220,7 @@ pub fn state(
         views,
         clients,
         blank: super::advisor::blank(host, xhttp_path),
+        outbound: settings.outbound.clone(),
     }
 }
 
@@ -319,6 +326,55 @@ pub fn validate(nodes: &[Node]) -> Result<(), String> {
 /// the settings document unbounded, not to constrain real use.
 const MAX_NODES: usize = 64;
 
+/// Same reasoning as [`MAX_NODES`], for the outbound candidate lists.
+const MAX_OUTBOUND_ENTRIES: usize = 64;
+
+/// Reject an outbound config that cannot be stored or dialled.
+///
+/// Validated here rather than only at dial time because a candidate that the
+/// relay silently skips is indistinguishable, from the panel, from one that is
+/// being used — the operator would see a saved Proxy IP and a connection that
+/// still goes direct, with nothing to explain it.
+///
+/// Only entries that would be *dropped* are refused. Reachability is
+/// deliberately not checked: whether a proxy actually forwards traffic is
+/// something only the real relay path can answer, and guessing here would
+/// produce exactly the fake verdict this project refuses to ship.
+///
+/// # Errors
+/// A message addressed to the operator.
+pub fn validate_outbound(cfg: &OutboundConfig) -> Result<(), String> {
+    use crate::relay::outbound::{validate_nat64_prefix, validate_proxy_candidate};
+
+    if cfg.proxy_candidates.len() > MAX_OUTBOUND_ENTRIES
+        || cfg.nat64_prefixes.len() > MAX_OUTBOUND_ENTRIES
+    {
+        return Err(format!("{MAX_OUTBOUND_ENTRIES} outbound entries is the limit"));
+    }
+    for candidate in &cfg.proxy_candidates {
+        if !validate_proxy_candidate(candidate) {
+            return Err(format!(
+                "\"{candidate}\" is not a usable proxy address. Give a public IP or a hostname, \
+                 with no port and no path."
+            ));
+        }
+    }
+    for prefix in &cfg.nat64_prefixes {
+        if !validate_nat64_prefix(prefix) {
+            return Err(format!(
+                "\"{prefix}\" is not a valid NAT64 prefix. It must be a /96 whose last 32 bits \
+                 are zero, like 64:ff9b::/96."
+            ));
+        }
+    }
+    // A mode that needs entries it does not have would save cleanly and then
+    // behave as Off, which looks like the feature is broken rather than unset.
+    if cfg.mode == ProxyMode::ProxyIp && cfg.proxy_candidates.is_empty() {
+        return Err("Proxy IP mode needs at least one proxy address.".to_owned());
+    }
+    Ok(())
+}
+
 /// What a QR request is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QrSubject {
@@ -407,7 +463,11 @@ mod tests {
     }
 
     fn settings() -> Settings {
-        Settings { version: super::super::store::VERSION, nodes: vec![node("a"), node("b")] }
+        Settings {
+            version: super::super::store::VERSION,
+            nodes: vec![node("a"), node("b")],
+            outbound: OutboundConfig::default(),
+        }
     }
 
     #[test]
@@ -568,5 +628,98 @@ mod tests {
                 let _ = route(m, &s);
             }
         }
+    }
+
+    // --- outbound validation at the save boundary ---
+
+    #[test]
+    fn the_default_outbound_config_saves_cleanly() {
+        // Off with nothing set is what every existing deployment posts. If this
+        // ever refuses, saving nodes breaks for everyone who never touched the
+        // feature.
+        assert!(validate_outbound(&OutboundConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn a_usable_proxy_config_is_accepted() {
+        let cfg = OutboundConfig {
+            mode: ProxyMode::ProxyIp,
+            proxy_candidates: vec!["93.184.216.34".into(), "edge.example.com".into()],
+            ..Default::default()
+        };
+        assert!(validate_outbound(&cfg).is_ok());
+    }
+
+    #[test]
+    fn candidates_the_relay_would_drop_are_refused_at_save_time() {
+        // Each of these parses as a string but cannot be dialled, so the relay
+        // would skip it. Saving it silently is what makes a working-looking
+        // config that goes direct.
+        for bad in ["127.0.0.1", "10.0.0.1", "host:443", "host/path", "   "] {
+            let cfg = OutboundConfig {
+                mode: ProxyMode::ProxyIp,
+                proxy_candidates: vec![bad.into()],
+                ..Default::default()
+            };
+            let err = validate_outbound(&cfg).expect_err(&format!("{bad:?} must be refused"));
+            assert!(err.contains(bad.trim()) || !bad.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn nat64_prefixes_must_be_96_with_a_zero_tail() {
+        for bad in ["64:ff9b::/64", "64:ff9b::1/96", "64:ff9b::", "nonsense"] {
+            let cfg = OutboundConfig {
+                mode: ProxyMode::Nat64,
+                nat64_prefixes: vec![bad.into()],
+                ..Default::default()
+            };
+            assert!(validate_outbound(&cfg).is_err(), "{bad:?} must be refused");
+        }
+        let good = OutboundConfig {
+            mode: ProxyMode::Nat64,
+            nat64_prefixes: vec!["64:ff9b::/96".into()],
+            ..Default::default()
+        };
+        assert!(validate_outbound(&good).is_ok());
+    }
+
+    #[test]
+    fn nat64_mode_with_no_prefix_is_allowed_because_a_default_exists() {
+        // Unlike Proxy IP, NAT64 has a well-known prefix to fall back on, so an
+        // empty list is a complete config rather than an unset one.
+        let cfg = OutboundConfig { mode: ProxyMode::Nat64, ..Default::default() };
+        assert!(validate_outbound(&cfg).is_ok());
+    }
+
+    #[test]
+    fn proxy_ip_mode_without_candidates_is_refused_rather_than_saved_as_a_no_op() {
+        let cfg = OutboundConfig { mode: ProxyMode::ProxyIp, ..Default::default() };
+        assert!(validate_outbound(&cfg).is_err());
+    }
+
+    #[test]
+    fn unused_lists_are_still_validated() {
+        // Off mode with a malformed leftover entry: refused, because the entry
+        // becomes live the moment the mode changes and the operator would not
+        // be told then.
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Off,
+            proxy_candidates: vec!["127.0.0.1".into()],
+            ..Default::default()
+        };
+        assert!(validate_outbound(&cfg).is_err());
+    }
+
+    #[test]
+    fn the_entry_count_is_bounded() {
+        let cfg = OutboundConfig {
+            mode: ProxyMode::ProxyIp,
+            proxy_candidates: (0..=MAX_OUTBOUND_ENTRIES)
+                .map(|i| format!("198.51.100.{}", i % 200))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(validate_outbound(&cfg).is_err());
     }
 }

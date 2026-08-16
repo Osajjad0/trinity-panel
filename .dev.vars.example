@@ -9,14 +9,8 @@
 # `npx wrangler secret put <NAME>`, or let the setup wizard set them over the
 # API. They are never read from source and never written to logs.
 
-# Argon2id hash of the admin panel password — NOT the password itself.
-# Generate one with:  npm run hash-password
-# Storing a hash rather than the password means a leaked KV namespace or a
-# dashboard screenshot does not hand over panel access.
-PANEL_PASSWORD_HASH=
-
-# 32 random bytes, base64, used to sign admin session cookies.
-# Generate one with:  npm run gen-key
-# Rotating this invalidates every existing session, which is the intended way
-# to log out everyone at once.
-SESSION_SIGNING_KEY=
+# Admin panel password, in PLAINTEXT. Not a hash — the Worker reads this value
+# directly and derives the session-signing key from it via BLAKE3, which is also
+# why changing the password invalidates every outstanding session. Empty means
+# the panel does not exist, not that it is open.
+PANEL_PASSWORD=

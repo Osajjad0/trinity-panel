@@ -16,17 +16,13 @@
   // proxy panels.
   "name": "REPLACE-ME-worker-name",
 
-  // Emitted by `worker-build`, which wraps the compiled .wasm in the JS shim
-  // the runtime loads. Produced by `npm run build`; not checked in.
+  // Produced by `python scripts/build.py`; the WASM shim lives in
+  // build/worker/shim.mjs. The output is not checked in.
   "main": "build/worker/shim.mjs",
 
   // Pins runtime behaviour. Raising this can change semantics, so it moves
   // only deliberately.
   "compatibility_date": "2026-07-01",
-
-  "build": {
-    "command": "npx --yes worker-build@latest --release"
-  },
 
   // Static panel assets. The `binding` makes them reachable from Rust as
   // env.ASSETS so the Worker can serve the decoy page and the admin UI without
@@ -66,8 +62,8 @@
 
   "kv_namespaces": [
     {
-      // Panel settings, user table, and clean-IP lists. Created by the wizard;
-      // if you are deploying by CLI, run:
+      // Panel settings. Created by the wizard; if you are deploying by CLI,
+      // run:
       //   npx wrangler kv namespace create SETTINGS
       // and paste the printed id below.
       "binding": "SETTINGS",
@@ -77,17 +73,21 @@
 
   // Non-secret defaults. Anything sensitive is a secret, never a var — vars are
   // readable from the dashboard and are included in `wrangler deploy` output.
+  // The placeholders below are overwritten by the wizard and by
+  // scripts/deploy.py; deploying with the placeholders serves the transport on
+  // the root path, which defeats the random-prefix design. Substitute real
+  // random values (or use the wizard) before deploying this way.
   "vars": {
-    // Base path for the XHTTP transport. Overridden per deployment with a
-    // random value; a guessable path is the cheapest thing for a scanner to
-    // find. The wizard generates one.
     "XHTTP_PATH": "/",
-    // Base path for the admin panel. Same reasoning.
     "PANEL_PATH": "/",
+    "SUB_PATH": "/",
     // WebSocket is off by default. It is the most heavily classified transport
     // in this space, and enabling it on the same hostname as XHTTP couples
     // their survival — a classifier that flags the hostname takes both down.
-    "WS_ENABLED": "false"
+    // scripts/deploy.py sets this to "true"; this file keeps it "false" so a
+    // CLI user does not enable an unproven transport by accident.
+    "WS_ENABLED": "false",
+    "WS_PATH": "/ws"
   },
 
   "observability": {
@@ -98,7 +98,10 @@
   }
 
   // Secrets are NOT listed here. Set them with:
-  //   npx wrangler secret put PANEL_PASSWORD_HASH
-  //   npx wrangler secret put SESSION_SIGNING_KEY
-  // or let the wizard set them over the API. See .dev.vars.example.
+  //   npx wrangler secret put VLESS_USERS
+  //   npx wrangler secret put TROJAN_USERS
+  //   npx wrangler secret put VMESS_USERS
+  //   npx wrangler secret put SS_USERS
+  //   npx wrangler secret put PANEL_PASSWORD
+  // or let the setup wizard set them over the API. See .dev.vars.example.
 }

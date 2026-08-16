@@ -51,6 +51,7 @@ pub fn is_permitted(target: &Target) -> bool {
 mod imp {
     use super::{is_permitted, ConnectError};
     use crate::protocol::Target;
+    use crate::relay::outbound::DialPlan;
     use worker::{Socket, SecureTransport};
 
     /// Dial `target` over plain TCP.
@@ -81,10 +82,54 @@ mod imp {
             .connect(host, target.port)
             .map_err(|e| ConnectError::Failed(e.to_string()))
     }
+
+    /// Try each candidate in a dial plan until one actually connects.
+    ///
+    /// # Why this awaits `opened()` and `open()` does not
+    ///
+    /// `Socket::connect()` on this runtime is lazy: it hands back a socket
+    /// before the TCP handshake has been attempted, and a dial to a dead or
+    /// refused address still returns `Ok`. The handshake result only surfaces
+    /// at `opened().await`. A fallback loop built on `open()` alone therefore
+    /// always "succeeds" on the first candidate and never falls through — the
+    /// feature would look wired up and do nothing.
+    ///
+    /// # Why the single-candidate case is special-cased
+    ///
+    /// In `Off` mode the plan holds exactly one entry. Awaiting `opened()`
+    /// there would introduce a handshake wait the pre-feature path did not
+    /// have, and there is no second candidate to fall back to, so the result
+    /// could not change any decision. That path returns the lazy socket
+    /// untouched and stays behaviourally identical to calling [`open`]
+    /// directly. Every caller already awaits the handshake at its own first
+    /// read or write.
+    ///
+    /// # Errors
+    /// The error from the last candidate attempted, so the caller sees the
+    /// most relevant failure rather than the first.
+    pub async fn open_with_plan(plan: &DialPlan) -> Result<Socket, ConnectError> {
+        if let [only] = plan.candidates.as_slice() {
+            return open(only);
+        }
+
+        let mut last_err = ConnectError::Failed("no candidates".into());
+        for candidate in &plan.candidates {
+            match open(candidate) {
+                // A candidate that dials but never completes its handshake is
+                // not a working route. Verify before committing to it.
+                Ok(sock) => match sock.opened().await {
+                    Ok(_) => return Ok(sock),
+                    Err(e) => last_err = ConnectError::Failed(e.to_string()),
+                },
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use imp::open;
+pub use imp::{open, open_with_plan};
 
 #[cfg(test)]
 mod tests {

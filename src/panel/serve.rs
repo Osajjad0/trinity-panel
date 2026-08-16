@@ -211,8 +211,11 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
     if let Err(message) = api::validate(&body.nodes) {
         return refuse(&message);
     }
+    if let Err(message) = api::validate_outbound(&body.outbound) {
+        return refuse(&message);
+    }
 
-    let settings = Settings { version: super::store::VERSION, nodes: body.nodes };
+    let settings = Settings { version: super::store::VERSION, nodes: body.nodes, outbound: body.outbound };
     let Ok(document) = settings.to_json() else {
         return refuse("Those settings could not be stored.");
     };

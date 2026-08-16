@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Trinity Panel — Setup</title>
+<style>
+/* Served by the local installer from inside this file. Nothing is fetched from
+   the network, so the wizard works offline apart from the Cloudflare calls it
+   makes on your behalf. */
+:root{
+  --bg:#0d1017; --bg2:#12161f; --card:#171c26; --card2:#1d232f;
+  --line:#262d3b; --line2:#333c4d;
+  --ink:#e7ebf3; --dim:#98a2b6; --faint:#6b7689;
+  --accent:#f6821f; --accent-ink:#1a1205; --accent-dim:#c96712;
+  --ring:#5b8cff; --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.28);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:
+    radial-gradient(1100px 520px at 50% -10%, #1b2333 0%, transparent 70%),
+    var(--bg);
+  color:var(--ink);
+  font:15px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--ring);text-decoration:none}
+a:hover{text-decoration:underline}
+h1,h2,h3{line-height:1.25;margin:0}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+
+.shell{max-width:780px;margin:0 auto;padding:2.2rem 1.1rem 4rem}
+
+/* ---- masthead ---- */
+.mast{display:flex;align-items:center;gap:.8rem;margin-bottom:.35rem}
+.mark{width:34px;height:34px;flex:0 0 auto}
+.mast h1{font-size:1.35rem;letter-spacing:-.01em}
+.mast .sub{color:var(--dim);font-size:.88rem;margin-top:.1rem}
+.lede{color:var(--dim);font-size:.92rem;margin:.5rem 0 1.6rem;max-width:60ch}
+
+/* ---- stepper ---- */
+.stepper{display:flex;gap:.4rem;margin-bottom:1.4rem;counter-reset:s}
+.stepper li{
+  flex:1 1 0;list-style:none;font-size:.74rem;color:var(--faint);
+  padding-top:.5rem;border-top:2px solid var(--line);letter-spacing:.02em;
+  text-transform:uppercase;font-weight:600;
+}
+.stepper li[data-state=active]{color:var(--accent);border-top-color:var(--accent)}
+.stepper li[data-state=done]{color:var(--ok);border-top-color:var(--ok)}
+
+/* ---- cards ---- */
+.card{
+  background:linear-gradient(180deg,var(--card2),var(--card));
+  border:1px solid var(--line); border-radius:14px; padding:1.15rem 1.2rem;
+  margin-bottom:1rem; box-shadow:var(--shadow);
+}
+.card[hidden]{display:none}
+.card > h2{font-size:1.05rem;display:flex;align-items:center;gap:.55rem}
+.card > h2 .n{
+  width:1.55rem;height:1.55rem;flex:0 0 auto;border-radius:50%;
+  background:var(--accent);color:var(--accent-ink);
+  font-size:.82rem;font-weight:700;display:grid;place-items:center;
+}
+.card p{color:var(--dim);margin:.6rem 0 .8rem;font-size:.92rem}
+.card p.tight{margin-bottom:.4rem}
+.card p strong{color:var(--ink);font-weight:600}
+.done-note{color:var(--ok);font-size:.86rem;margin:0}
+
+/* ---- lists ---- */
+ol.steps,ul.plain{margin:.2rem 0 .9rem;padding-left:1.25rem;color:var(--dim);font-size:.92rem}
+ol.steps li,ul.plain li{margin:.3rem 0}
+ol.steps li strong{color:var(--ink)}
+
+/* ---- permission table ---- */
+table.perms{border-collapse:collapse;width:100%;font-size:.86rem;margin:.3rem 0 .9rem}
+table.perms th,table.perms td{
+  text-align:left;padding:.4rem .55rem;border-bottom:1px solid var(--line);
+}
+table.perms th{color:var(--faint);font-weight:600;font-size:.76rem;text-transform:uppercase;letter-spacing:.03em}
+table.perms td:first-child{color:var(--ink)}
+table.perms td:last-child{color:var(--dim)}
+
+/* ---- controls ---- */
+.row{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center}
+.field{margin-bottom:.9rem}
+.field > label{display:block;font-weight:600;font-size:.85rem;margin-bottom:.3rem}
+.field .help{color:var(--faint);font-size:.82rem;margin:.25rem 0 0}
+input,select{
+  font:inherit;width:100%;padding:.55rem .7rem;border-radius:9px;
+  background:var(--bg2);color:var(--ink);border:1px solid var(--line2);
+}
+input:focus,select:focus{outline:2px solid var(--ring);outline-offset:1px;border-color:transparent}
+input::placeholder{color:var(--faint)}
+select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--dim) 50%),linear-gradient(135deg,var(--dim) 50%,transparent 50%);background-position:calc(100% - 18px) 52%,calc(100% - 13px) 52%;background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:2.2rem}
+select:disabled{color:var(--faint);cursor:not-allowed}
+
+button{
+  font:inherit;font-weight:600;padding:.55rem .95rem;border-radius:9px;
+  cursor:pointer;border:1px solid var(--line2);background:var(--card2);color:var(--ink);
+  transition:border-color .15s,background .15s,transform .05s;
+}
+button:hover:not(:disabled){border-color:var(--line2);background:#232b39}
+button:active:not(:disabled){transform:translateY(1px)}
+button:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+button.primary:hover:not(:disabled){background:#ff9330}
+button.ghost{background:transparent}
+button.small{padding:.35rem .6rem;font-size:.82rem;font-weight:500}
+
+/* ---- copyable value ---- */
+.copyable{
+  display:flex;align-items:stretch;gap:.4rem;background:var(--bg2);
+  border:1px solid var(--line2);border-radius:9px;padding:.35rem .35rem .35rem .6rem;
+}
+.copyable .val{
+  flex:1 1 auto;min-width:0;align-self:center;font-family:ui-monospace,Menlo,Consolas,monospace;
+  font-size:.82rem;word-break:break-all;color:var(--ink);
+}
+.copyable .val.secret{letter-spacing:.06em}
+.copyable button{flex:0 0 auto;padding:.3rem .55rem;font-size:.78rem;font-weight:500}
+
+/* ---- status area ---- */
+.status{
+  display:flex;align-items:center;gap:.6rem;background:var(--bg2);
+  border:1px solid var(--line);border-radius:10px;padding:.6rem .75rem;margin:.9rem 0 .3rem;
+}
+.dot{width:9px;height:9px;flex:0 0 auto;border-radius:50%;background:var(--faint)}
+.status[data-state=installing] .dot{background:var(--accent);animation:pulse 1.1s ease-in-out infinite}
+.status[data-state=done] .dot{background:var(--ok)}
+.status[data-state=failed] .dot{background:var(--bad)}
+@keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
+.status .label{font-weight:600;font-size:.86rem}
+.status[data-state=installing] .label{color:var(--accent)}
+.status[data-state=done] .label{color:var(--ok)}
+.status[data-state=failed] .label{color:var(--bad)}
+.status .detail{color:var(--dim);font-size:.85rem;min-width:0;overflow-wrap:anywhere}
+
+/* ---- log ---- */
+.log{
+  margin:.5rem 0 0;background:#0a0d13;border:1px solid var(--line);border-radius:9px;
+  padding:.6rem .75rem;max-height:15rem;overflow:auto;
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.79rem;line-height:1.7;
+  color:var(--dim);white-space:pre-wrap;overflow-wrap:anywhere;
+}
+.log:empty{display:none}
+.log b{color:var(--ink);font-weight:600}
+.log .e{color:var(--bad)}
+.log .g{color:var(--ok)}
+
+/* ---- notes ---- */
+.note{
+  border-left:2px solid var(--line2);padding:.1rem 0 .1rem .7rem;margin:.7rem 0;
+  color:var(--dim);font-size:.86rem;
+}
+.note.warn{border-left-color:var(--warn)}
+.note.warn b{color:var(--warn)}
+
+/* ---- credential grid ---- */
+.creds{display:grid;gap:.7rem;margin:.9rem 0}
+.creds .k{font-size:.76rem;color:var(--faint);text-transform:uppercase;letter-spacing:.03em;font-weight:600;margin-bottom:.25rem}
+.launch{
+  display:inline-flex;align-items:center;gap:.45rem;margin-top:.2rem;
+  background:var(--accent);color:var(--accent-ink);font-weight:700;
+  padding:.6rem 1.05rem;border-radius:10px;font-size:.95rem;
+}
+.launch:hover{background:#ff9330;text-decoration:none}
+
+/* ---- footer ---- */
+.foot{color:var(--faint);font-size:.82rem;margin-top:1.6rem;text-align:center}
+.foot a{color:var(--dim)}
+
+/* ---- toast ---- */
+.toast{
+  position:fixed;left:50%;bottom:1.2rem;transform:translateX(-50%) translateY(6px);
+  background:var(--ink);color:var(--bg);padding:.5rem .95rem;border-radius:9px;
+  font-size:.85rem;font-weight:600;opacity:0;pointer-events:none;
+  transition:opacity .18s,transform .18s;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+@media (max-width:560px){
+  .shell{padding:1.4rem .85rem 3rem}
+  .stepper li{font-size:0;padding-top:.4rem}
+  .stepper li::after{content:attr(data-short);font-size:.7rem}
+  .card{padding:1rem .9rem}
+  .row > button{flex:1 1 auto}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <header>
+    <div class="mast">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M16 2.6 29.2 25.4H2.8Z" fill="none" stroke="#f6821f" stroke-width="2.4"
+              stroke-linejoin="round"/>
+        <circle cx="16" cy="18.6" r="3.4" fill="#f6821f"/>
+      </svg>
+      <div>
+        <h1>Trinity Panel</h1>
+        <div class="sub">Setup wizard</div>
+      </div>
+    </div>
+    <p class="lede">
+      This installs Trinity Panel onto your own Cloudflare account. Four steps, no
+      terminal commands, nothing stored on any machine but yours. Your API token is
+      used once, in this browser session, and is never written to disk.
+    </p>
+  </header>
+
+  <ol class="stepper" id="stepper">
+    <li data-step="1" data-short="Account" data-state="active">1 · Cloudflare account</li>
+    <li data-step="2" data-short="Token">2 · Create a token</li>
+    <li data-step="3" data-short="Install">3 · Install</li>
+    <li data-step="4" data-short="Done">4 · Your link</li>
+  </ol>
+
+  <!-- Step 1 — account -------------------------------------------------------->
+  <section class="card" id="card-1">
+    <h2><span class="n">1</span> Sign up and verify a Cloudflare account</h2>
+    <p>
+      Trinity Panel runs on Cloudflare Workers. The free plan is enough for personal
+      use. If you already have an account, skip to step&nbsp;2.
+    </p>
+    <ol class="steps">
+      <li><strong>Create the account</strong> at
+        <a href="https://dash.cloudflare.com/sign-up" target="_blank" rel="noopener noreferrer">dash.cloudflare.com/sign-up</a>
+        using an email you can read right now.</li>
+      <li><strong>Verify the email.</strong> Cloudflare sends a confirmation link.
+        An unverified account cannot create Workers, and the failure it produces
+        later is not obvious, so do this first.</li>
+      <li><strong>Register a workers.dev subdomain</strong> — open
+        <em>Workers &amp; Pages</em> in the dashboard and accept the subdomain it
+        offers. Your panel will live at
+        <span class="mono">&lt;name&gt;.&lt;subdomain&gt;.workers.dev</span>.</li>
+    </ol>
+    <div class="note">
+      No domain name and no payment method are required. A custom domain is optional
+      and can be attached later.
+    </div>
+    <div class="row">
+      <button class="primary" data-next="2">I have a verified account</button>
+      <a href="https://dash.cloudflare.com/sign-up" target="_blank" rel="noopener noreferrer">
+        <button class="ghost" type="button">Open sign-up</button>
+      </a>
+    </div>
+  </section>
+
+  <!-- Step 2 — token ---------------------------------------------------------->
+  <section class="card" id="card-2" hidden>
+    <h2><span class="n">2</span> Create an API token</h2>
+    <p>
+      The button below opens Cloudflare's token page with the permissions
+      pre-selected. Review them, scroll to the bottom, then
+      <strong>Continue to summary → Create Token</strong>. Copy the token once —
+      Cloudflare will not show it again.
+    </p>
+    <table class="perms">
+      <thead><tr><th>Permission</th><th>Why it is needed</th></tr></thead>
+      <tbody>
+        <tr><td>Workers Scripts · Edit</td><td>Upload the Worker itself.</td></tr>
+        <tr><td>Workers KV Storage · Edit</td><td>Create the namespace that stores your settings.</td></tr>
+        <tr><td>Account Settings · Read</td><td>Discover your account ID and workers.dev subdomain.</td></tr>
+        <tr><td>Workers Routes / DNS · Edit</td><td>Only used if you attach a custom domain. Harmless otherwise.</td></tr>
+      </tbody>
+    </table>
+    <div class="note warn">
+      <b>Scope it down if you prefer.</b> Only the first three rows are required by
+      this installer. The pre-selected link includes the optional two so a custom
+      domain works later without making a second token. You can deselect them.
+    </div>
+    <div class="field">
+      <label>Account scope</label>
+      <p class="help">On the token page, set <em>Account Resources</em> to the account
+        you want Trinity Panel installed on, and leave the token untouched otherwise.</p>
+    </div>
+    <div class="row">
+      <a id="token-link" target="_blank" rel="noopener noreferrer">
+        <button class="primary" type="button">Open Cloudflare token page</button>
+      </a>
+      <button class="ghost" data-next="3">I have my token</button>
+      <button class="ghost small" data-back="1">Back</button>
+    </div>
+  </section>
+
+  <!-- Step 3 — install -------------------------------------------------------->
+  <section class="card" id="card-3" hidden>
+    <h2><span class="n">3</span> Paste the token and install</h2>
+
+    <div class="field">
+      <label for="token">Cloudflare API token</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false"
+             placeholder="paste the token you just created">
+      <p class="help">Held in this page only. Sent to the local installer on this
+        machine, used against Cloudflare's API, and discarded when you close the tab.</p>
+    </div>
+
+    <div class="field">
+      <label for="method">Installation method</label>
+      <select id="method">
+        <option value="workers" selected>Cloudflare Workers — recommended</option>
+        <option value="workers-custom-domain">Cloudflare Workers + custom domain</option>
+        <option value="manual">Show me the commands instead</option>
+      </select>
+      <p class="help" id="method-help">
+        Compiles the Worker and uploads it over Cloudflare's API. Creates one Worker,
+        one KV namespace and one Durable Object on your account. Nothing else is touched.
+      </p>
+    </div>
+
+    <div class="field" id="field-name">
+      <label for="name">Worker name</label>
+      <input id="name" type="text" autocomplete="off" spellcheck="false"
+             placeholder="e.g. edge-cache-7f2a">
+      <p class="help">Becomes part of your hostname. Pick something unremarkable —
+        obviously proxy-shaped names attract attention. Leave blank for a random one.</p>
+    </div>
+
+    <div class="field" id="field-domain" hidden>
+      <label for="domain">Custom hostname</label>
+      <input id="domain" type="text" autocomplete="off" spellcheck="false"
+             placeholder="panel.example.com">
+      <p class="help">Must be a hostname on a zone already in this Cloudflare account.</p>
+    </div>
+
+    <div class="row">
+      <button class="primary" id="install">Install</button>
+      <button class="ghost small" data-back="2">Back</button>
+    </div>
+
+    <div class="status" id="status" data-state="standby" role="status" aria-live="polite">
+      <span class="dot"></span>
+      <span class="label" id="status-label">Standby</span>
+      <span class="detail" id="status-detail">Waiting for your token.</span>
+    </div>
+    <pre class="log" id="log" aria-live="polite"></pre>
+  </section>
+
+  <!-- Step 4 — done ----------------------------------------------------------->
+  <section class="card" id="card-4" hidden>
+    <h2><span class="n">4</span> Your private link</h2>
+    <p class="tight">
+      Trinity Panel is live. This link is the <strong>only</strong> way into your
+      panel — the path is random and unlisted, and every other path on the host
+      returns an ordinary-looking page. Treat the link as a password.
+    </p>
+
+    <a id="launch" class="launch" target="_blank" rel="noopener noreferrer">Open my panel →</a>
+
+    <div class="creds" id="creds"></div>
+
+    <div class="note warn">
+      <b>Saved nowhere but here.</b> These values were generated during install and
+      are not stored on disk by the installer. Copy them somewhere safe before
+      closing this tab. If you lose the panel password you can re-run the wizard to
+      set a new one.
+    </div>
+
+    <div class="row">
+      <button class="ghost small" id="copy-all">Copy everything</button>
+      <button class="ghost small" id="restart">Install another</button>
+    </div>
+  </section>
+
+  <p class="foot">
+    Trinity Panel · <a href="https://github.com/Osajjad0/trinity-panel" target="_blank" rel="noopener noreferrer">source</a>
+    · MIT licensed · you are installing onto your own account
+  </p>
+
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+/* The Cloudflare token page, with the permission set pre-selected. Kept as one
+   literal so it is auditable at a glance: nothing here is assembled from user
+   input. */
+const TOKEN_URL =
+  "https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=" +
+  encodeURIComponent(JSON.stringify([
+    { key: "workers_scripts",    type: "edit" },
+    { key: "workers_kv_storage", type: "edit" },
+    { key: "page",               type: "edit" },
+    { key: "dns",                type: "edit" },
+    { key: "user_details",       type: "read" },
+  ])) +
+  "&accountId=*&zoneId=all&name=Trinity-Panel";
+
+$("token-link").href = TOKEN_URL;
+
+/* ---- step navigation ---------------------------------------------------- */
+
+let step = 1;
+
+function show(n) {
+  step = n;
+  for (let i = 1; i <= 4; i++) $("card-" + i).hidden = i !== n;
+  for (const li of $("stepper").children) {
+    const s = Number(li.dataset.step);
+    li.dataset.state = s === n ? "active" : s < n ? "done" : "";
+  }
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-next],[data-back]");
+  if (!el) return;
+  e.preventDefault();
+  show(Number(el.dataset.next || el.dataset.back));
+});
+
+/* ---- toast and clipboard ------------------------------------------------ */
+
+let toastTimer = 0;
+function toast(message) {
+  const el = $("toast");
+  el.textContent = message;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 1600);
+}
+
+async function copy(text, what) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast((what || "Value") + " copied");
+  } catch {
+    // Clipboard access can be refused; a selection the user can copy by hand is
+    // a better outcome than a silent failure.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand && document.execCommand("copy");
+    ta.remove();
+    toast(ok ? (what || "Value") + " copied" : "Press Ctrl+C to copy");
+  }
+}
+
+/* A labelled value with its own copy button. */
+function copyable(value, { secret = false, label = "Value" } = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = "copyable";
+  const span = document.createElement("span");
+  span.className = "val" + (secret ? " secret" : "");
+  span.textContent = value;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "Copy";
+  btn.addEventListener("click", () => copy(value, label));
+  wrap.append(span, btn);
+  return wrap;
+}
+
+/* ---- status area -------------------------------------------------------- */
+
+const STATUS_LABELS = {
+  standby: "Standby",
+  installing: "Installing",
+  done: "Done",
+  failed: "Failed",
+};
+
+function setStatus(state, detail) {
+  $("status").dataset.state = state;
+  $("status-label").textContent = STATUS_LABELS[state] || state;
+  $("status-detail").textContent = detail || "";
+}
+
+function logLine(text, kind) {
+  const el = $("log");
+  const span = document.createElement("span");
+  if (kind) span.className = kind;
+  span.textContent = text + "\n";
+  el.appendChild(span);
+  el.scrollTop = el.scrollHeight;
+}
+
+/* ---- method dropdown ---------------------------------------------------- */
+
+const METHOD_HELP = {
+  "workers":
+    "Compiles the Worker and uploads it over Cloudflare's API. Creates one Worker, " +
+    "one KV namespace and one Durable Object on your account. Nothing else is touched.",
+  "workers-custom-domain":
+    "Same as above, then binds a hostname from a zone you already have on this " +
+    "account. Needs DNS · Edit on the token.",
+  "manual":
+    "Nothing is installed. The installer prints the exact two commands to run " +
+    "yourself, with the values it would have generated.",
+};
+
+$("method").addEventListener("change", () => {
+  const m = $("method").value;
+  $("method-help").textContent = METHOD_HELP[m];
+  $("field-domain").hidden = m !== "workers-custom-domain";
+  $("install").textContent = m === "manual" ? "Show commands" : "Install";
+});
+
+/* ---- install ------------------------------------------------------------ */
+
+$("token").addEventListener("input", () => {
+  if ($("status").dataset.state === "standby") {
+    setStatus("standby", $("token").value.trim() ? "Ready to install." : "Waiting for your token.");
+  }
+});
+
+$("install").addEventListener("click", install);
+
+async function install() {
+  const token = $("token").value.trim();
+  if (!token) {
+    setStatus("failed", "Paste your Cloudflare API token first.");
+    $("token").focus();
+    return;
+  }
+
+  const method = $("method").value;
+  const domain = $("domain").value.trim();
+  if (method === "workers-custom-domain" && !domain) {
+    setStatus("failed", "Enter the hostname you want to use.");
+    $("domain").focus();
+    return;
+  }
+
+  $("install").disabled = true;
+  $("log").textContent = "";
+  setStatus("installing", "Talking to Cloudflare...");
+
+  try {
+    const res = await fetch("api/install", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // Proves the request came from the page the installer served, not from
+        // some other site that happened to find this port open.
+        "X-Setup-Token": window.__SETUP_TOKEN__ || "",
+      },
+      body: JSON.stringify({ token, method, name: $("name").value.trim(), domain }),
+    });
+
+    // The installer streams newline-delimited JSON so a long build reports
+    // progress rather than looking hung.
+    await readEvents(res);
+  } catch (err) {
+    setStatus("failed", String(err && err.message ? err.message : err));
+    logLine(String(err), "e");
+  } finally {
+    $("install").disabled = false;
+  }
+}
+
+/* Read newline-delimited JSON events off the install response. */
+async function readEvents(res) {
+  const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+  if (!reader) {
+    handleEvent(JSON.parse(await res.text()));
+    return;
+  }
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (line) handleEvent(JSON.parse(line));
+    }
+  }
+  if (buffer.trim()) handleEvent(JSON.parse(buffer));
+}
+
+function handleEvent(ev) {
+  switch (ev.event) {
+    case "step":
+      setStatus("installing", ev.message);
+      logLine(ev.message);
+      break;
+    case "note":
+      logLine(ev.message);
+      break;
+    case "error":
+      setStatus("failed", ev.message);
+      logLine(ev.message, "e");
+      break;
+    case "commands":
+      setStatus("done", "Commands ready — run them yourself.");
+      logLine(ev.message, "g");
+      for (const c of ev.commands) logLine("  " + c);
+      break;
+    case "done":
+      setStatus("done", "Trinity Panel is live.");
+      logLine("Deployed.", "g");
+      finish(ev.result);
+      break;
+    default:
+      logLine(JSON.stringify(ev));
+  }
+}
+
+/* ---- final screen ------------------------------------------------------- */
+
+function finish(result) {
+  $("launch").href = result.panelUrl;
+
+  const rows = [
+    ["Panel link", result.panelUrl, false],
+    ["Panel password", result.panelPassword, true],
+    ["Subscription link", result.subscriptionUrl, false],
+    ["VLESS UUID", result.vlessUuid, true],
+    ["Trojan password", result.trojanPassword, true],
+    ["VMess UUID", result.vmessUuid, true],
+    ["Shadowsocks key", result.shadowsocksUsers, true],
+    ["Host", result.host, false],
+  ];
+
+  const box = $("creds");
+  box.textContent = "";
+  const plain = [];
+  for (const [label, value, secret] of rows) {
+    if (!value) continue;
+    const group = document.createElement("div");
+    const k = document.createElement("div");
+    k.className = "k";
+    k.textContent = label;
+    group.append(k, copyable(value, { secret, label }));
+    box.appendChild(group);
+    plain.push(label + ": " + value);
+  }
+
+  $("copy-all").onclick = () => copy(plain.join("\n"), "Everything");
+  show(4);
+}
+
+$("restart").addEventListener("click", () => {
+  $("token").value = "";
+  $("log").textContent = "";
+  setStatus("standby", "Waiting for your token.");
+  show(3);
+});
+</script>
+</body>
+</html>

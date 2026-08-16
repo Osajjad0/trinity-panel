@@ -1,0 +1,14 @@
+{
+  "name": "trinity-installer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The official web-based installer for Trinity Panel.",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.120.0"
+  }
+}

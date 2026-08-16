@@ -54,7 +54,7 @@ async fn dispatch(req: Request, env: &Env) -> Result<Response> {
         // protection for that — it is a diagnostic, so it is opt-in.
         Route::ConnectProbe => {
             if env.var("DIAGNOSTICS").map(|v| v.to_string()).unwrap_or_default() == "true" {
-                connect_probe(&req).await
+                connect_probe(&req, env).await
             } else {
                 decoy(env).await
             }
@@ -141,7 +141,7 @@ async fn duplex_probe(mut req: Request) -> Result<Response> {
 ///
 /// Reachable only under the secret XHTTP prefix, so it is not discoverable
 /// without already knowing the path.
-async fn connect_probe(req: &Request) -> Result<Response> {
+async fn connect_probe(req: &Request, env: &Env) -> Result<Response> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let url = req.url()?;
@@ -165,7 +165,16 @@ async fn connect_probe(req: &Request) -> Result<Response> {
         return json_steps(&steps);
     }
 
-    let mut sock = match crate::relay::connect::open(&target) {
+    // Load the operator's real outbound config so this probe diagnoses the
+    // path the relay actually takes. Falls back to Off on any error.
+    let outbound_cfg = crate::relay::outbound::load(env).await;
+    let plan = outbound_cfg.resolve(&target);
+    steps.push(format!("mode: {:?}, candidates: {}", outbound_cfg.mode, plan.candidates.len()));
+
+    // open_with_plan already awaits opened() for multi-candidate plans, so
+    // the socket returned here has a completed handshake. For single-candidate
+    // (Off mode) it returns the lazy socket, which we verify below.
+    let mut sock = match crate::relay::connect::open_with_plan(&plan).await {
         Ok(s) => {
             steps.push("connect() returned a socket".into());
             s
@@ -176,15 +185,19 @@ async fn connect_probe(req: &Request) -> Result<Response> {
         }
     };
 
-    // Cloudflare's connect() is lazy: it hands back a socket before the TCP
-    // handshake completes. Without awaiting `opened`, a connection that never
-    // establishes shows up much later as a read returning nothing.
-    match sock.opened().await {
-        Ok(_) => steps.push("socket opened".into()),
-        Err(e) => {
-            steps.push(format!("opened() failed: {e}"));
-            return json_steps(&steps);
+    // For Off mode (single candidate), open_with_plan returns the lazy socket
+    // without awaiting opened(). Verify the handshake explicitly so the probe
+    // reports the same information regardless of mode.
+    if plan.candidates.len() == 1 {
+        match sock.opened().await {
+            Ok(_) => steps.push("socket opened".into()),
+            Err(e) => {
+                steps.push(format!("opened() failed: {e}"));
+                return json_steps(&steps);
+            }
         }
+    } else {
+        steps.push("socket opened (verified by open_with_plan)".into());
     }
 
     let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");

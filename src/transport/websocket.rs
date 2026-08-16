@@ -71,10 +71,15 @@ pub fn handle(_req: &Request, env: &Env) -> Result<Response> {
         shadowsocks: read("SS_USERS"),
     });
 
+    // Clone env for the async task: the outbound config lives in KV and can
+    // only be read from an async context.
+    let env_clone = env.clone();
+
     spawn_local(async move {
+        let outbound_cfg = crate::relay::outbound::load(&env_clone).await;
         // Errors are deliberately swallowed: there is nobody to report them to
         // that is not also the untrusted peer.
-        let _ = serve(&server, creds).await;
+        let _ = serve(&server, creds, outbound_cfg).await;
         let _ = server.close(Some(1000), Some("bye"));
     });
 
@@ -86,6 +91,7 @@ pub fn handle(_req: &Request, env: &Env) -> Result<Response> {
 async fn serve(
     server: &WebSocket,
     creds: detect::Credentials,
+    outbound_cfg: crate::relay::outbound::OutboundConfig,
 ) -> core::result::Result<(), ()> {
     let mut events = server.events().map_err(|_| ())?;
 
@@ -126,7 +132,11 @@ async fn serve(
                     return Err(());
                 }
                 let target = req.target.ok_or(())?;
-                let sock = connect::open(&target).map_err(|_| ())?;
+                // Route through the outbound layer using the loaded config.
+                // In Off mode this is a single direct candidate; with Proxy IP
+                // or NAT64 each candidate's handshake is verified before use.
+                let plan = outbound_cfg.resolve(&target);
+                let sock = connect::open_with_plan(&plan).await.map_err(|_| ())?;
 
                 match req.kind {
                     // VLESS needs its two-zero-byte reply, then any payload that

@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "trinity-installer",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-01",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.01
+  },
+  // The installer serves its own UI from /public and the install API from
+  // /api. It holds no secrets of its own — the user's Cloudflare token lives
+  // only in the memory of a single install request and is discarded when that
+  // request ends.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  }
+  // No KV, no Durable Object, no secrets. The installer is stateless: every
+  // install is one request, one token, one response stream, then forgotten.
+}

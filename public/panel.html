@@ -202,6 +202,59 @@ th,td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid var(--line);v
       </div>
 
       <div class="card">
+        <h3>Outbound routing</h3>
+        <p class="muted">Controls how this Worker reaches the destinations your
+           clients ask for. This is server-side relay behaviour, not a client
+           setting — it does not appear in share links or config files.</p>
+        <div class="field" style="max-width:320px">
+          <label for="ob-mode">Mode</label>
+          <div class="help">Off dials the destination directly. Proxy IP tries
+             one or more intermediate addresses first. NAT64 rewrites IPv4
+             destinations into IPv6 form — experimental, see the note below.</div>
+          <select id="ob-mode">
+            <option value="off">Off — direct dial</option>
+            <option value="proxyIp">Proxy IP — try intermediates first</option>
+            <option value="nat64">NAT64 — synthesise IPv6 for IPv4 (experimental)</option>
+          </select>
+        </div>
+
+        <div id="ob-proxy" class="hidden">
+          <div class="field">
+            <label for="ob-proxies">Proxy candidates</label>
+            <div class="help">One IPv4 address or hostname per line. Private,
+               loopback, and documentation ranges are refused. The first one that
+               connects wins; the rest are tried in order.</div>
+            <textarea id="ob-proxies" rows="4" spellcheck="false" placeholder="1.2.3.4&#10;edge.example.com"></textarea>
+          </div>
+          <div class="field" style="max-width:160px">
+            <label for="ob-attempts">Max attempts</label>
+            <div class="help">How many candidates to try before giving up (1–8).</div>
+            <input id="ob-attempts" type="number" min="1" max="8" value="3">
+          </div>
+        </div>
+
+        <div id="ob-nat64" class="hidden">
+          <div class="field">
+            <label for="ob-prefixes">NAT64 prefixes</label>
+            <div class="help">One /96 prefix per line. The first valid one
+               is used; <code>64:ff9b::/96</code> is the default if none apply.</div>
+            <textarea id="ob-prefixes" rows="3" spellcheck="false" placeholder="64:ff9b::/96"></textarea>
+          </div>
+          <p class="muted sev-degraded">Experimental — measured not to work on
+             workers.dev as of 2026-08. Two runtime limits stack up: the
+             destination must already be an IPv4 <em>literal</em> (a domain
+             cannot be synthesised, because the runtime exposes no DNS API, so
+             domains fall back to direct), and outbound dials to IPv6 literals
+             were observed to fail regardless of NAT64 — a native IPv6 address
+             that answers from elsewhere does not connect from a Worker. Since
+             NAT64 can only ever produce an IPv6 target, it has nothing to
+             succeed with. Left in place because it costs nothing when unused
+             and the runtime may gain IPv6 egress later. Use Proxy IP instead;
+             that path is verified working.</p>
+        </div>
+      </div>
+
+      <div class="card">
         <h3>Preview what an app receives</h3>
         <div class="row" style="margin-bottom:.6rem">
           <div style="min-width:200px;flex:1"><select id="export-client"></select></div>
@@ -235,6 +288,7 @@ const api = (p) => `${BASE}/api/${p}`;
 let STATE = null;      // last /api/state response
 let NODES = [];        // working copy; saved as a whole
 let CURRENT = 0;       // index into NODES
+let OUTBOUND = null;   // working copy of outbound routing config
 let DIRTY = false;
 
 const $ = (id) => document.getElementById(id);
@@ -344,6 +398,7 @@ async function boot() {
   $("app").classList.remove("hidden");
 
   NODES = structuredClone(STATE.nodes);
+  OUTBOUND = structuredClone(STATE.outbound ?? { mode: "off", proxyCandidates: [], nat64Prefixes: [], maxProxyAttempts: 3 });
   CURRENT = 0;
   DIRTY = false;
   $("save").disabled = true;
@@ -362,7 +417,53 @@ async function boot() {
   fillClientSelects();
   renderClients();
   renderNodeList();
+  renderOutbound();
   await renderEditor();
+}
+
+// ---- outbound routing ------------------------------------------------------
+//
+// Server-side relay behaviour, so it is not part of a node and does not appear
+// in any share link. Kept as one working copy that `save` collects from the
+// form, the same way NODES is collected from the editor.
+
+function renderOutbound() {
+  const mode = OUTBOUND.mode || "off";
+  $("ob-mode").value = mode;
+  $("ob-proxies").value = (OUTBOUND.proxyCandidates || []).join("\n");
+  $("ob-prefixes").value = (OUTBOUND.nat64Prefixes || []).join("\n");
+  $("ob-attempts").value = OUTBOUND.maxProxyAttempts ?? 3;
+  showOutboundMode(mode);
+}
+
+/// Only the fields the selected mode actually uses are shown. A visible
+/// NAT64 box in Proxy IP mode reads as "this applies too", and it does not.
+function showOutboundMode(mode) {
+  $("ob-proxy").classList.toggle("hidden", mode !== "proxyIp");
+  $("ob-nat64").classList.toggle("hidden", mode !== "nat64");
+}
+
+/// Read the form back into the shape the API expects.
+///
+/// Blank lines are dropped here rather than sent: the relay would skip them
+/// anyway, and a stored config full of empty strings is harder to read back.
+function collectOutbound() {
+  const lines = (id) => $(id).value.split("\n").map((s) => s.trim()).filter(Boolean);
+  const attempts = Number.parseInt($("ob-attempts").value, 10);
+  return {
+    mode: $("ob-mode").value,
+    proxyCandidates: lines("ob-proxies"),
+    nat64Prefixes: lines("ob-prefixes"),
+    maxProxyAttempts: Number.isFinite(attempts) ? Math.min(8, Math.max(1, attempts)) : 3,
+  };
+}
+
+$("ob-mode").onchange = () => {
+  showOutboundMode($("ob-mode").value);
+  markDirty();
+};
+for (const id of ["ob-proxies", "ob-prefixes", "ob-attempts"]) {
+  $(id).oninput = markDirty;
 }
 
 function fillClientSelects() {
@@ -680,12 +781,18 @@ $("save").onclick = async () => {
   $("save").disabled = true;
   const keep = CURRENT;
   try {
-    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES }) });
+    // Collect outbound routing config from the UI. The server defaults to Off
+    // when the field is absent, so an unchanged panel never wipes a stored
+    // config that was set by another session or a direct KV edit.
+    OUTBOUND = collectOutbound();
+    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES, outbound: OUTBOUND }) });
     if (body && body.ok && body.state) {
       STATE = body.state;
       NODES = structuredClone(STATE.nodes);
+      OUTBOUND = structuredClone(STATE.outbound ?? OUTBOUND);
       CURRENT = Math.min(keep, Math.max(0, NODES.length - 1));
       renderNodeList();
+      renderOutbound();
       await renderEditor();
       renderClients();
       showTab("advanced");

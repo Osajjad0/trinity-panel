@@ -24,6 +24,7 @@
 //! entirely.
 
 pub mod connect;
+pub mod outbound;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
