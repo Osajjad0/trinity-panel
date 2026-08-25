@@ -41,12 +41,10 @@
 //! wait for the other.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use futures_channel::mpsc;
-use futures_util::future::Either;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // `wasm_bindgen` and `DurableObject` are not referenced anywhere below — the
@@ -57,6 +55,7 @@ use worker::{
 };
 
 use super::diag::{SessionDiag, SessionEnd, DownExit};
+use super::supervise::{self, Supervisor};
 use super::wire::{self, Class};
 use super::{UploadQueue, DEFAULT_MAX_BUFFERED_POSTS, DEFAULT_MAX_POST_BYTES};
 #[allow(unused_imports)] // used by the socket-owning task below on some paths
@@ -78,10 +77,10 @@ const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// Seconds of complete inactivity (no bytes in either direction) before the
-/// session is torn down. This releases the Durable Object instance so it stops
-/// consuming duration quota on the free tier. Active streaming resets the
-/// counter continuously, so only truly abandoned sessions are affected.
-const IDLE_TIMEOUT_SECS: u32 = 60;
+/// session is torn down. The threshold now lives in [`super::supervise`], as
+/// part of the transition table that enforces it; the value (60s) and its
+/// semantics — reset by any successful transfer either direction — are
+/// unchanged.
 
 /// Seconds a session may sit before its protocol header completes.
 ///
@@ -561,22 +560,44 @@ async fn own_session(
         }
     }
 
-    // Idle timeout: if no bytes flow in either direction for IDLE_TIMEOUT_SECS,
-    // tear down the session to release DO duration. The activity flag is set by
-    // both relay directions whenever bytes are successfully transferred.
-    let activity = Arc::new(AtomicBool::new(true));
-    let upstream_activity = activity.clone();
-    let downstream_activity = activity.clone();
+    // Supervision plumbing. The pumps report progress and completion as
+    // events; a pure state machine (`supervise`) turns those into teardown
+    // decisions, and the upstream pump races its input against a cancel
+    // signal so `CloseUpstream` can stop it without dropping the session.
+    let (mut cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
+    let (events_tx, mut events_rx) = mpsc::unbounded::<supervise::Event>();
+    let down_events = events_tx.clone();
 
     // Both directions run as one task rather than two. A nested `spawn_local`
     // would belong to whichever request happened to be executing, and would be
     // cancelled when that request finished -- the same trap the outer task hit.
     // Joining them here means the single future handed to `wait_until` owns
     // everything, and neither direction can outlive or orphan the other.
+    let up_events = events_tx;
     let upstream = async move {
-        while let Some(chunk) = uplink.next().await {
+        loop {
+            let chunk = {
+                match futures_util::future::select(
+                    Box::pin(uplink.next()),
+                    Box::pin(cancel_rx.next()),
+                )
+                .await
+                {
+                    futures_util::future::Either::Left((chunk, _)) => chunk,
+                    // Supervised close: stop feeding the destination and fall
+                    // through to the shutdown that signals it EOF.
+                    futures_util::future::Either::Right(_) => break,
+                }
+            };
+            let Some(chunk) = chunk else {
+                break; // client vanished before completing the session
+            };
             if decoder.decode(chunk, &mut ready).is_err() {
-                break; // corrupt or forged; nothing recoverable follows
+                // Corrupt or forged mid-session data: nothing recoverable
+                // follows, so report the poisoning instead of letting the
+                // supervisor read this as an ordinary client departure.
+                let _ = up_events.unbounded_send(supervise::Event::Poisoned);
+                break;
             }
             let mut failed = false;
             for piece in ready.drain(..) {
@@ -584,7 +605,7 @@ async fn own_session(
                     failed = true;
                     break;
                 }
-                upstream_activity.store(true, Ordering::Relaxed);
+                let _ = up_events.unbounded_send(supervise::Event::UpBytes);
             }
             if failed {
                 break;
@@ -593,9 +614,11 @@ async fn own_session(
         // Closing the write half signals EOF to the destination rather than
         // leaving it waiting for a request body that will never arrive.
         let _ = writer.shutdown().await;
+        let _ = up_events.unbounded_send(supervise::Event::UpDone);
     };
 
     let downlink = async move {
+
         let pump_started_ms = now_ms();
         let Ok(prologue) = encoder.prologue() else { return };
         if !prologue.is_empty() && down.send(Ok(prologue)).await.is_err() {
@@ -632,7 +655,7 @@ async fn own_session(
                 }
                 Ok(n) => {
                     down_diag.record_read(n);
-                    downstream_activity.store(true, Ordering::Relaxed);
+                    let _ = down_events.unbounded_send(supervise::Event::DownBytes);
                 }
             }
 
@@ -657,7 +680,8 @@ async fn own_session(
                         }
                         futures_util::future::Either::Left((Ok(n), _)) => {
                             down_diag.record_read(n);
-                            downstream_activity.store(true, Ordering::Relaxed);
+                            let _ =
+                                down_events.unbounded_send(supervise::Event::DownBytes);
                         }
                         // Window closed: whatever the train delivered so far
                         // goes out as one chunk.
@@ -668,6 +692,9 @@ async fn own_session(
 
             if buf.is_empty() {
                 if eof_or_error {
+                    let _ = down_events.unbounded_send(supervise::Event::DownDone(
+                        down_diag.down_exit.get().unwrap_or(DownExit::Eof),
+                    ));
                     break;
                 }
                 continue;
@@ -675,11 +702,15 @@ async fn own_session(
             let chunk = buf.split().freeze();
             let Ok(wrapped) = encoder.encode(chunk) else {
                 down_diag.down_exit.set(Some(DownExit::EncodeFailed));
+                let _ = down_events
+                    .unbounded_send(supervise::Event::DownDone(DownExit::EncodeFailed));
                 break;
             };
             let sent_len = wrapped.len();
             if down.send(Ok(wrapped)).await.is_err() {
                 down_diag.down_exit.set(Some(DownExit::ReceiverGone));
+                let _ = down_events
+                    .unbounded_send(supervise::Event::DownDone(DownExit::ReceiverGone));
                 break;
             }
             down_diag.record_send(sent_len);
@@ -692,43 +723,67 @@ async fn own_session(
         down_diag.pump_ms.set(now_ms().saturating_sub(pump_started_ms));
     };
 
-    // Race the relay against an idle timer. The timer checks the activity flag
-    // every second; if no bytes flowed for IDLE_TIMEOUT_SECS consecutive checks,
-    // the session is considered abandoned and the select drops both relay futures.
-    let idle_timer = async {
-        let mut idle_secs: u32 = 0;
-        loop {
-            gloo_timers::future::sleep(std::time::Duration::from_secs(1)).await;
-            if activity.swap(false, Ordering::Relaxed) {
-                idle_secs = 0;
-            } else {
-                idle_secs += 1;
-                if idle_secs >= IDLE_TIMEOUT_SECS {
-                    return;
+    // The supervisor owns teardown. It is driven here — the same single
+    // future that owns the pumps polls them alongside a control stream of
+    // pump events and one-second ticks, so no direction can be orphaned and
+    // no decision can be missed.
+    // By here every sender lives inside one of the two pumps, so the event
+    // channel closing is exactly "both pumps finished".
+
+    let mut relays = Box::pin(futures_util::future::join(upstream, downlink));
+    let mut supervisor = Supervisor::new();
+    // Assigned on every exit path; when the join arm wins, both pumps
+    // finished on their own — exactly as before supervision existed.
+    let end_reason;
+
+    loop {
+        let control = futures_util::future::select(
+            Box::pin(events_rx.next()),
+            Box::pin(gloo_timers::future::sleep(std::time::Duration::from_secs(1))),
+        );
+        match futures_util::future::select(relays.as_mut(), control).await {
+            futures_util::future::Either::Left(_) => {
+                end_reason = SessionEnd::RelaysDone;
+                break;
+            }
+            futures_util::future::Either::Right((control_out, _)) => {
+                let event = match control_out {
+                    futures_util::future::Either::Left((ev, _)) => ev,
+                    futures_util::future::Either::Right(_) => {
+                        Some(supervise::Event::TimerTick)
+                    }
+                };
+                let Some(ev) = event else {
+                    // Both pumps dropped their senders; the join arm above
+                    // normally fires first, but either way they are done.
+                    end_reason = SessionEnd::RelaysDone;
+                    break;
+                };
+                match supervisor.on(ev) {
+                    supervise::Decision::Continue => {}
+                    supervise::Decision::CloseUpstream => {
+                        let _ = cancel_tx.try_send(());
+                    }
+                    supervise::Decision::EndSession => {
+                        end_reason = if ev == supervise::Event::TimerTick {
+                            // A timer kill is never normal; surface it even
+                            // without the KV binding so a bench run sees it in
+                            // the worker logs.
+                            worker::console_log!(
+                                "trinity-diag sid={} idle_timer_fired",
+                                sid
+                            );
+                            SessionEnd::IdleTimerFired
+                        } else {
+                            terminal_reason(&ev)
+                        };
+                        break;
+                    }
                 }
             }
         }
-    };
-
-    let winner = futures_util::future::select(
-        Box::pin(futures_util::future::join(upstream, downlink)),
-        Box::pin(idle_timer),
-    )
-    .await;
-
-    // Which side won decides how the client experienced this session: the
-    // timer's win drops both relays mid-await and the GET body just stops,
-    // indistinguishable from a clean end on an unframed codec. That is exactly
-    // the truncation signature we are hunting.
-    match winner {
-        Either::Left(_) => diag.session_end.set(Some(SessionEnd::RelaysDone)),
-        Either::Right(_) => {
-            diag.session_end.set(Some(SessionEnd::IdleTimerFired));
-            // A timer kill is never normal; surface it even without the KV
-            // binding so a bench run sees it in the worker logs.
-            worker::console_log!("trinity-diag sid={} idle_timer_fired", sid);
-        }
     }
+    diag.session_end.set(Some(end_reason));
     // Last-known-good bookkeeping, once per session at teardown. Only a win
     // by a genuine proxy candidate records a preference: a direct win would
     // write this session's destination host into shared state where it could
@@ -753,6 +808,19 @@ async fn own_session(
         }
     }
     publish(&diag, &sid, &env).await;
+}
+
+/// Map the terminal supervisor event onto its diagnostic reason.
+///
+/// Natural completions (both pumps finishing, whichever reported last) keep
+/// the historical `relays_done`; only the supervised early endings get their
+/// own additive labels.
+fn terminal_reason(event: &supervise::Event) -> SessionEnd {
+    match event {
+        supervise::Event::DownDone(DownExit::ReceiverGone) => SessionEnd::ReceiverGone,
+        supervise::Event::Poisoned => SessionEnd::Poisoned,
+        _ => SessionEnd::RelaysDone,
+    }
 }
 
 /// Opt-in publication: only when the deployment carries a `SESSION_DIAG`

@@ -22,6 +22,7 @@
 pub mod durable;
 pub mod diag;
 pub mod session;
+pub mod supervise;
 pub mod wire;
 
 pub use session::{Accepted, QueueError, UploadQueue};
