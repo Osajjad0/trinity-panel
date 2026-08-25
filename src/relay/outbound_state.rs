@@ -74,16 +74,21 @@ impl OutboundState {
     }
 }
 
-/// The canonical comparison key for a candidate.
+/// The canonical comparison key for a candidate: host and PORT.
 ///
 /// Domains compare case-insensitively (KV stores what the panel saved, xray
 /// dials whatever case it resolved), IPs through their canonical rendering.
+/// The port is part of the key on purpose: a proxy host that carried TLS
+/// traffic says nothing about whether it forwards plain port-80 dials, and a
+/// port-blind preference was measured adding a full 5 s handshake timeout to
+/// every mismatched-port dial before the fallback succeeded.
 #[must_use]
 pub fn candidate_key(target: &Target) -> String {
-    match &target.host {
+    let host = match &target.host {
         Host::Domain(d) => d.trim().to_ascii_lowercase(),
         Host::Ip(ip) => ip.to_string(),
-    }
+    };
+    format!("{host}:{}", target.port)
 }
 
 /// Move the fresh preferred candidate to the front of the plan, if it is one
@@ -154,16 +159,40 @@ mod tests {
     #[test]
     fn fresh_preferred_moves_to_the_front() {
         let p = plan(&["dest.example", "di.nscl.ir", "nima.nscl.ir"], 443);
-        let ordered = order_plan(p, &state(Some("di.nscl.ir"), NOW - 1_000), NOW);
+        let ordered = order_plan(p, &state(Some("di.nscl.ir:443"), NOW - 1_000), NOW);
         assert_eq!(ordered.candidates[0], t("di.nscl.ir", 443));
         assert_eq!(ordered.candidates.len(), 3);
         assert_eq!(ordered.logical, t("dest.example", 443));
     }
 
     #[test]
+    fn a_preference_learned_on_one_port_never_reorders_another_port() {
+        // Regression for the measured live failure: a proxy that won on 443
+        // was reordered ahead of direct for port-80 dials too, where it
+        // blackholed and burned the whole handshake budget every time.
+        let p = plan(&["dest.example", "di.nscl.ir", "nima.nscl.ir"], 80);
+        let ordered = order_plan(p, &state(Some("di.nscl.ir:443"), NOW - 1_000), NOW);
+        assert_eq!(ordered.candidates[0], t("dest.example", 80));
+        // And the mirror image: an 80-win means nothing to a 443 dial.
+        let p443 = plan(&["dest.example", "di.nscl.ir"], 443);
+        let ordered443 =
+            order_plan(p443, &state(Some("di.nscl.ir:80"), NOW - 1_000), NOW);
+        assert_eq!(ordered443.candidates[0], t("dest.example", 443));
+    }
+
+    #[test]
+    fn legacy_host_only_preferences_match_nothing_rather_than_guessing() {
+        // Documents written before the port was part of the key degrade to
+        // no-reorder instead of applying a possibly wrong guess.
+        let p = plan(&["dest.example", "di.nscl.ir"], 443);
+        let ordered = order_plan(p, &state(Some("di.nscl.ir"), NOW - 1_000), NOW);
+        assert_eq!(ordered.candidates[0], t("dest.example", 443));
+    }
+
+    #[test]
     fn matching_is_case_insensitive_and_trimmed() {
         let p = plan(&["dest.example", "DI.NSCL.IR"], 443);
-        let ordered = order_plan(p, &state(Some("  di.nscl.ir "), NOW - 1_000), NOW);
+        let ordered = order_plan(p, &state(Some("  di.nscl.ir:443 "), NOW - 1_000), NOW);
         assert_eq!(ordered.candidates[0], t("DI.NSCL.IR", 443));
     }
 
@@ -173,13 +202,13 @@ mod tests {
         // Exactly one TTL old is still fresh enough to act on.
         let at_boundary = order_plan(
             plan(&["dest.example", "di.nscl.ir"], 443),
-            &state(Some("di.nscl.ir"), NOW - ttl_ms),
+            &state(Some("di.nscl.ir:443"), NOW - ttl_ms),
             NOW,
         );
         assert_eq!(at_boundary.candidates[0], t("di.nscl.ir", 443));
         // One millisecond past it is stale and reorders nothing.
         let past_ttl =
-            order_plan(plan(&["dest.example", "di.nscl.ir"], 443), &state(Some("di.nscl.ir"), NOW - ttl_ms - 1), NOW);
+            order_plan(plan(&["dest.example", "di.nscl.ir"], 443), &state(Some("di.nscl.ir:443"), NOW - ttl_ms - 1), NOW);
         assert_eq!(past_ttl.candidates[0], t("dest.example", 443));
         assert_eq!(past_ttl.candidates[1], t("di.nscl.ir", 443));
     }
@@ -196,7 +225,7 @@ mod tests {
     #[test]
     fn preference_not_in_the_plan_is_ignored() {
         let p = plan(&["dest.example", "di.nscl.ir"], 443);
-        let out = order_plan(p, &state(Some("pyip.ygkkk.dpdns.org"), NOW - 1_000), NOW);
+        let out = order_plan(p, &state(Some("pyip.ygkkk.dpdns.org:443"), NOW - 1_000), NOW);
         assert_eq!(
             out.candidates,
             vec![t("dest.example", 443), t("di.nscl.ir", 443)]
@@ -206,7 +235,7 @@ mod tests {
     #[test]
     fn already_first_is_a_no_op_not_a_churn() {
         let p = plan(&["dest.example", "di.nscl.ir"], 443);
-        let out = order_plan(p, &state(Some("DEST.EXAMPLE"), NOW - 1_000), NOW);
+        let out = order_plan(p, &state(Some("dest.example:443"), NOW - 1_000), NOW);
         assert_eq!(out.candidates[0], t("dest.example", 443));
         assert_eq!(out.candidates.len(), 2);
     }
@@ -239,7 +268,7 @@ mod tests {
             let age = (seed % 5_000_000) as u64;
             seed ^= seed << 17;
             let pick = pool[(seed as usize) % pool.len()];
-            let st = state(Some(pick), NOW.saturating_sub(age));
+            let st = state(Some(&format!("{pick}:443")), NOW.saturating_sub(age));
 
             let out = order_plan(built.clone(), &st, NOW);
 
@@ -255,7 +284,7 @@ mod tests {
 
     #[test]
     fn changed_winner_inside_debounce_window_is_not_recorded() {
-        let s = state(Some("di.nscl.ir"), NOW - (WRITE_DEBOUNCE_SECS * 1000 - 1));
+        let s = state(Some("di.nscl.ir:443"), NOW - (WRITE_DEBOUNCE_SECS * 1000 - 1));
         assert!(!should_record(&t("nima.nscl.ir", 443), &s, NOW));
     }
 
@@ -267,7 +296,7 @@ mod tests {
 
     #[test]
     fn unchanged_winner_is_never_recorded_even_when_due() {
-        let s = state(Some("di.nscl.ir"), NOW - WRITE_DEBOUNCE_SECS * 1000 * 100);
+        let s = state(Some("di.nscl.ir:443"), NOW - WRITE_DEBOUNCE_SECS * 1000 * 100);
         assert!(!should_record(&t("DI.NSCL.IR", 443), &s, NOW));
     }
 
@@ -279,7 +308,7 @@ mod tests {
 
     #[test]
     fn serde_round_trip_preserves_the_document() {
-        let original = state(Some("Di.Nscl.ir"), 1_756_000_000_123);
+        let original = state(Some("Di.Nscl.ir:443"), 1_756_000_000_123);
         let json = serde_json::to_string(&original).unwrap();
         assert_eq!(OutboundState::from_json(&json), original);
         // camelCase on the wire, as everywhere else in this project.
@@ -310,9 +339,9 @@ mod tests {
         };
         let target = t("www.gstatic.com", 443);
         let resolved = cfg.resolve(&target);
-        let ordered = order_plan(resolved.clone(), &state(Some("nima.nscl.ir"), NOW - 1), NOW);
+        let ordered = order_plan(resolved.clone(), &state(Some("nima.nscl.ir:443"), NOW - 1), NOW);
         assert_eq!(ordered.candidates.len(), resolved.candidates.len());
-        assert_eq!(candidate_key(&ordered.candidates[0]), "nima.nscl.ir");
+        assert_eq!(candidate_key(&ordered.candidates[0]), "nima.nscl.ir:443");
         assert_eq!(ordered.logical, target);
     }
 }
