@@ -59,11 +59,19 @@ pub struct Settings {
     /// networks. Defaults to false when absent from stored JSON.
     #[serde(default)]
     pub enhanced_reachability: bool,
+    /// Optimistic-concurrency revision, bumped on every successful save.
+    /// A client may send the revision it loaded as `expectedRev`; a mismatch
+    /// means another tab (or session) saved first and the edit is refused
+    /// rather than silently overwriting it. Defaults to 0 for documents that
+    /// predate the field, so the very first save after an upgrade always
+    /// succeeds.
+    #[serde(default)]
+    pub rev: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { version: VERSION, nodes: Vec::new(), outbound: OutboundConfig::default(), enhanced_reachability: false }
+        Self { version: VERSION, nodes: Vec::new(), outbound: OutboundConfig::default(), enhanced_reachability: false, rev: 0 }
     }
 }
 
@@ -171,7 +179,7 @@ impl Settings {
             }
         }
 
-        Self { version: VERSION, nodes, outbound: OutboundConfig::default(), enhanced_reachability: false }
+        Self { version: VERSION, nodes, outbound: OutboundConfig::default(), enhanced_reachability: false, rev: 0 }
     }
 
     /// Parse a stored document, rejecting one from a future schema.
@@ -317,9 +325,21 @@ mod tests {
 
     #[test]
     fn settings_round_trip_through_storage() {
-        let s = Settings::derive_from_env(&deployment());
+        let mut s = Settings::derive_from_env(&deployment());
+        s.rev = 7;
         let json = s.to_json().expect("serialises");
         assert_eq!(Settings::parse(&json).expect("parses"), s);
+        // The wire name is camelCase, like every other field here.
+        assert!(json.contains("\"rev\":7"));
+    }
+
+    #[test]
+    fn a_document_without_a_revision_loads_as_revision_zero() {
+        // Documents written before optimistic concurrency existed must keep
+        // loading, and their first save must succeed.
+        let raw = r#"{"version":1,"nodes":[]}"#;
+        let s = Settings::parse(raw).expect("parses");
+        assert_eq!(s.rev, 0);
     }
 
     #[test]

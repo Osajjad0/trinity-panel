@@ -818,7 +818,11 @@ $("save").onclick = async () => {
     // when the field is absent, so an unchanged panel never wipes a stored
     // config that was set by another session or a direct KV edit.
     OUTBOUND = collectOutbound();
-    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES, outbound: OUTBOUND, enhanced_reachability: $("enh-reach").checked }) });
+    // Send the revision we loaded so a save racing another tab is refused
+    // instead of silently overwriting it. An old backend ignores the field;
+    // a state without rev (older session) omits it via undefined.
+    const expectedRev = typeof STATE?.rev === "number" ? STATE.rev : undefined;
+    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES, outbound: OUTBOUND, enhanced_reachability: $("enh-reach").checked, expected_rev: expectedRev }) });
     if (body && body.ok && body.state) {
       STATE = body.state;
       NODES = structuredClone(STATE.nodes);

@@ -215,7 +215,17 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         return refuse(&message);
     }
 
-    let settings = Settings { version: super::store::VERSION, nodes: body.nodes, outbound: body.outbound, enhanced_reachability: body.enhanced_reachability };
+    // Optimistic concurrency: compare what the client loaded against what is
+    // stored now. A mismatch means another tab or session saved first; their
+    // edit wins and this one is refused with instructions rather than
+    // silently overwriting it. Old clients send no expectation at all.
+    let host = host_of(req);
+    let (stored, _, _) = load(env, &host).await;
+    let Ok(new_rev) = api::resolve_save_rev(body.expected_rev, stored.rev) else {
+        return refuse(api::REV_CONFLICT_MESSAGE);
+    };
+
+    let settings = Settings { version: super::store::VERSION, nodes: body.nodes, outbound: body.outbound, enhanced_reachability: body.enhanced_reachability, rev: new_rev };
     let Ok(document) = settings.to_json() else {
         return refuse("Those settings could not be stored.");
     };
@@ -230,7 +240,6 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         }
         Err(_) => return refuse("Saving failed. Nothing was changed."),
     }
-    let host = host_of(req);
     let sub_base = format!("https://{host}{}", var(env, "SUB_PATH"));
     let xhttp_path = var(env, "XHTTP_PATH");
     let state = api::state(&settings, &host, &sub_base, &xhttp_path, Source::Stored, None);

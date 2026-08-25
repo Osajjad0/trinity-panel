@@ -95,6 +95,27 @@ pub struct SaveRequest {
     /// clients), and off is the byte-identical existing behaviour.
     #[serde(default)]
     pub enhanced_reachability: bool,
+    /// The revision the client loaded, for optimistic concurrency. Absent
+    /// from old clients, whose saves behave exactly as they always did.
+    #[serde(default)]
+    pub expected_rev: Option<u32>,
+}
+
+/// Refusal shown when a save raced another save.
+pub const REV_CONFLICT_MESSAGE: &str = "Settings changed elsewhere. Reload and try again.";
+
+/// Resolve the revision a successful save should store.
+///
+/// `expected_rev` is what the client believes is currently stored. A mismatch
+/// with `stored_rev` means someone else saved first; refusing keeps the other
+/// tab's edit intact instead of silently overwriting it. Old clients send no
+/// expectation and always succeed — the historical behaviour.
+pub fn resolve_save_rev(expected_rev: Option<u32>, stored_rev: u32) -> Result<u32, &'static str> {
+    match expected_rev {
+        Some(expected) if expected != stored_rev => Err(REV_CONFLICT_MESSAGE),
+        // Wrapping so even a u32::MAX-stored document stays savable.
+        _ => Ok(stored_rev.wrapping_add(1)),
+    }
 }
 
 /// What the browser posts to re-check a draft.
@@ -190,6 +211,10 @@ pub struct State {
     /// The Enhanced Reachability toggle's current value. Shown so the panel
     /// renders the same on/off state the subscriptions are being served with.
     pub enhanced_reachability: bool,
+    /// Optimistic-concurrency revision of the settings document. Sent back as
+    /// `expectedRev` on save; a stale value is refused with an explanation
+    /// rather than silently overwriting whoever saved in between.
+    pub rev: u32,
 }
 
 /// Where the settings a request is serving came from.
@@ -236,6 +261,7 @@ pub fn state(
         blank: super::advisor::blank(host, xhttp_path),
         outbound: settings.outbound.clone(),
         enhanced_reachability: settings.enhanced_reachability,
+        rev: settings.rev,
     }
 }
 
@@ -454,6 +480,33 @@ mod tests {
         Endpoint, Flow, Mux, Protocol, Security, TlsSettings, Transport, XhttpMode,
     };
 
+    #[test]
+    fn a_stale_expected_revision_is_refused_with_guidance() {
+        assert_eq!(
+            resolve_save_rev(Some(3), 5),
+            Err(REV_CONFLICT_MESSAGE)
+        );
+        assert_eq!(REV_CONFLICT_MESSAGE, "Settings changed elsewhere. Reload and try again.");
+    }
+
+    #[test]
+    fn a_matching_expected_revision_saves_and_bumps() {
+        assert_eq!(resolve_save_rev(Some(5), 5), Ok(6));
+        assert_eq!(resolve_save_rev(Some(0), 0), Ok(1));
+    }
+
+    #[test]
+    fn an_old_client_without_an_expectation_behaves_as_before() {
+        // No expected_rev field: the save succeeds whatever is stored.
+        assert_eq!(resolve_save_rev(None, 0), Ok(1));
+        assert_eq!(resolve_save_rev(None, 41), Ok(42));
+    }
+
+    #[test]
+    fn the_revision_counter_wraps_rather_than_panicking() {
+        assert_eq!(resolve_save_rev(Some(u32::MAX), u32::MAX), Ok(0));
+    }
+
     fn node(tag: &str) -> Node {
         Node {
             tag: tag.to_owned(),
@@ -483,6 +536,7 @@ mod tests {
             nodes: vec![node("a"), node("b")],
             outbound: OutboundConfig::default(),
             enhanced_reachability: false,
+            rev: 4,
         }
     }
 

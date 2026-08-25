@@ -248,7 +248,8 @@ mod tests {
     }
 
     mod handshake_bound {
-        use super::*;
+        // Explicit imports at the bottom of the module; nothing else from
+        // the parent is used here.
 
         /// A dial whose handshake never completes — the blackhole case.
         struct Never;
