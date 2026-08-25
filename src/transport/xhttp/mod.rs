@@ -20,6 +20,7 @@
 
 #[cfg(target_arch = "wasm32")]
 pub mod durable;
+pub mod diag;
 pub mod session;
 pub mod wire;
 

@@ -84,11 +84,35 @@ async fn xhttp(req: Request, env: &Env, class: Class<'_>) -> Result<Response> {
         }
     };
 
-    env.durable_object("XHTTP_SESSION")?
-        .id_from_name(session)?
-        .get_stub()?
-        .fetch_with_request(req)
-        .await
+    let ns = match env.durable_object("XHTTP_SESSION") {
+        Ok(ns) => ns,
+        Err(e) => return do_error(env, &format!("stub: {e}")).await,
+    };
+    let id = match ns.id_from_name(session) {
+        Ok(id) => id,
+        Err(e) => return do_error(env, &format!("stub: {e}")).await,
+    };
+    let stub = match id.get_stub() {
+        Ok(s) => s,
+        Err(e) => return do_error(env, &format!("stub: {e}")).await,
+    };
+    match stub.fetch_with_request(req).await {
+        Ok(resp) => Ok(resp),
+        Err(e) => do_error(env, &format!("fetch: {e}")).await,
+    }
+}
+
+/// Diagnostic: surface the Durable Object error instead of the decoy.
+///
+/// Active only when DIAGNOSTICS=true, i.e. on throwaway test deployments
+/// that need the actual failure text; anywhere else this is a no-op wrapper
+/// and the decoy is served exactly as before.
+async fn do_error(env: &Env, msg: &str) -> Result<Response> {
+    if env.var("DIAGNOSTICS").map(|v| v.to_string()).unwrap_or_default() == "true" {
+        Response::ok(format!("DO-ERR {msg}"))
+    } else {
+        decoy(env).await
+    }
 }
 
 /// Measure whether this deployment can actually stream a request body in

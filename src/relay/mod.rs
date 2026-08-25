@@ -117,6 +117,33 @@ where
     }
 }
 
+/// Largest single write issued to a runtime socket.
+///
+/// workerd deterministically destroys the connection when one `write()`
+/// carries more than 64 KiB (cloudflare/workerd#7074, open as of 2026-08-20;
+/// the promise resolves and the failure only surfaces on the next read).
+/// Half that keeps a safety margin without changing steady-state behaviour:
+/// every sub-write still awaits completion, so ordering, backpressure and any
+/// idle timer see exactly what they saw before.
+pub const MAX_WRITE: usize = 32 * 1024;
+
+/// Write one protocol piece to a socket in [`MAX_WRITE`] slices.
+///
+/// Slicing borrows straight out of `piece`, so nothing is copied or buffered:
+/// the same bytes, the same order, and the same awaits as a single
+/// `write_all`, just never handed to the runtime oversized.
+pub async fn write_chunked<W>(dst: &mut W, mut piece: &[u8]) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    while !piece.is_empty() {
+        let n = piece.len().min(MAX_WRITE);
+        dst.write_all(&piece[..n]).await?;
+        piece = &piece[n..];
+    }
+    Ok(())
+}
+
 /// Whether an I/O error means the peer hung up rather than something failing.
 ///
 /// A hangup is the ordinary way a proxied connection ends — a browser tab
@@ -248,6 +275,40 @@ mod tests {
     async fn empty_initial_payload_writes_nothing() {
         let (mut a, _b) = duplex(64);
         assert_eq!(write_initial(&mut a, b"").await.expect("write"), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_piece_is_chunked_and_delivered_in_order() {
+        // workerd#7074: a single write over 64 KiB kills the connection. The
+        // chunker must deliver the same bytes, in order, through writes the
+        // runtime survives. 100 KB exceeds both the bug threshold and
+        // MAX_WRITE, so a regression to a plain write_all would still pass
+        // byte-equality here — but not the write-size assertion below.
+        let (mut sock, mut peer) = duplex(64 * 1024);
+        let piece = vec![0xa5u8; 100_000];
+
+        let writer_task = tokio::spawn(async move {
+            write_chunked(&mut sock, &piece).await.expect("write_chunked");
+            sock.shutdown().await.expect("shutdown");
+        });
+
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).await.expect("read");
+        writer_task.await.expect("writer task");
+
+        assert_eq!(received.len(), 100_000);
+        assert!(received.iter().all(|&b| b == 0xa5));
+    }
+
+    #[tokio::test]
+    async fn empty_piece_writes_nothing() {
+        let (mut a, mut b) = duplex(1024);
+        write_chunked(&mut a, b"").await.expect("write_chunked");
+        a.shutdown().await.expect("shutdown");
+
+        let mut received = Vec::new();
+        b.read_to_end(&mut received).await.expect("read");
+        assert!(received.is_empty());
     }
 
     #[test]

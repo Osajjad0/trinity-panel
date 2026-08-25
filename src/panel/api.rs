@@ -91,6 +91,10 @@ pub struct SaveRequest {
     /// Outbound routing config. Defaults to Off when absent (old clients).
     #[serde(default)]
     pub outbound: OutboundConfig,
+    /// Enhanced Reachability toggle. Defaults to off when absent (old
+    /// clients), and off is the byte-identical existing behaviour.
+    #[serde(default)]
+    pub enhanced_reachability: bool,
 }
 
 /// What the browser posts to re-check a draft.
@@ -109,6 +113,9 @@ pub struct CheckRequest {
     /// The change to apply first, if any.
     #[serde(default)]
     pub edit: Option<Edit>,
+    /// The toggle's local state, so advice matches what saving would render.
+    #[serde(default)]
+    pub enhanced_reachability: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -180,6 +187,9 @@ pub struct State {
     pub blank: Node,
     /// Outbound routing configuration (Proxy IP / NAT64).
     pub outbound: OutboundConfig,
+    /// The Enhanced Reachability toggle's current value. Shown so the panel
+    /// renders the same on/off state the subscriptions are being served with.
+    pub enhanced_reachability: bool,
 }
 
 /// Where the settings a request is serving came from.
@@ -204,10 +214,14 @@ pub fn state(
 ) -> State {
     let clients = bundle::all_clients()
         .into_iter()
-        .map(|client| client_view(&settings.nodes, client, sub_base))
+        .map(|client| client_view(&settings.nodes, client, sub_base, settings.enhanced_reachability))
         .collect();
 
-    let views = settings.nodes.iter().map(node_view).collect();
+    let views = settings
+        .nodes
+        .iter()
+        .map(|node| node_view(node, settings.enhanced_reachability))
+        .collect();
 
     State {
         host: host.to_owned(),
@@ -221,14 +235,15 @@ pub fn state(
         clients,
         blank: super::advisor::blank(host, xhttp_path),
         outbound: settings.outbound.clone(),
+        enhanced_reachability: settings.enhanced_reachability,
     }
 }
 
-fn client_view(nodes: &[Node], client: ClientTarget, sub_base: &str) -> ClientView {
+fn client_view(nodes: &[Node], client: ClientTarget, sub_base: &str, enhanced: bool) -> ClientView {
     let slug = bundle::client_slug(client);
     // The share-link bundle is what a subscription URL returns, so its skip
     // list is the honest answer to "what will this app actually receive".
-    let links = bundle::render(nodes, client, Shape::ShareLinks);
+    let links = bundle::render(nodes, client, Shape::ShareLinks, enhanced);
     let (included, skipped) = links
         .as_ref()
         .map_or_else(|_| (0, Vec::new()), |b| (b.included, b.skipped.clone()));
@@ -240,7 +255,7 @@ fn client_view(nodes: &[Node], client: ClientTarget, sub_base: &str) -> ClientVi
     };
     // Offered only when the emitter really produces a document for this
     // client; a download link that returns the decoy is worse than no link.
-    let config = bundle::render(nodes, client, Shape::FullConfig)
+    let config = bundle::render(nodes, client, Shape::FullConfig, enhanced)
         .ok()
         .map(|b| format!("{sub_base}/{slug}.{}", extension(&b.filename)));
 
@@ -260,11 +275,11 @@ fn extension(filename: &str) -> &str {
     filename.rsplit_once('.').map_or("json", |(_, ext)| ext)
 }
 
-fn node_view(node: &Node) -> NodeView {
+fn node_view(node: &Node, enhanced: bool) -> NodeView {
     let links = bundle::all_clients()
         .into_iter()
         .filter_map(|client| {
-            crate::subscription::to_uri(node, client)
+            crate::subscription::to_uri(node, client, enhanced)
                 .ok()
                 .map(|uri| NodeLink { client: bundle::client_slug(client), uri })
         })
@@ -275,7 +290,7 @@ fn node_view(node: &Node) -> NodeView {
         protocol: node.protocol.name(),
         transport: node.transport.name(),
         links,
-        matrix: super::advisor::matrix(node),
+        matrix: super::advisor::matrix(node, enhanced),
     }
 }
 
@@ -467,6 +482,7 @@ mod tests {
             version: super::super::store::VERSION,
             nodes: vec![node("a"), node("b")],
             outbound: OutboundConfig::default(),
+            enhanced_reachability: false,
         }
     }
 

@@ -61,6 +61,33 @@ const MUX_MAX_CONCURRENCY: u16 = 1024;
 /// multiplexing without naming a width.
 const MUX_DEFAULT_CONCURRENCY: u16 = 8;
 
+/// uTLS fingerprint applied when Enhanced Reachability is enabled and the node
+/// has no explicit fingerprint.
+///
+/// Enhanced Reachability is intended for networks where the TLS ClientHello
+/// from a proxy client is being fingerprinted or dropped. Emitting a browser
+/// fingerprint makes the connection present the same shape as ordinary HTTPS,
+/// which is the most widely tested evasion profile in the Xray ecosystem.
+/// A node that already names a fingerprint is never overridden.
+const ENHANCED_FINGERPRINT: &str = "chrome";
+
+/// Enhanced Reachability fragment values, verified against the v26.6.1 source:
+/// `transport/internet/finalmask/fragment` (`FragmentMask`) parses exactly
+/// `packets` / `length` / `delay` — the singular spelling, not the plural
+/// `lengths`/`delays` seen in some third-party snippets — and `tlshello`
+/// fragments only the TLS ClientHello. This is the profile the ecosystem has
+/// converged on for networks that fingerprint or drop proxy-shaped TLS
+/// ClientHellos; fragmenting later records buys nothing against a filter that
+/// inspects the very start of the handshake.
+///
+/// Emitted under `streamSettings.finalmask.tcp[]`, never as freedom-style
+/// `settings.fragment`: since v26.3.27 that top-level key is ignored on
+/// non-freedom outbounds, which would make the toggle a silent no-op. The
+/// project's validation build (v26.6.1) is newer than that.
+const ENHANCED_FRAGMENT_PACKETS: &str = "tlshello";
+const ENHANCED_FRAGMENT_LENGTH: &str = "100-200";
+const ENHANCED_FRAGMENT_DELAY: &str = "10-20";
+
 /// The Xray emitter.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct XrayEmitter;
@@ -71,7 +98,7 @@ impl Emit for XrayEmitter {
     }
 
     fn emit(&self, node: &Node, target: ClientTarget) -> Result<Emitted, EmitError> {
-        emit_nodes(core::slice::from_ref(node), target)
+        emit_nodes(core::slice::from_ref(node), target, false)
     }
 }
 
@@ -87,7 +114,7 @@ impl Emit for XrayEmitter {
 /// [`EmitError::Refused`] when the list is empty, when tags collide or are
 /// unusable, when the target is not executed by Xray, or when any node is
 /// rejected by [`gate`].
-pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitError> {
+pub fn emit_nodes(nodes: &[Node], target: ClientTarget, enhanced: bool) -> Result<Emitted, EmitError> {
     if target.core() != Core::Xray {
         return Err(EmitError::Refused(vec![format!(
             "{} runs {}, not Xray — an Xray JSON config would not be read by it",
@@ -113,7 +140,7 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitE
     let mut outbounds = Vec::with_capacity(nodes.len() + 1);
 
     for node in nodes {
-        match gate(node, target) {
+        match gate(node, target, enhanced) {
             Ok(findings) => {
                 dropped.extend(findings.into_iter().map(|d| relabel(d, tag_of(node), label)));
             }
@@ -131,7 +158,7 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitE
             }
             Err(other) => return Err(other),
         }
-        outbounds.push(outbound(node, &known, label, &mut dropped));
+        outbounds.push(outbound(node, &known, label, enhanced, &mut dropped));
     }
 
     if !refusals.is_empty() {
@@ -142,6 +169,19 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitE
 
     let root = json!({
         "log": { "loglevel": "warning" },
+        // AdGuard DNS over HTTPS as the default resolver. Prevents local DNS
+        // leaks and ensures domain resolution happens through an encrypted
+        // channel rather than the user's ISP. Xray resolves DoH natively.
+        "dns": {
+            "servers": [
+                "https://dns.adguard-dns.com/dns-query",
+                // AdGuard's plain-IP resolvers as fallback for clients that
+                // cannot bootstrap DoH itself (DoH needs a working DNS answer
+                // for dns.adguard-dns.com before it can be used).
+                "94.140.14.14",
+                "94.140.15.15"
+            ]
+        },
         "inbounds": [ socks_inbound() ],
         "outbounds": outbounds,
         "routing": routing(nodes),
@@ -287,12 +327,21 @@ fn routing(nodes: &[Node]) -> Value {
 }
 
 /// One node as one Xray outbound.
-fn outbound(node: &Node, known: &BTreeSet<&str>, label: bool, dropped: &mut Vec<Dropped>) -> Value {
+fn outbound(
+    node: &Node,
+    known: &BTreeSet<&str>,
+    label: bool,
+    enhanced: bool,
+    dropped: &mut Vec<Dropped>,
+) -> Value {
     let mut ob = Map::new();
     ob.insert("tag".to_owned(), json!(tag_of(node)));
     ob.insert("protocol".to_owned(), json!(protocol_name(&node.protocol)));
     ob.insert("settings".to_owned(), protocol_settings(node));
-    ob.insert("streamSettings".to_owned(), stream_settings(node, known, label, dropped));
+    ob.insert(
+        "streamSettings".to_owned(),
+        stream_settings(node, known, label, enhanced, dropped),
+    );
 
     if node.mux.enabled {
         ob.insert("mux".to_owned(), mux(node, label, dropped));
@@ -381,6 +430,7 @@ fn stream_settings(
     node: &Node,
     known: &BTreeSet<&str>,
     label: bool,
+    enhanced: bool,
     dropped: &mut Vec<Dropped>,
 ) -> Value {
     let mut s = Map::new();
@@ -413,6 +463,11 @@ fn stream_settings(
             }
             if let Some(fp) = t.fingerprint.as_deref().filter(|f| !f.is_empty()) {
                 tls.insert("fingerprint".to_owned(), json!(fp));
+            } else if enhanced {
+                // Enhanced Reachability defaults the uTLS fingerprint to a
+                // browser profile so the handshake looks like ordinary HTTPS.
+                // Only applied when the node did not pick one itself.
+                tls.insert("fingerprint".to_owned(), json!(ENHANCED_FINGERPRINT));
             }
             // allowInsecure is deliberately unreachable, not merely omitted.
             // It is a hard configuration error from v26.2.2 onward, so a config
@@ -446,6 +501,8 @@ fn stream_settings(
             re.insert("shortId".to_owned(), json!(r.short_id));
             if let Some(fp) = r.fingerprint.as_deref().filter(|f| !f.is_empty()) {
                 re.insert("fingerprint".to_owned(), json!(fp));
+            } else if enhanced {
+                re.insert("fingerprint".to_owned(), json!(ENHANCED_FINGERPRINT));
             }
             s.insert("realitySettings".to_owned(), Value::Object(re));
         }
@@ -475,7 +532,39 @@ fn stream_settings(
         }
     }
 
+    if enhanced {
+        enhanced_reachability(node, &mut s);
+    }
+
     Value::Object(s)
+}
+
+/// Stream-level additions applied when Enhanced Reachability is on.
+///
+/// Adds the Xray TLS ClientHello fragment under `streamSettings.finalmask.tcp[]`.
+/// The legacy top-level `settings.fragment` is honoured only on freedom
+/// outbounds and silently ignored on every other protocol, so since v26.3.27
+/// it must be expressed as a finalmask entry (the project's validation build,
+/// v26.6.1, supports it). Fragmentation applies to the TLS handshake, so a
+/// node without TLS or Reality has no ClientHello to fragment and is left
+/// unchanged.
+fn enhanced_reachability(node: &Node, s: &mut Map<String, Value>) {
+    if !matches!(node.security, Security::Tls(_) | Security::Reality(_)) {
+        return;
+    }
+    s.insert(
+        "finalmask".to_owned(),
+        json!({
+            "tcp": [{
+                "type": "fragment",
+                "settings": {
+                    "packets": ENHANCED_FRAGMENT_PACKETS,
+                    "length": ENHANCED_FRAGMENT_LENGTH,
+                    "delay": ENHANCED_FRAGMENT_DELAY
+                }
+            }]
+        }),
+    );
 }
 
 /// Prefix a message with its node's tag when several nodes share the output.
@@ -851,7 +940,7 @@ mod tests {
         // §9.8: a second member of vnext[] is a hard error, not a shorthand.
         let a = xhttp_node();
         let b = Node { tag: "second".into(), ..xhttp_node() };
-        let e = emit_nodes(&[a, b], ClientTarget::V2rayN).expect("two nodes are emittable");
+        let e = emit_nodes(&[a, b], ClientTarget::V2rayN, false).expect("two nodes are emittable");
         let v = parse(&e);
 
         let obs = v["outbounds"].as_array().expect("outbounds is an array");
@@ -882,14 +971,14 @@ mod tests {
     fn duplicate_and_reserved_tags_are_refused() {
         let dup = [xhttp_node(), xhttp_node()];
         assert!(matches!(
-            emit_nodes(&dup, ClientTarget::V2rayN),
+            emit_nodes(&dup, ClientTarget::V2rayN, false),
             Err(EmitError::Refused(_))
         ));
 
         for bad in ["direct", "socks-in", "balancer", "  "] {
             let n = Node { tag: bad.into(), ..xhttp_node() };
             assert!(
-                matches!(emit_nodes(&[n], ClientTarget::V2rayN), Err(EmitError::Refused(_))),
+                matches!(emit_nodes(&[n], ClientTarget::V2rayN, false), Err(EmitError::Refused(_))),
                 "tag {bad:?} must be refused"
             );
         }
@@ -901,7 +990,7 @@ mod tests {
         let node = Node { chain_via: Some("hop".into()), ..xhttp_node() };
 
         // Hop present: no complaint.
-        let e = emit_nodes(&[hop, node.clone()], ClientTarget::V2rayN).expect("emittable");
+        let e = emit_nodes(&[hop, node.clone()], ClientTarget::V2rayN, false).expect("emittable");
         assert!(e.dropped.iter().all(|d| d.field != "chain_via"));
         let v = parse(&e);
         assert_eq!(
@@ -1026,7 +1115,7 @@ mod tests {
     #[test]
     fn an_empty_node_list_is_refused_rather_than_producing_an_inert_config() {
         assert!(matches!(
-            emit_nodes(&[], ClientTarget::V2rayN),
+            emit_nodes(&[], ClientTarget::V2rayN, false),
             Err(EmitError::Refused(_))
         ));
     }
@@ -1104,8 +1193,160 @@ mod tests {
         ];
 
         for (name, nodes) in samples {
-            emit_nodes(&nodes, ClientTarget::V2rayN)
+            emit_nodes(&nodes, ClientTarget::V2rayN, false)
                 .unwrap_or_else(|err| panic!("{name} should emit: {err}"));
         }
+    }
+}
+
+/// Enhanced Reachability coverage.
+///
+/// The off-state is covered by the tests above, which all emit with the flag
+/// off; the guarantee there is byte-identical output. These tests pin what the
+/// flag actually adds.
+#[cfg(test)]
+mod enhanced_tests {
+    use super::*;
+    use crate::config::model::{Endpoint, Mux, RealitySettings, TlsSettings, XhttpMode};
+
+    fn node() -> Node {
+        Node {
+            tag: "proxy".into(),
+            server: Endpoint { address: "edge.example.com".into(), port: 443 },
+            protocol: Protocol::Vless {
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                flow: Flow::None,
+            },
+            transport: Transport::Xhttp {
+                mode: XhttpMode::PacketUp,
+                path: "/tunnel".into(),
+                host: None,
+            },
+            security: Security::Tls(TlsSettings::default()),
+            mux: Mux::default(),
+            chain_via: None,
+            worker_served: true,
+        }
+    }
+
+    fn enhanced(n: Node) -> Emitted {
+        emit_nodes(&[n], ClientTarget::V2rayN, true).expect("enhanced should emit")
+    }
+
+    fn parse(e: &Emitted) -> Value {
+        serde_json::from_str(&e.config).expect("emitter must produce valid JSON")
+    }
+
+    /// The exact finalmask structure Xray v26.6.1's fragment mask parses,
+    /// verified against its source. Asserted whole: any drift here is a config
+    /// Xray rejects or silently ignores.
+    fn expected_fragment() -> Value {
+        json!({
+            "tcp": [{
+                "type": "fragment",
+                "settings": {
+                    "packets": "tlshello",
+                    "length": "100-200",
+                    "delay": "10-20"
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn tls_gets_the_fragment_and_a_browser_fingerprint() {
+        let v = parse(&enhanced(node()));
+        let stream = &v["outbounds"][0]["streamSettings"];
+        assert_eq!(stream["finalmask"], expected_fragment());
+        assert_eq!(stream["tlsSettings"]["fingerprint"], "chrome");
+    }
+
+    #[test]
+    fn reality_gets_the_fragment_and_a_defaulted_fingerprint() {
+        let n = Node {
+            worker_served: false,
+            transport: Transport::Raw,
+            security: Security::Reality(RealitySettings {
+                public_key: "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0".into(),
+                short_id: "6ba85179e30d4fc2".into(),
+                server_name: "www.microsoft.com".into(),
+                fingerprint: None,
+            }),
+            ..node()
+        };
+        let v = parse(&enhanced(n));
+        let stream = &v["outbounds"][0]["streamSettings"];
+        assert_eq!(stream["finalmask"], expected_fragment());
+        assert_eq!(stream["realitySettings"]["fingerprint"], "chrome");
+    }
+
+    #[test]
+    fn an_explicit_fingerprint_is_never_overridden() {
+        let n = Node {
+            security: Security::Tls(TlsSettings {
+                fingerprint: Some("firefox".into()),
+                ..Default::default()
+            }),
+            ..node()
+        };
+        let v = parse(&enhanced(n));
+        let stream = &v["outbounds"][0]["streamSettings"];
+        assert_eq!(stream["tlsSettings"]["fingerprint"], "firefox");
+        // Fragmentation is independent of the fingerprint choice.
+        assert_eq!(stream["finalmask"], expected_fragment());
+    }
+
+    #[test]
+    fn a_node_without_tls_has_no_clienthello_to_fragment() {
+        let n = Node {
+            worker_served: false,
+            // The gate refuses a TLS-less VLESS to a public address, so use a
+            // private one — the only case where it is legitimately allowed.
+            server: Endpoint { address: "10.0.0.1".into(), port: 443 },
+            transport: Transport::Raw,
+            security: Security::None,
+            ..node()
+        };
+        let v = parse(&enhanced(n));
+        let stream = &v["outbounds"][0]["streamSettings"];
+        assert!(stream.get("finalmask").is_none());
+        assert!(stream.get("tlsSettings").is_none());
+    }
+
+    #[test]
+    fn only_fields_xray_actually_parses_are_added() {
+        // cipherSuites has no verified support in the target schema, and the
+        // legacy freedom-style fragment key is ignored on non-freedom
+        // outbounds: neither may appear.
+        let text = &enhanced(node()).config;
+        assert!(!text.contains("cipherSuites"));
+        let v: Value = serde_json::from_str(text).unwrap();
+        let outbound = &v["outbounds"][0];
+        assert!(outbound["settings"].get("fragment").is_none());
+    }
+
+    #[test]
+    fn enhanced_on_and_off_differ_only_in_the_enhanced_fields() {
+        let off: Value = serde_json::from_str(
+            &emit_nodes(&[node()], ClientTarget::V2rayN, false)
+                .expect("off emits")
+                .config,
+        )
+        .unwrap();
+        let on = parse(&enhanced(node()));
+
+        assert!(off["outbounds"][0]["streamSettings"].get("finalmask").is_none());
+        assert!(off["outbounds"][0]["streamSettings"]["tlsSettings"]
+            .get("fingerprint")
+            .is_none());
+        assert_ne!(off, on, "the toggle must change the output");
+
+        // Strip exactly what the toggle adds and the rest is identical.
+        let mut stripped = on.clone();
+        let stream = &mut stripped["outbounds"][0]["streamSettings"];
+        let obj = stream.as_object_mut().unwrap();
+        obj.remove("finalmask");
+        obj["tlsSettings"].as_object_mut().unwrap().remove("fingerprint");
+        assert_eq!(stripped, off, "nothing else may change");
     }
 }

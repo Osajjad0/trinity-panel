@@ -54,11 +54,16 @@ pub struct Settings {
     /// Defaults to Off when absent from stored JSON.
     #[serde(default)]
     pub outbound: OutboundConfig,
+    /// When true, share links and configs include client-side reachability
+    /// hints (e.g. `fp=chrome`) that improve TLS compatibility on restricted
+    /// networks. Defaults to false when absent from stored JSON.
+    #[serde(default)]
+    pub enhanced_reachability: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { version: VERSION, nodes: Vec::new(), outbound: OutboundConfig::default() }
+        Self { version: VERSION, nodes: Vec::new(), outbound: OutboundConfig::default(), enhanced_reachability: false }
     }
 }
 
@@ -166,7 +171,7 @@ impl Settings {
             }
         }
 
-        Self { version: VERSION, nodes, outbound: OutboundConfig::default() }
+        Self { version: VERSION, nodes, outbound: OutboundConfig::default(), enhanced_reachability: false }
     }
 
     /// Parse a stored document, rejecting one from a future schema.

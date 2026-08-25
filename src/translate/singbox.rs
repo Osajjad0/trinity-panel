@@ -91,13 +91,23 @@ impl Emit for SingBox {
         // refusal propagates unchanged. Its non-blocking findings are the
         // starting point of `dropped`, not a separate channel the caller has to
         // remember to merge.
-        let mut dropped = gate(node, target)?;
+        let mut dropped = gate(node, target, false)?;
 
         let tag = outbound_tag(node, &mut dropped);
-        let proxy = proxy_outbound(node, target, &tag, &mut dropped)?;
+        let proxy = proxy_outbound(node, target, &tag, false, &mut dropped)?;
 
         let config = json!({
             "log": { "level": "info", "timestamp": true },
+            // AdGuard DNS over HTTPS as the default resolver. Prevents local
+            // DNS leaks; sing-box resolves DoH natively via type "https".
+            "dns": {
+                // Plain-IP fallbacks let sing-box resolve the DoH hostname itself.
+                "servers": [
+                    { "tag": "adguard", "type": "https", "server": "https://dns.adguard-dns.com/dns-query" },
+                    { "tag": "adguard-fallback-1", "type": "udp", "server": "94.140.14.14" },
+                    { "tag": "adguard-fallback-2", "type": "udp", "server": "94.140.15.15" }
+                ]
+            },
             "inbounds": [ {
                 "type": "mixed",
                 "tag": "mixed-in",
@@ -173,6 +183,7 @@ fn proxy_outbound(
     node: &Node,
     target: ClientTarget,
     tag: &str,
+    enhanced: bool,
     dropped: &mut Vec<Dropped>,
 ) -> Result<Value, EmitError> {
     let mut o = Map::new();
@@ -220,7 +231,7 @@ fn proxy_outbound(
         if let Some(t) = transport_block(node, target, dropped)? {
             o.insert("transport".to_owned(), t);
         }
-        if let Some(tls) = tls_block(node, dropped) {
+        if let Some(tls) = tls_block(node, enhanced, dropped) {
             o.insert("tls".to_owned(), tls);
         }
     }
@@ -520,7 +531,7 @@ fn sip003_escape(s: &str) -> String {
 }
 
 /// The `tls` object, or `None` when the node runs without it.
-fn tls_block(node: &Node, dropped: &mut Vec<Dropped>) -> Option<Value> {
+fn tls_block(node: &Node, enhanced: bool, dropped: &mut Vec<Dropped>) -> Option<Value> {
     match &node.security {
         Security::None => None,
 
@@ -567,6 +578,15 @@ fn tls_block(node: &Node, dropped: &mut Vec<Dropped>) -> Option<Value> {
             }
             if let Some(fp) = t.fingerprint.as_deref().filter(|f| !f.is_empty()) {
                 tls.insert("utls".to_owned(), json!({ "enabled": true, "fingerprint": fp }));
+            } else if enhanced {
+                // Enhanced Reachability defaults the uTLS fingerprint to a
+                // browser profile. sing-box has no equivalent of Xray's TLS
+                // ClientHello fragment, so this is the only part of the
+                // profile it can carry; nothing fragment-shaped is emitted.
+                tls.insert(
+                    "utls".to_owned(),
+                    json!({ "enabled": true, "fingerprint": DEFAULT_UTLS_FINGERPRINT }),
+                );
             }
             Some(Value::Object(tls))
         }
@@ -967,7 +987,7 @@ const SELECTOR_TAG: &str = "select";
 /// # Errors
 /// [`EmitError::Refused`] when the list is empty, when the target does not run
 /// sing-box, or when every node is rejected by [`gate`].
-pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitError> {
+pub fn emit_nodes(nodes: &[Node], target: ClientTarget, enhanced: bool) -> Result<Emitted, EmitError> {
     if target.core() != Core::SingBox {
         return Err(EmitError::Refused(vec![format!(
             "{} runs {}, not sing-box, so a sing-box JSON config would not be read by it",
@@ -995,7 +1015,7 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitE
     for (node, tag) in nodes.iter().zip(&tags) {
         // Collect every node's reasons rather than stopping at the first: a
         // user fixing a ten-node export should see all ten problems at once.
-        let mut node_dropped = match gate(node, target) {
+        let mut node_dropped = match gate(node, target, enhanced) {
             Ok(f) => f,
             Err(EmitError::Refused(reasons)) => {
                 refusals.extend(reasons.iter().map(|r| prefix(r, tag, label)));
@@ -1003,7 +1023,7 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitE
             }
             Err(other) => return Err(other),
         };
-        match proxy_outbound(node, target, tag, &mut node_dropped) {
+        match proxy_outbound(node, target, tag, enhanced, &mut node_dropped) {
             Ok(o) => {
                 outbounds.push(o);
                 usable_tags.push(tag.clone());
@@ -1040,6 +1060,16 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitE
 
     let config = json!({
         "log": { "level": "info", "timestamp": true },
+        // AdGuard DNS over HTTPS as the default resolver. Prevents local
+        // DNS leaks; sing-box resolves DoH natively via type "https".
+        "dns": {
+            // Plain-IP fallbacks let sing-box resolve the DoH hostname itself.
+            "servers": [
+                { "tag": "adguard", "type": "https", "server": "https://dns.adguard-dns.com/dns-query" },
+                { "tag": "adguard-fallback-1", "type": "udp", "server": "94.140.14.14" },
+                { "tag": "adguard-fallback-2", "type": "udp", "server": "94.140.15.15" }
+            ]
+        },
         "inbounds": [ {
             "type": "mixed",
             "tag": "mixed-in",
@@ -1107,7 +1137,7 @@ mod multi_node_tests {
     }
 
     fn parsed(nodes: &[Node]) -> Value {
-        let e = emit_nodes(nodes, ClientTarget::SingBoxUpstream).expect("emits");
+        let e = emit_nodes(nodes, ClientTarget::SingBoxUpstream, false).expect("emits");
         serde_json::from_str(&e.config).expect("valid json")
     }
 
@@ -1153,7 +1183,7 @@ mod multi_node_tests {
     fn one_untranslatable_node_does_not_lose_the_others() {
         // The property that matters for a subscription: partial success beats
         // refusing everything, as long as the omission is reported.
-        let e = emit_nodes(&[node("good"), xhttp("bad")], ClientTarget::SingBoxUpstream)
+        let e = emit_nodes(&[node("good"), xhttp("bad")], ClientTarget::SingBoxUpstream, false)
             .expect("emits");
         let v: Value = serde_json::from_str(&e.config).expect("valid json");
         let selector = v["outbounds"]
@@ -1168,17 +1198,82 @@ mod multi_node_tests {
 
     #[test]
     fn an_empty_list_is_refused_rather_than_emitting_a_useless_config() {
-        assert!(emit_nodes(&[], ClientTarget::SingBoxUpstream).is_err());
+        assert!(emit_nodes(&[], ClientTarget::SingBoxUpstream, false).is_err());
     }
 
     #[test]
     fn a_client_running_another_core_is_refused() {
-        assert!(emit_nodes(&[node("a")], ClientTarget::V2rayN).is_err());
-        assert!(emit_nodes(&[node("a")], ClientTarget::Mihomo).is_err());
+        assert!(emit_nodes(&[node("a")], ClientTarget::V2rayN, false).is_err());
+        assert!(emit_nodes(&[node("a")], ClientTarget::Mihomo, false).is_err());
     }
 
     #[test]
     fn every_node_failing_refuses_the_whole_export() {
-        assert!(emit_nodes(&[xhttp("bad")], ClientTarget::SingBoxUpstream).is_err());
+        assert!(emit_nodes(&[xhttp("bad")], ClientTarget::SingBoxUpstream, false).is_err());
+    }
+}
+
+/// Enhanced Reachability coverage. Off-state behaviour is pinned by the tests
+/// above, which all emit with the flag off.
+#[cfg(test)]
+mod enhanced_tests {
+    use super::*;
+    use crate::config::model::{Endpoint, TlsSettings};
+
+    fn vless_ws() -> Node {
+        Node {
+            tag: "cf-node".into(),
+            server: Endpoint { address: "edge.example.com".into(), port: 443 },
+            protocol: Protocol::Vless {
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                flow: Flow::None,
+            },
+            transport: Transport::WebSocket { path: "/ws".into(), host: None, heartbeat_secs: 30 },
+            security: Security::Tls(TlsSettings::default()),
+            mux: Mux::default(),
+            chain_via: None,
+            worker_served: false,
+        }
+    }
+
+    /// sing-box has no equivalent of Xray's ClientHello fragment, so Enhanced
+    /// Reachability must add a browser uTLS fingerprint and nothing else.
+    #[test]
+    fn enhanced_adds_a_browser_utls_and_nothing_else() {
+        let off = emit_nodes(&[vless_ws()], ClientTarget::SingBoxUpstream, false)
+            .expect("off emits");
+        let on = emit_nodes(&[vless_ws()], ClientTarget::SingBoxUpstream, true)
+            .expect("on emits");
+
+        // No fragment-shaped field may appear anywhere in the output.
+        assert!(!on.config.contains("fragment"));
+        assert!(!on.config.contains("finalmask"));
+
+        let off_v: Value = serde_json::from_str(&off.config).unwrap();
+        let mut on_v: Value = serde_json::from_str(&on.config).unwrap();
+        assert!(off_v["outbounds"][0]["tls"].get("utls").is_none());
+
+        // The toggle's entire effect is the utls block.
+        assert_eq!(
+            on_v["outbounds"][0]["tls"]["utls"],
+            json!({ "enabled": true, "fingerprint": DEFAULT_UTLS_FINGERPRINT })
+        );
+        on_v["outbounds"][0]["tls"].as_object_mut().unwrap().remove("utls");
+        assert_eq!(on_v, off_v, "nothing else may change");
+    }
+
+    #[test]
+    fn an_explicit_fingerprint_is_kept_under_enhanced() {
+        let mut n = vless_ws();
+        n.security = Security::Tls(TlsSettings {
+            fingerprint: Some("firefox".into()),
+            ..Default::default()
+        });
+        let e = emit_nodes(&[n], ClientTarget::SingBoxUpstream, true).expect("emits");
+        let v: Value = serde_json::from_str(&e.config).unwrap();
+        assert_eq!(
+            v["outbounds"][0]["tls"]["utls"],
+            json!({ "enabled": true, "fingerprint": "firefox" })
+        );
     }
 }

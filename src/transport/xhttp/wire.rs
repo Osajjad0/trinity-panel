@@ -38,7 +38,7 @@ use core::fmt;
 /// in a lookup table. Bounding the length keeps a flood of junk sessions from
 /// turning into unbounded key storage. Xray's own generator emits 16–32
 /// characters.
-const MAX_SESSION_LEN: usize = 64;
+pub const MAX_SESSION_LEN: usize = 64;
 
 /// Upper bound on the sequence number.
 ///

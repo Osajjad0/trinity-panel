@@ -50,6 +50,7 @@ opt-level = "s"
 # protocol parsers, the XHTTP wire layer and the conflict engine compile and
 # test on the host in milliseconds, with no WASM harness and no deployment.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }
 worker = "0.8.5"
 
 [dev-dependencies]

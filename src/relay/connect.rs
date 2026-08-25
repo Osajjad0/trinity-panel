@@ -108,6 +108,14 @@ mod imp {
     /// The error from the last candidate attempted, so the caller sees the
     /// most relevant failure rather than the first.
     pub async fn open_with_plan(plan: &DialPlan) -> Result<Socket, ConnectError> {
+        use futures_util::future::Either;
+        // A candidate that accepts the dial but never completes its handshake
+        // would otherwise hold the session — and on the free tier, real quota —
+        // for as long as the runtime lets a socket sit half-open. Five seconds
+        // covers every healthy round trip; a blackholed candidate costs at most
+        // HANDSHAKE_TIMEOUT_SECS per attempt instead of an unbounded hang.
+        const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
         if let [only] = plan.candidates.as_slice() {
             return open(only);
         }
@@ -117,10 +125,32 @@ mod imp {
             match open(candidate) {
                 // A candidate that dials but never completes its handshake is
                 // not a working route. Verify before committing to it.
-                Ok(sock) => match sock.opened().await {
-                    Ok(_) => return Ok(sock),
-                    Err(e) => last_err = ConnectError::Failed(e.to_string()),
-                },
+                Ok(sock) => {
+                    // `opened` borrows the socket, so the select's pinned
+                    // future must be dropped before the socket can move out
+                    // on success. Scoping the whole select does that; the
+                    // verdict is a plain enum by the time it is matched.
+                    let handshook = {
+                        match futures_util::future::select(
+                            Box::pin(sock.opened()),
+                            Box::pin(gloo_timers::future::sleep(std::time::Duration::from_secs(
+                                HANDSHAKE_TIMEOUT_SECS,
+                            ))),
+                        )
+                        .await
+                        {
+                            Either::Left((Ok(_), _)) => Ok(()),
+                            Either::Left((Err(e), _)) => Err(e.to_string()),
+                            // The timer won. The half-open socket dies with
+                            // this scope.
+                            Either::Right(((), _)) => Err("handshake timed out".into()),
+                        }
+                    };
+                    match handshook {
+                        Ok(()) => return Ok(sock),
+                        Err(msg) => last_err = ConnectError::Failed(msg),
+                    }
+                }
                 Err(e) => last_err = e,
             }
         }

@@ -255,6 +255,34 @@ th,td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid var(--line);v
       </div>
 
       <div class="card">
+        <h3>Enhanced reachability</h3>
+        <p class="muted">For networks where connections to Cloudflare and
+           Workers are degraded — deep inspection that drops or throttles TLS
+           handshakes, for example. When on, exported configurations carry
+           extra settings that make the client's TLS handshake look more like
+           ordinary browser traffic and harder to interrupt. This can help on
+           such networks; it is not a universal bypass, and networks that
+           block Cloudflare outright will still block everything that runs on
+           it.</p>
+        <p class="muted">What each app receives with this on:</p>
+        <ul class="muted" style="margin:.2rem 0 .6rem 1.2rem">
+          <li>Xray-based apps (v2rayN, v2rayNG): TLS ClientHello fragmentation
+              and a browser TLS fingerprint. The fragmentation only exists in
+              the full configuration export — share links cannot express it
+              and carry the fingerprint only.</li>
+          <li>sing-box and Mihomo-based apps (Hiddify, Karing, Clash): a
+              browser TLS fingerprint. These cores have no equivalent of
+              Xray's fragmentation, so nothing else is added.</li>
+        </ul>
+        <p class="muted">Off by default. With it off, exports are exactly as
+           they always were.</p>
+        <div class="field">
+          <label for="enh-reach"><input type="checkbox" id="enh-reach">
+             Enable enhanced reachability</label>
+        </div>
+      </div>
+
+      <div class="card">
         <h3>Preview what an app receives</h3>
         <div class="row" style="margin-bottom:.6rem">
           <div style="min-width:200px;flex:1"><select id="export-client"></select></div>
@@ -418,6 +446,9 @@ async function boot() {
   renderClients();
   renderNodeList();
   renderOutbound();
+  // State is camelCase on the way in; the save payload names its fields
+  // after the Rust struct, which is snake_case.
+  $("enh-reach").checked = !!STATE.enhancedReachability;
   await renderEditor();
 }
 
@@ -462,6 +493,8 @@ $("ob-mode").onchange = () => {
   showOutboundMode($("ob-mode").value);
   markDirty();
 };
+
+$("enh-reach").onchange = markDirty;
 for (const id of ["ob-proxies", "ob-prefixes", "ob-attempts"]) {
   $(id).oninput = markDirty;
 }
@@ -627,7 +660,7 @@ async function renderEditor(edit) {
   try {
     result = await send("check", {
       method: "POST",
-      body: JSON.stringify({ node, client: $("editor-client").value, edit: edit || null }),
+      body: JSON.stringify({ node, client: $("editor-client").value, edit: edit || null, enhanced_reachability: $("enh-reach").checked }),
     });
   } catch (err) {
     toast(err.message);
@@ -785,11 +818,12 @@ $("save").onclick = async () => {
     // when the field is absent, so an unchanged panel never wipes a stored
     // config that was set by another session or a direct KV edit.
     OUTBOUND = collectOutbound();
-    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES, outbound: OUTBOUND }) });
+    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES, outbound: OUTBOUND, enhanced_reachability: $("enh-reach").checked }) });
     if (body && body.ok && body.state) {
       STATE = body.state;
       NODES = structuredClone(STATE.nodes);
       OUTBOUND = structuredClone(STATE.outbound ?? OUTBOUND);
+      $("enh-reach").checked = !!STATE.enhancedReachability;
       CURRENT = Math.min(keep, Math.max(0, NODES.length - 1));
       renderNodeList();
       renderOutbound();

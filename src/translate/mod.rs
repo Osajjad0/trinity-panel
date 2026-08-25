@@ -133,8 +133,8 @@ pub trait Emit {
 ///
 /// # Errors
 /// [`EmitError::Refused`] if any finding blocks selection or is untranslatable.
-pub fn gate(node: &Node, target: ClientTarget) -> Result<Vec<Dropped>, EmitError> {
-    let findings = check(node, target);
+pub fn gate(node: &Node, target: ClientTarget, enhanced: bool) -> Result<Vec<Dropped>, EmitError> {
+    let findings = check(node, target, enhanced);
 
     let blocking: Vec<String> = findings
         .iter()
@@ -179,12 +179,12 @@ mod tests {
 
     #[test]
     fn gate_allows_a_clean_node() {
-        assert_eq!(gate(&xhttp_node(), ClientTarget::V2rayN), Ok(Vec::new()));
+        assert_eq!(gate(&xhttp_node(), ClientTarget::V2rayN, false), Ok(Vec::new()));
     }
 
     #[test]
     fn gate_refuses_an_untranslatable_node_with_a_readable_reason() {
-        let err = gate(&xhttp_node(), ClientTarget::SingBoxUpstream)
+        let err = gate(&xhttp_node(), ClientTarget::SingBoxUpstream, false)
             .expect_err("XHTTP cannot be expressed in upstream sing-box");
         let EmitError::Refused(reasons) = err else {
             panic!("expected refusal");
@@ -202,7 +202,7 @@ mod tests {
         let mut n = xhttp_node();
         n.security = Security::Reality(crate::config::model::RealitySettings::default());
         assert!(matches!(
-            gate(&n, ClientTarget::V2rayN),
+            gate(&n, ClientTarget::V2rayN, false),
             Err(EmitError::Refused(_))
         ));
     }
@@ -216,7 +216,7 @@ mod tests {
             host: None,
             heartbeat_secs: 30,
         };
-        let dropped = gate(&n, ClientTarget::V2rayN).expect("websocket is allowed");
+        let dropped = gate(&n, ClientTarget::V2rayN, false).expect("websocket is allowed");
         assert!(
             !dropped.is_empty(),
             "a degradation the user should know about must reach the output"

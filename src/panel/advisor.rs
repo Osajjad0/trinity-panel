@@ -110,26 +110,29 @@ pub struct Advice {
 
 /// Build the advice for `node` as seen by `target`.
 #[must_use]
-pub fn advise(node: &Node, target: ClientTarget) -> Advice {
+pub fn advise(node: &Node, target: ClientTarget, enhanced: bool) -> Advice {
     Advice {
-        controls: controls(node, target),
-        matrix: matrix(node),
-        findings: conflicts::check(node, target),
+        controls: controls(node, target, enhanced),
+        matrix: matrix(node, enhanced),
+        findings: conflicts::check(node, target, enhanced),
     }
 }
 
 /// Every client's verdict on this node.
 #[must_use]
-pub fn matrix(node: &Node) -> Vec<TargetVerdict> {
+pub fn matrix(node: &Node, enhanced: bool) -> Vec<TargetVerdict> {
     bundle::all_clients()
         .into_iter()
         .map(|client| {
-            let findings = conflicts::check(node, client);
+            let findings = conflicts::check(node, client, enhanced);
             TargetVerdict {
                 client: client.name(),
                 slug: bundle::client_slug(client),
                 core: client.core().name(),
-                exportable: crate::subscription::to_uri(node, client).is_ok(),
+                // Enhanced Reachability adds a fingerprint parameter to links
+                // that already render; it never changes which nodes do. So the
+                // verdict here holds for both toggle states.
+                exportable: crate::subscription::to_uri(node, client, false).is_ok(),
                 severity: findings.iter().map(|f| f.severity).max(),
                 findings,
             }
@@ -146,6 +149,7 @@ pub fn matrix(node: &Node) -> Vec<TargetVerdict> {
 fn select(
     node: &Node,
     target: ClientTarget,
+    enhanced: bool,
     field: &'static str,
     label: &'static str,
     help: &'static str,
@@ -158,7 +162,7 @@ fn select(
         .map(|(value, _)| {
             let mut candidate = node.clone();
             apply(&mut candidate, field, value);
-            conflicts::check(&candidate, target)
+            conflicts::check(&candidate, target, enhanced)
         })
         .collect();
 
@@ -209,7 +213,7 @@ const fn free(
 #[must_use]
 #[allow(clippy::too_many_lines)] // A table of parameters. Splitting it would
                                  // only scatter the one list a reader wants.
-pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
+pub fn controls(node: &Node, target: ClientTarget, enhanced: bool) -> Vec<Control> {
     let mut out = vec![
         free(
             "tag",
@@ -237,7 +241,7 @@ pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
             Kind::Number,
             node.server.port.to_string(),
         ),
-        protocol_control(node, target),
+        protocol_control(node, target, enhanced),
     ];
 
     match &node.protocol {
@@ -254,6 +258,7 @@ pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
             out.push(select(
                 node,
                 target,
+                enhanced,
                 "flow",
                 "Flow",
                 "XTLS Vision splices traffic at the TLS record layer to avoid encrypting \
@@ -280,6 +285,7 @@ pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
             out.push(select(
                 node,
                 target,
+                enhanced,
                 "cipher",
                 "Encryption",
                 "How the payload is encrypted inside VMess. auto is right for almost everyone: \
@@ -306,6 +312,7 @@ pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
             out.push(select(
                 node,
                 target,
+                enhanced,
                 "method",
                 "Cipher",
                 "The 2022 ciphers use a pre-shared key rather than a passphrase and are the \
@@ -334,13 +341,14 @@ pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
         }
     }
 
-    out.push(transport_control(node, target));
+    out.push(transport_control(node, target, enhanced));
 
     match &node.transport {
         Transport::Xhttp { mode, path, host } => {
             out.push(select(
                 node,
                 target,
+                enhanced,
                 "xhttp_mode",
                 "XHTTP mode",
                 "packet-up sends the upload as a series of ordinary POSTs, so nothing in the \
@@ -418,7 +426,7 @@ pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
         Transport::Raw => {}
     }
 
-    out.push(security_control(node, target));
+    out.push(security_control(node, target, enhanced));
 
     match &node.security {
         Security::Tls(tls) => {
@@ -440,7 +448,7 @@ pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
                 Kind::Text,
                 tls.alpn.join(","),
             ));
-            out.push(fingerprint_control(node, target, tls.fingerprint.as_deref()));
+            out.push(fingerprint_control(node, target, enhanced, tls.fingerprint.as_deref()));
             out.push(free(
                 "allow_insecure",
                 "Skip certificate check",
@@ -476,7 +484,7 @@ pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
                 Kind::Text,
                 r.server_name.clone(),
             ));
-            out.push(fingerprint_control(node, target, r.fingerprint.as_deref()));
+            out.push(fingerprint_control(node, target, enhanced, r.fingerprint.as_deref()));
         }
         Security::None => {}
     }
@@ -505,10 +513,11 @@ pub fn controls(node: &Node, target: ClientTarget) -> Vec<Control> {
 }
 
 /// The protocol control, whose options change the credential fields with them.
-fn protocol_control(node: &Node, target: ClientTarget) -> Control {
+fn protocol_control(node: &Node, target: ClientTarget, enhanced: bool) -> Control {
     select(
         node,
         target,
+        enhanced,
         "protocol",
         "Protocol",
         "How the connection identifies itself and encrypts its payload. VLESS is the lightest \
@@ -525,10 +534,11 @@ fn protocol_control(node: &Node, target: ClientTarget) -> Control {
     )
 }
 
-fn transport_control(node: &Node, target: ClientTarget) -> Control {
+fn transport_control(node: &Node, target: ClientTarget, enhanced: bool) -> Control {
     select(
         node,
         target,
+        enhanced,
         "transport",
         "Transport",
         "What the traffic is disguised as on the wire. XHTTP looks like ordinary HTTP requests \
@@ -547,10 +557,11 @@ fn transport_control(node: &Node, target: ClientTarget) -> Control {
     )
 }
 
-fn security_control(node: &Node, target: ClientTarget) -> Control {
+fn security_control(node: &Node, target: ClientTarget, enhanced: bool) -> Control {
     select(
         node,
         target,
+        enhanced,
         "security",
         "Transport security",
         "TLS is what makes the traffic look like ordinary HTTPS, and is required for anything \
@@ -562,10 +573,16 @@ fn security_control(node: &Node, target: ClientTarget) -> Control {
 }
 
 /// uTLS fingerprints, which decide what the TLS handshake looks like.
-fn fingerprint_control(node: &Node, target: ClientTarget, current: Option<&str>) -> Control {
+fn fingerprint_control(
+    node: &Node,
+    target: ClientTarget,
+    enhanced: bool,
+    current: Option<&str>,
+) -> Control {
     select(
         node,
         target,
+        enhanced,
         "fingerprint",
         "TLS fingerprint",
         "Makes the TLS handshake look like a particular browser's. Without one, the handshake \
@@ -953,7 +970,7 @@ mod tests {
         ] {
             let mut n = node();
             n.protocol = protocol;
-            for c in controls(&n, ClientTarget::V2rayN) {
+            for c in controls(&n, ClientTarget::V2rayN, false) {
                 assert!(c.help.len() > 40, "{} has no real help text", c.field);
                 assert!(!c.label.is_empty(), "{} has no label", c.field);
             }
@@ -965,7 +982,7 @@ mod tests {
         // A disabled control with no reason is worse than no control: the user
         // cannot tell it from a bug.
         for target in bundle::all_clients() {
-            for c in controls(&node(), target) {
+            for c in controls(&node(), target, false) {
                 for ch in &c.choices {
                     if ch.blocked {
                         assert!(
@@ -985,7 +1002,7 @@ mod tests {
     fn vision_is_blocked_on_a_worker_served_node() {
         // The combination every other panel accepts and then silently fails to
         // apply. Both Vision values must be unselectable, with a reason.
-        let controls = controls(&node(), ClientTarget::V2rayN);
+        let controls = controls(&node(), ClientTarget::V2rayN, false);
         let flow = control(&controls, "flow");
         assert!(!choice(flow, "none").blocked);
         for v in ["vision", "vision-udp443"] {
@@ -998,12 +1015,12 @@ mod tests {
     #[test]
     fn reality_is_blocked_behind_cloudflare_but_offered_for_an_external_hop() {
         let mut n = node();
-        let blocked = control(&controls(&n, ClientTarget::V2rayN), "security").clone();
+        let blocked = control(&controls(&n, ClientTarget::V2rayN, false), "security").clone();
         assert!(choice(&blocked, "reality").blocked);
 
         // The same value on a hop we do not serve is the user's own business.
         n.worker_served = false;
-        let allowed = control(&controls(&n, ClientTarget::V2rayN), "security").clone();
+        let allowed = control(&controls(&n, ClientTarget::V2rayN, false), "security").clone();
         assert!(!choice(&allowed, "reality").blocked);
     }
 
@@ -1014,7 +1031,7 @@ mod tests {
         // user nothing and hides the actual fault.
         let mut n = node();
         n.security = Security::None; // Fatal for VLESS to a public address.
-        let controls = controls(&n, ClientTarget::V2rayN);
+        let controls = controls(&n, ClientTarget::V2rayN, false);
 
         let tag_like = control(&controls, "protocol");
         assert!(
@@ -1028,7 +1045,7 @@ mod tests {
 
     #[test]
     fn the_matrix_covers_every_client_and_names_the_ones_that_cannot_take_the_node() {
-        let m = matrix(&node());
+        let m = matrix(&node(), false);
         assert_eq!(m.len(), bundle::all_clients().len());
 
         let upstream = m
@@ -1051,26 +1068,26 @@ mod tests {
             method: SsMethod::Blake3Aes256Gcm,
             password: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
         };
-        let xray = control(&controls(&n, ClientTarget::V2rayN), "protocol").clone();
+        let xray = control(&controls(&n, ClientTarget::V2rayN, false), "protocol").clone();
         assert!(!choice(&xray, "shadowsocks").blocked, "Xray carries this");
 
-        let sb = control(&controls(&n, ClientTarget::Hiddify), "protocol").clone();
+        let sb = control(&controls(&n, ClientTarget::Hiddify, false), "protocol").clone();
         assert!(choice(&sb, "shadowsocks").blocked, "sing-box does not");
     }
 
     #[test]
     fn the_controls_follow_the_protocol_and_transport_in_use() {
         let mut n = node();
-        assert!(controls(&n, ClientTarget::V2rayN).iter().any(|c| c.field == "flow"));
-        assert!(controls(&n, ClientTarget::V2rayN).iter().any(|c| c.field == "xhttp_mode"));
+        assert!(controls(&n, ClientTarget::V2rayN, false).iter().any(|c| c.field == "flow"));
+        assert!(controls(&n, ClientTarget::V2rayN, false).iter().any(|c| c.field == "xhttp_mode"));
 
         n.protocol = Protocol::Trojan { password: "p".into() };
-        let c = controls(&n, ClientTarget::V2rayN);
+        let c = controls(&n, ClientTarget::V2rayN, false);
         assert!(!c.iter().any(|x| x.field == "flow"), "flow is a VLESS concept");
         assert!(c.iter().any(|x| x.field == "password"));
 
         n.transport = Transport::Raw;
-        let c = controls(&n, ClientTarget::V2rayN);
+        let c = controls(&n, ClientTarget::V2rayN, false);
         assert!(!c.iter().any(|x| x.field == "xhttp_mode"));
     }
 
@@ -1078,7 +1095,7 @@ mod tests {
     fn current_values_round_trip_through_their_own_choice_list() {
         // If a stored value has no matching choice, the editor shows an empty
         // dropdown and saving it silently changes the node.
-        for c in controls(&node(), ClientTarget::V2rayN) {
+        for c in controls(&node(), ClientTarget::V2rayN, false) {
             if c.kind == Kind::Select {
                 assert!(
                     c.choices.iter().any(|ch| ch.value == c.current),
@@ -1124,7 +1141,7 @@ mod tests {
                 base.protocol = protocol.clone();
                 base.transport = transport.clone();
 
-                for c in controls(&base, ClientTarget::V2rayN) {
+                for c in controls(&base, ClientTarget::V2rayN, false) {
                     let values: Vec<String> = if c.kind == Kind::Select {
                         c.choices.iter().map(|ch| ch.value.clone()).collect()
                     } else {
@@ -1133,7 +1150,7 @@ mod tests {
                     for value in values {
                         let mut edited = base.clone();
                         apply(&mut edited, c.field, &value);
-                        let after = controls(&edited, ClientTarget::V2rayN);
+                        let after = controls(&edited, ClientTarget::V2rayN, false);
                         let found = after
                             .iter()
                             .find(|x| x.field == c.field)
@@ -1187,7 +1204,7 @@ mod tests {
                     n.protocol = protocol.clone();
                     n.transport = transport;
                     n.security = Security::None;
-                    let _ = advise(&n, target);
+                    let _ = advise(&n, target, false);
                 }
             }
         }

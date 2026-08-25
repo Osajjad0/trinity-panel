@@ -95,12 +95,12 @@ fn b64_decoded_len(s: &str) -> Option<usize> {
 /// Returns findings ordered most severe first, so a UI that shows only the
 /// first one shows the one that matters.
 #[must_use]
-pub fn check(node: &Node, target: ClientTarget) -> Vec<Finding> {
+pub fn check(node: &Node, target: ClientTarget, enhanced: bool) -> Vec<Finding> {
     let mut f = Vec::new();
     check_worker_serving(node, &mut f);
     check_flow(node, target, &mut f);
     check_transport_translation(node, target, &mut f);
-    check_security(node, target, &mut f);
+    check_security(node, target, enhanced, &mut f);
     check_protocol(node, target, &mut f);
     check_mux(node, target, &mut f);
     f.sort_by_key(|x| core::cmp::Reverse(x.severity));
@@ -294,7 +294,7 @@ fn check_transport_translation(node: &Node, target: ClientTarget, out: &mut Vec<
 }
 
 /// TLS and REALITY constraints.
-fn check_security(node: &Node, target: ClientTarget, out: &mut Vec<Finding>) {
+fn check_security(node: &Node, target: ClientTarget, enhanced: bool, out: &mut Vec<Finding>) {
     match &node.security {
         Security::Tls(t) => {
             if t.allow_insecure && target.core() == Core::Xray {
@@ -332,7 +332,10 @@ fn check_security(node: &Node, target: ClientTarget, out: &mut Vec<Finding>) {
                      configuration outright otherwise.",
                 )),
             }
-            if r.fingerprint.is_none() && target.core() == Core::Mihomo {
+            // Enhanced reachability completes a missing REALITY fingerprint
+            // with a browser identity, so the emitter resolves this finding
+            // and the gate must not refuse the node for it.
+            if r.fingerprint.is_none() && target.core() == Core::Mihomo && !enhanced {
                 out.push(Finding::new(
                     Severity::Broken,
                     "fingerprint",
@@ -456,7 +459,7 @@ mod tests {
 
     #[test]
     fn clean_packet_up_node_has_no_blocking_findings() {
-        let f = check(&base(), ClientTarget::V2rayN);
+        let f = check(&base(), ClientTarget::V2rayN, false);
         assert!(
             !f.iter().any(|x| x.severity.blocks_selection()),
             "unexpected blocking findings: {f:#?}"
@@ -466,10 +469,10 @@ mod tests {
     #[test]
     fn xhttp_is_untranslatable_to_upstream_singbox_but_fine_for_hiddify() {
         let n = base();
-        let up = check(&n, ClientTarget::SingBoxUpstream);
+        let up = check(&n, ClientTarget::SingBoxUpstream, false);
         assert!(has(&up, "transport", Severity::Untranslatable));
 
-        let hid = check(&n, ClientTarget::Hiddify);
+        let hid = check(&n, ClientTarget::Hiddify, false);
         assert!(
             !hid.iter().any(|x| x.field == "transport" && x.severity == Severity::Untranslatable),
             "Hiddify ships a patched sing-box that does support XHTTP"
@@ -480,7 +483,7 @@ mod tests {
     fn vision_over_a_framed_transport_is_reported_broken() {
         let mut n = base();
         n.protocol = Protocol::Vless { uuid: "u".into(), flow: Flow::Vision };
-        let f = check(&n, ClientTarget::V2rayN);
+        let f = check(&n, ClientTarget::V2rayN, false);
         assert!(has(&f, "flow", Severity::Broken));
     }
 
@@ -491,7 +494,7 @@ mod tests {
         n.security = Security::None;
         n.transport = Transport::Raw;
         n.worker_served = false;
-        let f = check(&n, ClientTarget::V2rayN);
+        let f = check(&n, ClientTarget::V2rayN, false);
         assert!(has(&f, "flow", Severity::Fatal));
     }
 
@@ -499,7 +502,7 @@ mod tests {
     fn reality_behind_cloudflare_is_fatal_and_says_why() {
         let mut n = base();
         n.security = Security::Reality(RealitySettings::default());
-        let f = check(&n, ClientTarget::V2rayN);
+        let f = check(&n, ClientTarget::V2rayN, false);
         assert!(has(&f, "security", Severity::Fatal));
         assert!(
             f.iter().any(|x| x.detail.contains("open relay")),
@@ -517,17 +520,28 @@ mod tests {
             host: None,
             heartbeat_secs: 30,
         };
-        let f = check(&n, ClientTarget::V2rayN);
+        let f = check(&n, ClientTarget::V2rayN, false);
         assert!(has(&f, "security", Severity::Fatal));
+    }
+
+    #[test]
+    fn reality_missing_a_fingerprint_blocks_mihomo_unless_enhanced_completes_it() {
+        let mut n = base();
+        n.worker_served = false;
+        n.security = Security::Reality(RealitySettings::default());
+        assert!(has(&check(&n, ClientTarget::Mihomo, false), "fingerprint", Severity::Broken));
+        // Enhanced reachability supplies a browser fingerprint, so the gate
+        // must let the node through for the emitter to complete it.
+        assert!(!has(&check(&n, ClientTarget::Mihomo, true), "fingerprint", Severity::Broken));
     }
 
     #[test]
     fn allow_insecure_is_fatal_on_xray_only() {
         let mut n = base();
         n.security = Security::Tls(TlsSettings { allow_insecure: true, ..Default::default() });
-        assert!(has(&check(&n, ClientTarget::V2rayN), "allow_insecure", Severity::Fatal));
+        assert!(has(&check(&n, ClientTarget::V2rayN, false), "allow_insecure", Severity::Fatal));
         // mihomo still accepts skip-cert-verify.
-        assert!(!has(&check(&n, ClientTarget::Mihomo), "allow_insecure", Severity::Fatal));
+        assert!(!has(&check(&n, ClientTarget::Mihomo, false), "allow_insecure", Severity::Fatal));
     }
 
     #[test]
@@ -539,7 +553,7 @@ mod tests {
             let mut n = base();
             let name = t.name();
             n.transport = t;
-            let f = check(&n, ClientTarget::V2rayN);
+            let f = check(&n, ClientTarget::V2rayN, false);
             assert!(has(&f, "transport", Severity::Fatal), "{name} should be fatal");
         }
     }
@@ -549,7 +563,7 @@ mod tests {
         let mut n = base();
         n.worker_served = false;
         n.transport = Transport::Grpc { service_name: "s".into(), multi_mode: false };
-        let f = check(&n, ClientTarget::V2rayN);
+        let f = check(&n, ClientTarget::V2rayN, false);
         assert!(!has(&f, "transport", Severity::Fatal));
     }
 
@@ -576,7 +590,7 @@ mod tests {
         };
 
         for xray_client in [ClientTarget::V2rayN, ClientTarget::V2rayNg] {
-            let f = check(&n, xray_client);
+            let f = check(&n, xray_client, false);
             assert!(
                 !has(&f, "protocol", Severity::Broken),
                 "{} runs Xray, which carries this fine",
@@ -586,7 +600,7 @@ mod tests {
 
         // Everything else genuinely cannot, and must still say so.
         for other in [ClientTarget::Hiddify, ClientTarget::Karing, ClientTarget::Mihomo] {
-            let f = check(&n, other);
+            let f = check(&n, other, false);
             assert!(
                 has(&f, "protocol", Severity::Broken),
                 "{} cannot carry Shadowsocks over XHTTP",
@@ -604,14 +618,14 @@ mod tests {
             password: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
         };
         n.transport = Transport::WebSocket { path: "/w".into(), host: None, heartbeat_secs: 30 };
-        assert!(has(&check(&n, ClientTarget::V2rayN), "password", Severity::Fatal));
+        assert!(has(&check(&n, ClientTarget::V2rayN, false), "password", Severity::Fatal));
 
         // Exactly 16 bytes is accepted.
         n.protocol = Protocol::Shadowsocks {
             method: SsMethod::Blake3Aes128Gcm,
             password: "AAAAAAAAAAAAAAAAAAAAAA==".into(),
         };
-        assert!(!has(&check(&n, ClientTarget::V2rayN), "password", Severity::Fatal));
+        assert!(!has(&check(&n, ClientTarget::V2rayN, false), "password", Severity::Fatal));
     }
 
     #[test]
@@ -628,7 +642,7 @@ mod tests {
         let mut n = base();
         n.protocol = Protocol::Vless { uuid: "u".into(), flow: Flow::Vision };
         n.security = Security::None;
-        let f = check(&n, ClientTarget::SingBoxUpstream);
+        let f = check(&n, ClientTarget::SingBoxUpstream, false);
         assert!(f.len() > 1);
         for w in f.windows(2) {
             assert!(w[0].severity >= w[1].severity, "not sorted: {f:#?}");
@@ -648,7 +662,7 @@ mod tests {
             ClientTarget::Mihomo,
             ClientTarget::Hiddify,
         ] {
-            for f in check(&n, t) {
+            for f in check(&n, t, false) {
                 assert!(!f.summary.is_empty(), "empty summary for {}", f.field);
                 assert!(f.detail.len() > 60, "detail too thin for {}: {}", f.field, f.detail);
             }

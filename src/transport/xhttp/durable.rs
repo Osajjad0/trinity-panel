@@ -41,24 +41,30 @@
 //! wait for the other.
 
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use futures_channel::mpsc;
+use futures_util::future::Either;
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // `wasm_bindgen` and `DurableObject` are not referenced anywhere below — the
 // `#[durable_object]` macro expands to code that names them directly, so they
 // must be in scope at the expansion site or the macro fails to compile.
 use worker::{
-    durable_object, wasm_bindgen, DurableObject, Env, Request, Response, Result, Socket, State,
+    durable_object, wasm_bindgen, DurableObject, Env, Request, Response, Result, State,
 };
 
+use super::diag::{SessionDiag, SessionEnd, DownExit};
 use super::wire::{self, Class};
 use super::{UploadQueue, DEFAULT_MAX_BUFFERED_POSTS, DEFAULT_MAX_POST_BYTES};
+#[allow(unused_imports)] // used by the socket-owning task below on some paths
 use crate::protocol::codec::{Decoder, Encoder};
 use crate::protocol::{detect, Credentials, ProtocolError};
 use crate::relay::outbound::OutboundConfig;
-use crate::relay::{self, connect};
+#[allow(unused_imports)] // used by the socket-owning task below on some paths
+use crate::relay::{connect, write_chunked};
 
 /// Total bytes the reorder buffer may hold for one session.
 const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
@@ -69,6 +75,43 @@ const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// dribble one byte per POST forever and hold an isolate open on a connection
 /// that never authenticates.
 const MAX_HEADER_BYTES: usize = 8 * 1024;
+
+/// Seconds of complete inactivity (no bytes in either direction) before the
+/// session is torn down. This releases the Durable Object instance so it stops
+/// consuming duration quota on the free tier. Active streaming resets the
+/// counter continuously, so only truly abandoned sessions are affected.
+const IDLE_TIMEOUT_SECS: u32 = 60;
+
+/// Seconds a session may sit before its protocol header completes.
+///
+/// A client sends the header with its first uplink chunk, so anything longer
+/// than a slow-link round trip means the client is gone. Without this bound
+/// the pre-socket phase has no timer at all: every abandoned half-session --
+/// and a client retry storm creates them by the hundred -- pins an object for
+/// as long as the platform tolerates, burning duration quota the whole time.
+/// Generous by design; this bounds a leak, it does not time out real traffic.
+const HEADER_TIMEOUT_SECS: u64 = 10;
+
+/// Size of one downlink read from the destination socket.
+///
+/// The old code reused [`relay::INITIAL_BUFFER`] (16.5 KB), which sized for
+/// TLS-record boundaries on the *uplink* side. The downlink carries bulk
+/// response bodies, where per-read overhead dominates: at 16 KB a 10 MB
+/// download costs ~640 reads, channel hops, and HTTP frames each, versus ~160
+/// at 64 KB, with no memory concern -- the isolate holds 128 MB and this
+/// buffer lives only while the session does.
+const DOWNLINK_BUFFER: usize = 64 * 1024;
+
+/// How long the downlink pump keeps collecting reads after the first byte of a
+/// burst before flushing, in milliseconds.
+///
+/// workerd returns at most one 4 KiB segment per `read_buf` regardless of the
+/// buffer size (measured: 524 reads per 1 MB), so the only way to send fewer,
+/// larger chunks is to wait for neighbours. 3 ms is well below the ~300 ms
+/// inter-burst gaps the diag counters show on real downloads, so interactive
+/// traffic never waits for bytes that are not already in flight; bulk traffic
+/// collapses ~260 sends per MB into a few.
+const COALESCE_WINDOW_MS: u64 = 3;
 
 /// Depth of the uplink hand-off channel.
 ///
@@ -153,7 +196,9 @@ impl DurableObject for XhttpSession {
             // directions in one request and needs no cross-request state, so
             // the entry point serves it directly.
             Class::Downlink { .. } => self.downlink(),
-            Class::PacketUp { seq, .. } => self.uplink(req, seq).await,
+            Class::PacketUp { session, seq } => {
+                self.uplink(req, seq, session.as_str().to_owned()).await
+            }
             _ => reply(Status::NotFound),
         }
     }
@@ -215,7 +260,10 @@ impl XhttpSession {
     }
 
     /// Accept one uplink chunk and hand any newly-ordered bytes to the owner.
-    async fn uplink(&self, mut req: Request, seq: u64) -> Result<Response> {
+    ///
+    /// `sid` rides along for the session diagnostics only — the relay is
+    /// indifferent to it.
+    async fn uplink(&self, mut req: Request, seq: u64, sid: String) -> Result<Response> {
         if self.inner.borrow().poisoned {
             return reply(Status::Rejected);
         }
@@ -276,6 +324,7 @@ impl XhttpSession {
                 self.state.wait_until(own_session(
                     rx,
                     down,
+                    sid,
                     self.credentials(),
                     self.env.clone(),
                 ));
@@ -330,81 +379,142 @@ fn now_secs() -> u64 {
     worker::Date::now().as_millis() / 1000
 }
 
+fn now_ms() -> u64 {
+    worker::Date::now().as_millis()
+}
+
 /// The single task that owns the outbound socket for one session.
 ///
 /// Everything that touches the socket happens here, sequentially. No request
 /// handler ever holds it, so no interleaving of requests can corrupt it and no
 /// cancelled request can lose it.
-async fn own_session(mut uplink: mpsc::Receiver<Bytes>, down: DownSender, creds: Credentials, env: Env) {
-    // Load outbound config once, outside any borrow. Falls back to Off mode
-    // if KV is unavailable or the settings document is missing.
-    let outbound_cfg = match env.kv("SETTINGS") {
-        Ok(kv) => match kv.get(crate::panel::store::KEY).text().await {
-            Ok(Some(raw)) => crate::relay::outbound::from_settings_json(&raw),
-            _ => OutboundConfig::default(),
-        },
-        Err(_) => OutboundConfig::default(),
+async fn own_session(
+    mut uplink: mpsc::Receiver<Bytes>,
+    mut down: DownSender,
+    sid: String,
+    creds: Credentials,
+    env: Env,
+) {
+    // The settings read and the arrival of the first header bytes are
+    // independent waits, so they run concurrently. Loading the config before
+    // listening for the header put the full KV round-trip on every session's
+    // critical path ahead of the dial; joined like this, establishment costs
+    // whichever wait is longer, not their sum. Still falls back to Off mode
+    // when KV is unavailable or the settings document is missing.
+    // A clone for the settings read; the original stays here for the
+    // SESSION_DIAG-gated publication at teardown.
+    let diag_env = env.clone();
+    let settings_load = async move {
+        match diag_env.kv("SETTINGS") {
+            Ok(kv) => match kv.get(crate::panel::store::KEY).text().await {
+                Ok(Some(raw)) => crate::relay::outbound::from_settings_json(&raw),
+                _ => OutboundConfig::default(),
+            },
+            Err(_) => OutboundConfig::default(),
+        }
     };
 
     // Accumulate until a complete header parses. A header CAN arrive split
-    // across chunks — transport framing does not align with protocol framing,
+    // across chunks -- transport framing does not align with protocol framing,
     // and a small scMaxEachPostBytes or an edge flush boundary is enough to
     // split it. Treating that as a failure would kill legitimate sessions.
-    let mut header = BytesMut::new();
-    let mut opened: Option<(Socket, Decoder, Encoder, Bytes)> = None;
-
-    while opened.is_none() {
-        let Some(chunk) = uplink.next().await else {
-            return; // client vanished before completing the header
-        };
-        header.extend_from_slice(&chunk);
-        if header.len() > MAX_HEADER_BYTES {
-            return;
-        }
-
-        match detect::detect(&header, &creds, now_secs()) {
-            // A valid prefix of some enabled protocol. Keep it, loop for more.
-            Err(ProtocolError::Incomplete) => {}
-            Err(_) => return,
-            Ok(req) => {
-                // Vision splices the TLS record stream and cannot survive a
-                // CDN, which terminates TLS at the edge.
-                if req.flow_requested {
-                    return;
+    //
+    // Each chunk wait races HEADER_TIMEOUT_SECS. This phase has no other
+    // timer: without it, a client that opens posts and then vanishes -- which
+    // a retry storm produces en masse -- pins this object until the
+    // platform's idle reaping notices, burning duration quota the entire
+    // time. Real clients deliver the first chunk in well under a second; ten
+    // seconds is generous even for a bad mobile link.
+    //
+    // Borrows `uplink` rather than moving it: the receiver outlives this
+    // phase and feeds the upstream relay for the rest of the session. Returns
+    // the completed buffer rather than the parsed request, because the parse
+    // borrows the buffer; the buffer is re-parsed once after the join, which
+    // is microseconds against a once-per-session cost.
+    let header_phase = async {
+        let mut header = BytesMut::new();
+        loop {
+            let waited = {
+                match futures_util::future::select(
+                    Box::pin(uplink.next()),
+                    Box::pin(gloo_timers::future::sleep(std::time::Duration::from_secs(
+                        HEADER_TIMEOUT_SECS,
+                    ))),
+                )
+                .await
+                {
+                    futures_util::future::Either::Left((chunk, _)) => chunk,
+                    futures_util::future::Either::Right(((), _)) => return None, // header never came
                 }
-                let Some(target) = req.target else { return };
-                if !req.is_tcp {
-                    // UDP needs a datagram API this runtime does not have;
-                    // Mux needs framing this server does not implement.
-                    return;
-                }
-                // Before the socket, because it can fail: a client that
-                // negotiated a body mode this server cannot frame is refused
-                // rather than served a corrupted tunnel. Authenticating and
-                // then garbling every byte is strictly worse than declining.
-                let Ok((decoder, encoder)) = req.body.split(&crate::random::bytes32())
-                else {
-                    return;
-                };
-                // Route through the outbound layer using the session's loaded
-                // config. In Off mode this is a single direct candidate; with
-                // Proxy IP or NAT64 each candidate's handshake is verified
-                // before the session commits to it.
-                let plan = outbound_cfg.resolve(&target);
-                let Ok(sock) = connect::open_with_plan(&plan).await else { return };
-                opened = Some((sock, decoder, encoder, Bytes::copy_from_slice(req.payload)));
+            };
+            let Some(chunk) = waited else {
+                return None; // client vanished before completing the header
+            };
+            header.extend_from_slice(&chunk);
+            if header.len() > MAX_HEADER_BYTES {
+                return None;
+            }
+
+            match detect::detect(&header, &creds, now_secs()) {
+                // A valid prefix of some enabled protocol. Keep it, loop for more.
+                Err(ProtocolError::Incomplete) => {}
+                Err(_) => return None,
+                Ok(_) => return Some(header),
             }
         }
-    }
+    };
 
-    let Some((sock, mut decoder, encoder, leading)) = opened else { return };
-    let (read_half, mut writer) = tokio::io::split(sock);
+    let (Some(header), outbound_cfg) =
+        futures_util::future::join(header_phase, settings_load).await
+    else {
+        return;
+    };
+    let Ok(req) = detect::detect(&header, &creds, now_secs()) else {
+        return;
+    };
+
+    // Vision splices the TLS record stream and cannot survive a CDN, which
+    // terminates TLS at the edge.
+    if req.flow_requested {
+        return;
+    }
+    let Some(target) = req.target else { return };
+    if !req.is_tcp {
+        // UDP needs a datagram API this runtime does not have;
+        // Mux needs framing this server does not implement.
+        return;
+    }
+    // Before the socket, because it can fail: a client that negotiated a body
+    // mode this server cannot frame is refused rather than served a corrupted
+    // tunnel. Authenticating and then garbling every byte is strictly worse
+    // than declining. (`req.payload` borrows `header`, so both stay alive for
+    // the rest of establishment -- an 8 KB buffer, not worth contorting for.)
+    let Ok((mut decoder, mut encoder)) = req.body.split(&crate::random::bytes32()) else {
+        return;
+    };
+    // Route through the outbound layer using the session's loaded config. In
+    // Off mode this is a single direct candidate; with Proxy IP or NAT64 each
+    // candidate's handshake is verified before the session commits to it.
+    let plan = outbound_cfg.resolve(&target);
+    let started_ms = now_ms();
+    let Ok(sock) = connect::open_with_plan(&plan).await else { return };
+
+    // Session diagnostics: counted always (a few adds per chunk), published
+    // only when the deployment opts in via the SESSION_DIAG binding. The sid
+    // comes from the uplink path prefix; when unavailable a short hash stands
+    // in so bench keys still sort uniquely.
+    let diag = Arc::new(SessionDiag::new());
+    diag.setup_ms.set(now_ms().saturating_sub(started_ms));
+    let down_diag = diag.clone();
+
+    let leading = Bytes::copy_from_slice(req.payload);
+    let (mut read_half, mut writer) = tokio::io::split(sock);
 
     // One buffer for the session's whole uplink. Reused across chunks so a
     // steady stream costs no allocations once its capacity has settled.
     let mut ready: Vec<Bytes> = Vec::new();
 
-    // Forward whatever payload arrived alongside the header — through the
+    // Forward whatever payload arrived alongside the header -- through the
     // codec, because for an encrypted protocol these bytes are ciphertext.
     // Dropping them is the classic bug whose symptom is a destination TLS
     // handshake that hangs forever: the ClientHello was parsed off and
@@ -415,27 +525,30 @@ async fn own_session(mut uplink: mpsc::Receiver<Bytes>, down: DownSender, creds:
     // payload after the header: Shadowsocks-2022 carries it *inside* the
     // encrypted header, so there are no leading bytes at all and the codec is
     // holding the client's first request. Guarding this call on
-    // `!leading.is_empty()` strands that payload — the destination waits for a
+    // `!leading.is_empty()` strands that payload -- the destination waits for a
     // request that was already delivered to us, the client waits for a
     // response, and the session hangs with nothing logged anywhere.
     if decoder.decode(leading, &mut ready).is_err() {
         return;
     }
     for piece in ready.drain(..) {
-        if writer.write_all(&piece).await.is_err() {
+        if write_chunked(&mut writer, &piece).await.is_err() {
             return;
         }
     }
 
+    // Idle timeout: if no bytes flow in either direction for IDLE_TIMEOUT_SECS,
+    // tear down the session to release DO duration. The activity flag is set by
+    // both relay directions whenever bytes are successfully transferred.
+    let activity = Arc::new(AtomicBool::new(true));
+    let upstream_activity = activity.clone();
+    let downstream_activity = activity.clone();
+
     // Both directions run as one task rather than two. A nested `spawn_local`
     // would belong to whichever request happened to be executing, and would be
-    // cancelled when that request finished — the same trap the outer task hit.
+    // cancelled when that request finished -- the same trap the outer task hit.
     // Joining them here means the single future handed to `wait_until` owns
     // everything, and neither direction can outlive or orphan the other.
-    //
-    // The two halves of the codec are owned one per direction, so neither
-    // needs to reach the other's state and no shared borrow exists to be held
-    // across an await.
     let upstream = async move {
         while let Some(chunk) = uplink.next().await {
             if decoder.decode(chunk, &mut ready).is_err() {
@@ -443,10 +556,11 @@ async fn own_session(mut uplink: mpsc::Receiver<Bytes>, down: DownSender, creds:
             }
             let mut failed = false;
             for piece in ready.drain(..) {
-                if writer.write_all(&piece).await.is_err() {
+                if write_chunked(&mut writer, &piece).await.is_err() {
                     failed = true;
                     break;
                 }
+                upstream_activity.store(true, Ordering::Relaxed);
             }
             if failed {
                 break;
@@ -457,43 +571,173 @@ async fn own_session(mut uplink: mpsc::Receiver<Bytes>, down: DownSender, creds:
         let _ = writer.shutdown().await;
     };
 
-    futures_util::future::join(upstream, pump_downlink(read_half, down, encoder)).await;
-}
-
-/// Read the destination's output and feed the downlink response body.
-///
-/// Sends the protocol's prologue first — VLESS's two reply bytes, VMess's
-/// sealed response header, or nothing for Trojan — then relays until either
-/// side closes.
-async fn pump_downlink<R>(mut read_half: R, mut tx: DownSender, mut encoder: Encoder)
-where
-    R: tokio::io::AsyncRead + Unpin + 'static,
-{
-    use tokio::io::AsyncReadExt;
-
-    let Ok(prologue) = encoder.prologue() else { return };
-    if !prologue.is_empty() && tx.send(Ok(prologue)).await.is_err() {
-        return;
-    }
-
-    let mut buf = BytesMut::with_capacity(relay::INITIAL_BUFFER);
-    loop {
-        if buf.capacity() < relay::INITIAL_BUFFER {
-            buf.reserve(relay::INITIAL_BUFFER - buf.capacity());
+    let downlink = async move {
+        let pump_started_ms = now_ms();
+        let Ok(prologue) = encoder.prologue() else { return };
+        if !prologue.is_empty() && down.send(Ok(prologue)).await.is_err() {
+            return;
         }
-        match read_half.read_buf(&mut buf).await {
-            // Destination closed, or failed. Dropping `tx` ends the client's
-            // response stream, which is how the client learns.
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                // O(1) detach; the payload is not copied. For a plaintext
-                // protocol the encoder hands the same handle straight back.
-                let chunk = buf.split_to(n).freeze();
-                let Ok(wrapped) = encoder.encode(chunk) else { break };
-                if tx.send(Ok(wrapped)).await.is_err() {
-                    break; // client hung up, which is ordinary
+
+        let mut buf = BytesMut::with_capacity(DOWNLINK_BUFFER);
+        let mut last_send_ms = now_ms();
+        loop {
+            if buf.capacity() < DOWNLINK_BUFFER {
+                buf.reserve(DOWNLINK_BUFFER - buf.capacity());
+            }
+
+            // workerd caps each `read_buf` at one 4 KiB segment, so forwarding
+            // per read costs hundreds of channel messages and HTTP chunks per
+            // megabyte. Reads that arrive close together describe one TCP
+            // segment train: block for the first, then keep collecting while
+            // more arrive within COALESCE_WINDOW_MS, and flush once. An idle
+            // link pays only the single blocking read it always paid; a burst
+            // is flushed at most one window after its last byte.
+            let mut eof_or_error = false;
+            match read_half.read_buf(&mut buf).await {
+                // EOF and read errors were one silent arm before the
+                // diagnostic; recording which ending actually happened changes
+                // nothing observable on the wire.
+                Ok(0) => {
+                    down_diag.down_exit.set(Some(DownExit::Eof));
+                    eof_or_error = true;
+                }
+                Err(e) => {
+                    *down_diag.read_error.borrow_mut() = Some(e.to_string());
+                    down_diag.down_exit.set(Some(DownExit::ReadError));
+                    eof_or_error = true;
+                }
+                Ok(n) => {
+                    down_diag.record_read(n);
+                    downstream_activity.store(true, Ordering::Relaxed);
+                }
+            }
+
+            if !eof_or_error {
+                while buf.len() < DOWNLINK_BUFFER {
+                    let read = Box::pin(read_half.read_buf(&mut buf));
+                    let window =
+                        gloo_timers::future::sleep(std::time::Duration::from_millis(
+                            COALESCE_WINDOW_MS,
+                        ));
+                    match futures_util::future::select(read, window).await {
+                        futures_util::future::Either::Left((Ok(0), _)) => {
+                            down_diag.down_exit.set(Some(DownExit::Eof));
+                            eof_or_error = true;
+                            break;
+                        }
+                        futures_util::future::Either::Left((Err(e), _)) => {
+                            *down_diag.read_error.borrow_mut() = Some(e.to_string());
+                            down_diag.down_exit.set(Some(DownExit::ReadError));
+                            eof_or_error = true;
+                            break;
+                        }
+                        futures_util::future::Either::Left((Ok(n), _)) => {
+                            down_diag.record_read(n);
+                            downstream_activity.store(true, Ordering::Relaxed);
+                        }
+                        // Window closed: whatever the train delivered so far
+                        // goes out as one chunk.
+                        futures_util::future::Either::Right(_) => break,
+                    }
+                }
+            }
+
+            if buf.is_empty() {
+                if eof_or_error {
+                    break;
+                }
+                continue;
+            }
+            let chunk = buf.split().freeze();
+            let Ok(wrapped) = encoder.encode(chunk) else {
+                down_diag.down_exit.set(Some(DownExit::EncodeFailed));
+                break;
+            };
+            let sent_len = wrapped.len();
+            if down.send(Ok(wrapped)).await.is_err() {
+                down_diag.down_exit.set(Some(DownExit::ReceiverGone));
+                break;
+            }
+            down_diag.record_send(sent_len);
+            let now = now_ms();
+            if now.saturating_sub(last_send_ms) > down_diag.max_send_gap_ms.get() {
+                down_diag.max_send_gap_ms.set(now - last_send_ms);
+            }
+            last_send_ms = now;
+        }
+        down_diag.pump_ms.set(now_ms().saturating_sub(pump_started_ms));
+    };
+
+    // Race the relay against an idle timer. The timer checks the activity flag
+    // every second; if no bytes flowed for IDLE_TIMEOUT_SECS consecutive checks,
+    // the session is considered abandoned and the select drops both relay futures.
+    let idle_timer = async {
+        let mut idle_secs: u32 = 0;
+        loop {
+            gloo_timers::future::sleep(std::time::Duration::from_secs(1)).await;
+            if activity.swap(false, Ordering::Relaxed) {
+                idle_secs = 0;
+            } else {
+                idle_secs += 1;
+                if idle_secs >= IDLE_TIMEOUT_SECS {
+                    return;
                 }
             }
         }
+    };
+
+    let winner = futures_util::future::select(
+        Box::pin(futures_util::future::join(upstream, downlink)),
+        Box::pin(idle_timer),
+    )
+    .await;
+
+    // Which side won decides how the client experienced this session: the
+    // timer's win drops both relays mid-await and the GET body just stops,
+    // indistinguishable from a clean end on an unframed codec. That is exactly
+    // the truncation signature we are hunting.
+    match winner {
+        Either::Left(_) => diag.session_end.set(Some(SessionEnd::RelaysDone)),
+        Either::Right(_) => {
+            diag.session_end.set(Some(SessionEnd::IdleTimerFired));
+            // A timer kill is never normal; surface it even without the KV
+            // binding so a bench run sees it in the worker logs.
+            worker::console_log!("trinity-diag sid={} idle_timer_fired", sid);
+        }
     }
+    publish(&diag, &sid, &env).await;
+}
+
+/// Opt-in publication: only when the deployment carries a `SESSION_DIAG`
+/// binding does teardown write the counters to KV. Production never sets it,
+/// so its sessions skip both the KV write and the log line entirely.
+///
+/// The lookup is `env.kv` rather than `env.var` deliberately: `var` demands
+/// the bound value be a JS string and rejects a KV namespace outright, while
+/// `kv` succeeds exactly when the binding exists — which is the whole opt-in.
+async fn publish(diag: &SessionDiag, sid: &str, env: &Env) {
+    let Ok(kv) = env.kv("SESSION_DIAG") else {
+        return;
+    };
+    let key = format!("diag:{}-{}", now_ms(), sanitize_sid(sid));
+    // Fire-and-forget would risk the isolate dying before the write lands;
+    // this is once per session at teardown, so awaiting it costs nothing.
+    // A one-day TTL keeps the namespace self-cleaning.
+    match kv.put_bytes(&key, diag.to_json(sid).as_bytes()) {
+        Ok(p) => {
+            let _ = p.expiration_ttl(86_400).execute().await;
+        }
+        Err(_) => {}
+    }
+    worker::console_log!("trinity-diag {}", diag.to_json(sid));
+}
+
+/// Diag keys go into a KV name; keep it to the same charset `SessionId` already
+/// enforces so a hostile id cannot smuggle separators into the key.
+fn sanitize_sid(sid: &str) -> String {
+    sid.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        // Same bound the wire already imposes on a session id.
+        .take(super::wire::MAX_SESSION_LEN)
+        .collect()
 }

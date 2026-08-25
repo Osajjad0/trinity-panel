@@ -69,6 +69,7 @@ def _request(method: str, path: str, token: str, *, body=None, content_type=None
     retried; only requests that never got an answer at all.
     """
     import time as _time
+    _REQUEST_DEADLINE = 300  # seconds; hard cap per API call
     url = f"{API}{path}"
     headers = {"Authorization": f"Bearer {token}"}
     if content_type:
@@ -76,9 +77,19 @@ def _request(method: str, path: str, token: str, *, body=None, content_type=None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     last = None
     payload = None
+    deadline = _time.monotonic() + _REQUEST_DEADLINE
     for attempt in range(6):
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            raise DeployError(
+                f"{method} {path} timed out after {_REQUEST_DEADLINE}s "
+                f"(attempt {attempt + 1}/6). The API accepted the connection "
+                "but did not complete the response in time."
+            )
+        sock_timeout = min(120, remaining)
+        print(f"  [{method} {path}] attempt {attempt + 1}/6 (timeout {sock_timeout:.0f}s)")
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=sock_timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as exc:
@@ -91,7 +102,11 @@ def _request(method: str, path: str, token: str, *, body=None, content_type=None
             break
         except urllib.error.URLError as exc:
             last = exc
-            _time.sleep(2 * (attempt + 1))
+            wait = min(2 * (attempt + 1), deadline - _time.monotonic())
+            if wait <= 0:
+                break
+            print(f"  [{method} {path}] URLError: {exc.reason}; retrying in {wait:.0f}s")
+            _time.sleep(wait)
             continue
     if last is not None or payload is None:
         reason = last.reason if last else "unknown error"
@@ -316,6 +331,13 @@ def main() -> int:
     ap.add_argument("--xhttp-path", default=None, help="XHTTP base path (generated if omitted)")
     ap.add_argument("--panel-path", default=None, help="Admin panel base path (generated if omitted)")
     ap.add_argument("--sub-path", default=None, help="Subscription base path (generated if omitted)")
+    ap.add_argument(
+        "--session-diag",
+        action="store_true",
+        help="Add a SESSION_DIAG KV binding so session teardown publishes "
+        "per-session byte counters and exit reasons to that namespace "
+        "(diagnostics only; production deployments omit it)",
+    )
     ap.add_argument("--no-do", action="store_true", help="Skip the Durable Object migration (redeploys)")
     args = ap.parse_args()
 
@@ -334,6 +356,12 @@ def main() -> int:
         subdomain = preflight(token, account)
 
         kv_id = args.kv_id or ensure_kv(token, account, args.kv_title or f"{args.name}-settings")
+
+        # Diagnostics-only KV namespace for the SESSION_DIAG binding; created
+        # lazily so a plain deploy never touches it.
+        diag_kv = None
+        if args.session_diag:
+            diag_kv = ensure_kv(token, account, f"{args.name}-session-diag")
 
         # Generated once, printed once, never written to disk. A guessable path
         # is the cheapest thing for a scanner to find.
@@ -380,7 +408,7 @@ def main() -> int:
             {"type": "plain_text", "name": "XHTTP_PATH", "text": xhttp_path},
             {"type": "plain_text", "name": "PANEL_PATH", "text": panel_path},
             {"type": "plain_text", "name": "SUB_PATH", "text": sub_path},
-            {"type": "plain_text", "name": "WS_ENABLED", "text": "true"},
+            {"type": "plain_text", "name": "WS_ENABLED", "text": "false"},
             {"type": "plain_text", "name": "WS_PATH", "text": "/ws"},
             {"type": "secret_text", "name": "VLESS_USERS", "text": user_uuid},
             {"type": "secret_text", "name": "TROJAN_USERS", "text": trojan_pw},
@@ -388,6 +416,12 @@ def main() -> int:
             {"type": "secret_text", "name": "SS_USERS", "text": ss_users},
             {"type": "secret_text", "name": "PANEL_PASSWORD", "text": panel_password},
         ]
+        if args.session_diag:
+            # Diagnostics-only namespace: session teardown writes one small
+            # JSON blob per session here. Never bound on production.
+            bindings.append(
+                {"type": "kv_namespace", "name": "SESSION_DIAG", "namespace_id": diag_kv}
+            )
 
         upload(token, account, args.name, entry, modules, bindings, not args.no_do)
         enable_subdomain(token, account, args.name)

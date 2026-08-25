@@ -18,19 +18,26 @@ use crate::translate::{gate, EmitError};
 
 use super::encode::{base64, base64_url_nopad, fragment, percent};
 
+/// uTLS fingerprint defaulted under Enhanced Reachability.
+///
+/// `fp` is a real share-link parameter that v2rayN/v2rayNG pass through to
+/// Xray's TLS settings, so it belongs in a link; Xray's fragment cannot be
+/// expressed in any link format and is only ever carried by the JSON export.
+const ENHANCED_FINGERPRINT: &str = "chrome";
+
 /// Render `node` as a share link for `target`.
 ///
 /// # Errors
 /// [`EmitError::Refused`] when the node cannot work for this client.
-pub fn to_uri(node: &Node, target: ClientTarget) -> Result<String, EmitError> {
-    gate(node, target)?;
+pub fn to_uri(node: &Node, target: ClientTarget, enhanced: bool) -> Result<String, EmitError> {
+    gate(node, target, enhanced)?;
 
     match &node.protocol {
-        Protocol::Vless { uuid, flow } => Ok(vless(node, uuid, *flow)),
-        Protocol::Trojan { password } => Ok(trojan(node, password)),
-        Protocol::Vmess { uuid, cipher } => vmess(node, uuid, *cipher),
+        Protocol::Vless { uuid, flow } => Ok(vless(node, uuid, *flow, enhanced)),
+        Protocol::Trojan { password } => Ok(trojan(node, password, enhanced)),
+        Protocol::Vmess { uuid, cipher } => vmess(node, uuid, *cipher, enhanced),
         Protocol::Shadowsocks { method, password } => {
-            Ok(shadowsocks(node, method.wire_name(), password))
+            shadowsocks(node, method.wire_name(), password, enhanced)
         }
     }
 }
@@ -40,7 +47,7 @@ pub fn to_uri(node: &Node, target: ClientTarget) -> Result<String, EmitError> {
 /// Emitted in a stable order. Clients do not care, but a stable order means a
 /// regenerated subscription is byte-identical when nothing changed, which is
 /// what lets a user diff two links and see whether anything actually moved.
-fn common_params(node: &Node) -> Vec<(&'static str, String)> {
+fn common_params(node: &Node, enhanced: bool) -> Vec<(&'static str, String)> {
     let mut p: Vec<(&'static str, String)> = Vec::new();
 
     let (net, transport_host, path, mode) = match &node.transport {
@@ -80,6 +87,8 @@ fn common_params(node: &Node) -> Vec<(&'static str, String)> {
             p.push(("alpn", alpn));
             if let Some(fp) = &t.fingerprint {
                 p.push(("fp", fp.clone()));
+            } else if enhanced {
+                p.push(("fp", ENHANCED_FINGERPRINT.to_owned()));
             }
         }
         Security::Reality(r) => {
@@ -91,6 +100,8 @@ fn common_params(node: &Node) -> Vec<(&'static str, String)> {
             }
             if let Some(fp) = &r.fingerprint {
                 p.push(("fp", fp.clone()));
+            } else if enhanced {
+                p.push(("fp", ENHANCED_FINGERPRINT.to_owned()));
             }
         }
     }
@@ -140,8 +151,8 @@ fn query(params: &[(&'static str, String)]) -> String {
 }
 
 /// `vless://uuid@host:port?params#label`
-fn vless(node: &Node, uuid: &str, flow: Flow) -> String {
-    let mut p = client_params(node);
+fn vless(node: &Node, uuid: &str, flow: Flow, enhanced: bool) -> String {
+    let mut p = client_params(node, enhanced);
     // VLESS requires an explicit encryption value; omitting it makes Xray
     // refuse the config outright rather than assume a default.
     p.insert(0, ("encryption", "none".to_owned()));
@@ -165,21 +176,21 @@ fn vless(node: &Node, uuid: &str, flow: Flow) -> String {
 /// Emit share-link params. Xray defaults XHTTP to packet-up when `mode` is absent,
 /// so omit `mode` here to avoid the malformed `x-phtml packet-up` shape observed
 /// during client imports.
-fn client_params(node: &Node) -> Vec<(&'static str, String)> {
-    let mut out = common_params(node);
+fn client_params(node: &Node, enhanced: bool) -> Vec<(&'static str, String)> {
+    let mut out = common_params(node, enhanced);
     out.retain(|(k, _)| *k != "mode");
     out
 }
 ///
 /// No `flow` parameter is ever emitted: Xray removed flow for Trojan and now
 /// hard-errors on any non-empty value, so a link carrying one fails to load.
-fn trojan(node: &Node, password: &str) -> String {
+fn trojan(node: &Node, password: &str, enhanced: bool) -> String {
     format!(
         "trojan://{}@{}:{}?{}#{}",
         percent(password),
         host_for_uri(&node.server.address),
         node.server.port,
-        query(&client_params(node)),
+        query(&client_params(node, enhanced)),
         fragment(&node.tag)
     )
 }
@@ -189,8 +200,8 @@ fn trojan(node: &Node, password: &str) -> String {
 /// The oddest of the four formats and the least specified — the field names
 /// are short, untyped, and several are strings that look like numbers. This
 /// follows what v2rayN emits, since that is what the ecosystem parses.
-fn vmess(node: &Node, uuid: &str, cipher: VmessCipher) -> Result<String, EmitError> {
-    let p: std::collections::HashMap<&str, String> = client_params(node).into_iter().collect();
+fn vmess(node: &Node, uuid: &str, cipher: VmessCipher, enhanced: bool) -> Result<String, EmitError> {
+    let p: std::collections::HashMap<&str, String> = client_params(node, enhanced).into_iter().collect();
 
     let scy = match cipher {
         VmessCipher::Auto => "auto",
@@ -231,15 +242,87 @@ fn vmess(node: &Node, uuid: &str, cipher: VmessCipher) -> Result<String, EmitErr
 /// several clients no longer accept. SIP002 encodes only the userinfo and
 /// leaves the host readable, which is also what makes the link diagnosable by
 /// eye.
-fn shadowsocks(node: &Node, method: &str, password: &str) -> String {
+///
+/// Transport is carried through the SIP003 plugin mechanism: a Shadowsocks
+/// link's only transport path in any client is v2ray-plugin's WebSocket mode,
+/// so a WebSocket node emits `plugin=v2ray-plugin` plus the semicolon-form
+/// `plugin-opts` (percent-encoded inside the query string, as SIP003
+/// requires). Enhanced Reachability adds nothing here: a plugin connection is
+/// not an Xray TLS connection, so fragment and fingerprint have nowhere to go.
+fn shadowsocks(node: &Node, method: &str, password: &str, _enhanced: bool) -> Result<String, EmitError> {
+    // gate() has already refused every client that cannot carry this node —
+    // which, for XHTTP, is every client (the SIP002 link format has no way to
+    // express a transport other than SIP003 plugins).
+    let mut plugin_params: Vec<(&'static str, String)> = Vec::new();
+
+    match &node.transport {
+        Transport::Raw => {}
+        Transport::WebSocket { path, host, .. } => {
+            plugin_params.push(("plugin", "v2ray-plugin".to_owned()));
+
+            // SIP003 semicolon form. Xray's `security: none` is not a state
+            // v2ray-plugin can express — its dialer is either TLS or plain —
+            // and its fingerprint takes no uTLS profile at all, so only the
+            // framing is carried.
+            let mut opts = vec!["ws".to_owned()];
+            let mut host_val: Option<String> = None;
+            let mut tls = false;
+
+            match &node.security {
+                Security::Tls(t) => {
+                    tls = true;
+                    if let Some(sni) = t.sni.as_deref().filter(|s| !s.is_empty()) {
+                        host_val = Some(sni.to_owned());
+                    }
+                }
+                // mihomo's own WS carrier documents this gap the same way:
+                // the plugin builds its own connection and the node's TLS
+                // settings cannot reach it.
+                Security::Reality(_) | Security::None => {}
+            }
+            // v2ray-plugin falls back to the server address for Host/SNI.
+            // Emitting it explicitly would only pin the link to the address
+            // where this node is served today.
+            if let Some(h) = host.as_deref().filter(|h| !h.is_empty()) {
+                host_val = Some(h.to_owned());
+            }
+            if tls {
+                opts.push("tls".to_owned());
+            }
+            if let Some(h) = host_val {
+                opts.push(format!("host={h}"));
+            }
+            opts.push(format!("path={}", normalise_path(path)));
+
+            plugin_params.push(("plugin-opts", opts.join(";")));
+        }
+        other => {
+            return Err(EmitError::Refused(vec![format!(
+                "Shadowsocks over {} cannot be expressed in a share link. The ss:// format \
+                 reaches a transport only through the SIP003 plugin mechanism, and the only \
+                 plugin framing clients parse is v2ray-plugin's WebSocket. {} carries this node \
+                 with its {} transport intact, so use that export instead of a link.",
+                other.name(),
+                "Xray's JSON export",
+                other.name(),
+            )]));
+        }
+    }
+
     let userinfo = base64_url_nopad(format!("{method}:{password}").as_bytes());
-    format!(
-        "ss://{}@{}:{}#{}",
+    let params = if plugin_params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query(&plugin_params))
+    };
+    Ok(format!(
+        "ss://{}@{}:{}{}#{}",
         userinfo,
         host_for_uri(&node.server.address),
         node.server.port,
+        params,
         fragment(&node.tag)
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -270,7 +353,7 @@ mod tests {
     #[test]
     fn vless_link_has_the_shape_clients_expect() {
         let n = node(Protocol::Vless { uuid: "abc-123".into(), flow: Flow::None }, xhttp());
-        let uri = to_uri(&n, ClientTarget::V2rayN).expect("emits");
+        let uri = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
 
         assert!(uri.starts_with("vless://abc-123@example.com:443?"));
         assert!(uri.contains("encryption=none"), "Xray refuses VLESS without it");
@@ -291,7 +374,7 @@ mod tests {
             path: "/a#b?c".into(),
             host: None,
         };
-        let uri = to_uri(&n, ClientTarget::V2rayN).expect("emits");
+        let uri = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
 
         // Exactly one '#', and it introduces the label. An unescaped '#' in
         // the path would make everything after it the fragment.
@@ -303,7 +386,7 @@ mod tests {
     #[test]
     fn trojan_never_emits_flow() {
         let n = node(Protocol::Trojan { password: "p@ss word".into() }, xhttp());
-        let uri = to_uri(&n, ClientTarget::V2rayN).expect("emits");
+        let uri = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
         assert!(uri.starts_with("trojan://p%40ss%20word@example.com:443?"));
         assert!(
             !uri.contains("flow="),
@@ -317,7 +400,7 @@ mod tests {
             Protocol::Vmess { uuid: "uid".into(), cipher: VmessCipher::Auto },
             Transport::WebSocket { path: "/w".into(), host: None, heartbeat_secs: 30 },
         );
-        let uri = to_uri(&n, ClientTarget::V2rayN).expect("emits");
+        let uri = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
         let b64 = uri.strip_prefix("vmess://").expect("has scheme");
 
         // Decode independently rather than trusting our own encoder.
@@ -355,7 +438,7 @@ mod tests {
         // A plain-TCP Shadowsocks node is an external server, not one this
         // Worker serves — the runtime cannot serve a raw transport.
         n.worker_served = false;
-        let uri = to_uri(&n, ClientTarget::V2rayN).expect("emits");
+        let uri = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
         assert!(uri.starts_with("ss://"));
         // Host stays readable under SIP002; only userinfo is encoded.
         assert!(uri.contains("@example.com:443"));
@@ -365,7 +448,7 @@ mod tests {
     #[test]
     fn refuses_a_link_that_cannot_work_for_the_client() {
         let n = node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, xhttp());
-        let err = to_uri(&n, ClientTarget::SingBoxUpstream)
+        let err = to_uri(&n, ClientTarget::SingBoxUpstream, false)
             .expect_err("upstream sing-box cannot import XHTTP");
         assert!(matches!(err, EmitError::Refused(_)));
     }
@@ -376,12 +459,12 @@ mod tests {
         // and the link is ambiguous.
         let mut n = node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, xhttp());
         n.server.address = "2001:db8::1".into();
-        let uri = to_uri(&n, ClientTarget::V2rayN).expect("emits");
+        let uri = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
         assert!(uri.contains("@[2001:db8::1]:443"), "got {uri}");
 
         // An already-bracketed address must not be double-wrapped.
         n.server.address = "[2001:db8::1]".into();
-        let uri = to_uri(&n, ClientTarget::V2rayN).expect("emits");
+        let uri = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
         assert!(uri.contains("@[2001:db8::1]:443"), "got {uri}");
     }
 
@@ -390,7 +473,7 @@ mod tests {
         let mut n = node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, xhttp());
         for addr in ["example.com", "sub.example.co.uk", "93.184.216.34"] {
             n.server.address = addr.into();
-            let uri = to_uri(&n, ClientTarget::V2rayN).expect("emits");
+            let uri = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
             assert!(uri.contains(&format!("@{addr}:443")), "{addr} should not be escaped");
         }
     }
@@ -400,8 +483,8 @@ mod tests {
         // A regenerated subscription must be byte-identical when nothing
         // changed, or users cannot tell a real change from noise.
         let n = node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, xhttp());
-        let a = to_uri(&n, ClientTarget::V2rayN).expect("emits");
-        let b = to_uri(&n, ClientTarget::V2rayN).expect("emits");
+        let a = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
+        let b = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
         assert_eq!(a, b);
     }
 
@@ -416,11 +499,165 @@ mod tests {
         n.server.address = nasty.into();
         // Vision over a framed transport is refused, which is itself correct;
         // the point is that nothing panics on the way to that decision.
-        let _ = to_uri(&n, ClientTarget::V2rayN);
+        let _ = to_uri(&n, ClientTarget::V2rayN, false);
 
         n.protocol = Protocol::Trojan { password: nasty.into() };
-        if let Ok(uri) = to_uri(&n, ClientTarget::V2rayN) {
+        if let Ok(uri) = to_uri(&n, ClientTarget::V2rayN, false) {
             assert_eq!(uri.matches('#').count(), 1);
+        }
+    }
+}
+
+/// Enhanced Reachability coverage. Off-state behaviour is pinned by the tests
+/// above, which all emit with the flag off.
+#[cfg(test)]
+mod enhanced_tests {
+    use super::*;
+    use crate::config::model::{Endpoint, Mux, SsMethod, TlsSettings};
+
+    fn node(protocol: Protocol, transport: Transport) -> Node {
+        Node {
+            tag: "my node".into(),
+            server: Endpoint { address: "example.com".into(), port: 443 },
+            protocol,
+            transport,
+            security: Security::Tls(TlsSettings {
+                sni: Some("example.com".into()),
+                ..Default::default()
+            }),
+            mux: Mux::default(),
+            chain_via: None,
+            worker_served: true,
+        }
+    }
+
+    fn xhttp() -> Transport {
+        Transport::Xhttp { mode: XhttpMode::PacketUp, path: "/p".into(), host: None }
+    }
+
+    fn decode_vmess(uri: &str) -> serde_json::Value {
+        let b64 = uri.strip_prefix("vmess://").expect("has scheme");
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        let mut out = Vec::new();
+        for c in b64.bytes().filter(|&c| c != b'=') {
+            let v = alphabet.iter().position(|&x| x == c).unwrap_or(0) as u32;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        serde_json::from_slice(&out).expect("payload is valid JSON")
+    }
+
+    /// `fp` is a real share-link parameter every Xray client parses, so all
+    /// three URI protocols carry it under the toggle. The fragment cannot be
+    /// expressed in any link format, so nothing fragment-shaped may appear.
+    #[test]
+    fn vless_and_trojan_links_carry_fp_chrome() {
+        let vless = to_uri(
+            &node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, xhttp()),
+            ClientTarget::V2rayN,
+            true,
+        )
+        .expect("emits");
+        assert!(vless.contains("fp=chrome"), "got {vless}");
+        assert!(!vless.contains("fragment"));
+
+        let trojan = to_uri(
+            &node(Protocol::Trojan { password: "pw".into() }, xhttp()),
+            ClientTarget::V2rayN,
+            true,
+        )
+        .expect("emits");
+        assert!(trojan.contains("fp=chrome"), "got {trojan}");
+    }
+
+    #[test]
+    fn vmess_json_carrying_the_fingerprint() {
+        let uri = to_uri(
+            &node(
+                Protocol::Vmess { uuid: "uid".into(), cipher: VmessCipher::Auto },
+                Transport::WebSocket { path: "/w".into(), host: None, heartbeat_secs: 30 },
+            ),
+            ClientTarget::V2rayN,
+            true,
+        )
+        .expect("emits");
+        assert_eq!(decode_vmess(&uri)["fp"], "chrome");
+    }
+
+    #[test]
+    fn reality_links_carry_fp_chrome() {
+        let mut n = node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, Transport::Raw);
+        n.worker_served = false;
+        n.security = Security::Reality(crate::config::model::RealitySettings {
+            public_key: "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0".into(),
+            short_id: "6ba85179e30d4fc2".into(),
+            server_name: "www.microsoft.com".into(),
+            fingerprint: None,
+        });
+        let uri = to_uri(&n, ClientTarget::V2rayN, true).expect("emits");
+        assert!(uri.contains("security=reality"));
+        assert!(uri.contains("fp=chrome"), "got {uri}");
+    }
+
+    #[test]
+    fn an_explicit_fingerprint_is_never_overridden() {
+        let mut n = node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, xhttp());
+        n.security = Security::Tls(TlsSettings {
+            sni: Some("example.com".into()),
+            fingerprint: Some("firefox".into()),
+            ..Default::default()
+        });
+        let uri = to_uri(&n, ClientTarget::V2rayN, true).expect("emits");
+        assert!(uri.contains("fp=firefox"));
+        assert!(!uri.contains("chrome"));
+    }
+
+    #[test]
+    fn off_and_enhanced_differ_only_in_fp() {
+        let n = node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, xhttp());
+        let off = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
+        let on = to_uri(&n, ClientTarget::V2rayN, true).expect("emits");
+        assert!(!off.contains("fp="), "off-state links carry no fingerprint");
+        assert_eq!(off, on.replace("fp=chrome&", ""),
+            "fp=chrome is the only addition");
+    }
+
+    /// The SIP003 plugin connection is built by v2ray-plugin, not by Xray, so
+    /// Enhanced Reachability has nothing it can add to a Shadowsocks link.
+    #[test]
+    fn shadowsocks_links_are_identical_with_the_toggle() {
+        let mut n = node(
+            Protocol::Shadowsocks {
+                method: SsMethod::Blake3Aes128Gcm,
+                password: "AAAAAAAAAAAAAAAAAAAAAA==".into(),
+            },
+            Transport::Raw,
+        );
+        n.worker_served = false;
+        let off = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");
+        let on = to_uri(&n, ClientTarget::V2rayN, true).expect("emits");
+        assert_eq!(off, on, "the toggle must not touch a raw ss:// link");
+
+        // Transport is preserved through the plugin mechanism in both states.
+        n.transport = Transport::WebSocket { path: "/sw".into(), host: None, heartbeat_secs: 0 };
+        let ws = to_uri(&n, ClientTarget::V2rayN, true).expect("emits");
+        assert!(ws.contains("plugin=v2ray-plugin"), "got {ws}");
+        assert!(ws.contains("plugin-opts=ws%3Btls%3Bhost%3Dexample.com%3Bpath%3D%2Fsw"), "got {ws}");
+        assert!(!ws.contains("fp="), "v2ray-plugin takes no fingerprint");
+
+        // XHTTP has no plugin encoding; the link points at the JSON export.
+        n.transport = xhttp();
+        match to_uri(&n, ClientTarget::V2rayN, true) {
+            Err(EmitError::Refused(reasons)) => {
+                assert!(reasons.iter().any(|r| r.contains("JSON export")));
+            }
+            other => panic!("ss://+xhttp must be refused, got {other:?}"),
         }
     }
 }

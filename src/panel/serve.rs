@@ -108,7 +108,7 @@ pub async fn subscription(req: &Request, env: &Env, rest: &str) -> Result<Respon
     let host = host_of(req);
     let settings = load_settings(env, &host).await;
 
-    let Ok(rendered) = bundle::render(&settings.nodes, target, shape) else {
+    let Ok(rendered) = bundle::render(&settings.nodes, target, shape, settings.enhanced_reachability) else {
         // Nothing this client can use. Rendering the decoy keeps the endpoint
         // uninformative; the panel is where a user is told why.
         return crate::entry::decoy(env).await;
@@ -215,7 +215,7 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         return refuse(&message);
     }
 
-    let settings = Settings { version: super::store::VERSION, nodes: body.nodes, outbound: body.outbound };
+    let settings = Settings { version: super::store::VERSION, nodes: body.nodes, outbound: body.outbound, enhanced_reachability: body.enhanced_reachability };
     let Ok(document) = settings.to_json() else {
         return refuse("Those settings could not be stored.");
     };
@@ -260,7 +260,7 @@ async fn check(req: &mut Request) -> Result<Response> {
     if let Some(edit) = body.edit {
         super::advisor::apply(&mut node, &edit.field, &edit.value);
     }
-    let advice = super::advisor::advise(&node, target);
+    let advice = super::advisor::advise(&node, target, body.enhanced_reachability);
     json(&api::Checked { node, advice })
 }
 /// A rendered subscription, as JSON, so the panel can preview and copy it.
@@ -283,7 +283,7 @@ async fn export(req: &Request, env: &Env) -> Result<Response> {
     };
 
     let settings = load_settings(env, &host_of(req)).await;
-    match bundle::render(&settings.nodes, target, shape) {
+    match bundle::render(&settings.nodes, target, shape, settings.enhanced_reachability) {
         Ok(b) => json(&Export {
             body: b.body,
             content_type: b.content_type,
@@ -312,7 +312,7 @@ async fn qr(req: &Request, env: &Env) -> Result<Response> {
             let Some(node) = settings.node(&tag) else {
                 return refuse("That connection no longer exists.");
             };
-            match crate::subscription::to_uri(node, client) {
+            match crate::subscription::to_uri(node, client, settings.enhanced_reachability) {
                 Ok(uri) => uri,
                 Err(e) => return refuse(&format!("This app cannot import that connection: {e}")),
             }

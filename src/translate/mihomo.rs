@@ -59,6 +59,13 @@ const FINGERPRINTS: [&str; 10] = [
     "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized",
 ];
 
+/// uTLS identity applied when Enhanced Reachability is enabled and the node
+/// has no explicit fingerprint. It is a member of [`FINGERPRINTS`] by
+/// construction. mihomo has no equivalent of Xray's TLS ClientHello fragment,
+/// so the fingerprint default is the only part of the profile it can carry;
+/// nothing fragment-shaped is ever emitted.
+const ENHANCED_FINGERPRINT: &str = "chrome";
+
 /// Maximum bytes per uplink POST, as the string mihomo's range parser expects.
 ///
 /// Inventory §8: larger chunks mean fewer requests, and on the free plan the
@@ -101,8 +108,8 @@ impl Emit for Mihomo {
             )]));
         }
 
-        let mut dropped = gate(node, target)?;
-        let proxy = proxy_block(node, &mut dropped)?;
+        let mut dropped = gate(node, target, false)?;
+        let proxy = proxy_block(node, false, &mut dropped)?;
         let group = group_name(&node.tag);
 
         let mut out = String::with_capacity(1024);
@@ -116,6 +123,17 @@ impl Emit for Mihomo {
         kv(&mut out, 0, "allow-lan", "false");
         kv(&mut out, 0, "mode", "rule");
         kv(&mut out, 0, "log-level", "info");
+
+        // AdGuard DNS over HTTPS as the default resolver. Prevents local DNS
+        // leaks; mihomo resolves DoH natively via https:// nameserver URLs.
+        kv_open(&mut out, 0, "dns");
+        kv(&mut out, 1, "enable", "true");
+        kv(&mut out, 1, "enhanced-mode", "fake-ip");
+        kv_open(&mut out, 1, "nameserver");
+        line(&mut out, 2, "- https://dns.adguard-dns.com/dns-query");
+        // Plain-IP fallbacks so the DoH hostname itself can be resolved.
+        line(&mut out, 2, "- 94.140.14.14");
+        line(&mut out, 2, "- 94.140.15.15");
 
         kv_open(&mut out, 0, "proxies");
         out.push_str(&proxy);
@@ -165,7 +183,7 @@ fn group_name(tag: &str) -> String {
 }
 
 /// Render the single `proxies:` entry.
-fn proxy_block(node: &Node, dropped: &mut Vec<Dropped>) -> Result<String, EmitError> {
+fn proxy_block(node: &Node, enhanced: bool, dropped: &mut Vec<Dropped>) -> Result<String, EmitError> {
     check_name(&node.tag)?;
 
     let mut out = String::with_capacity(512);
@@ -194,9 +212,9 @@ fn proxy_block(node: &Node, dropped: &mut Vec<Dropped>) -> Result<String, EmitEr
     }
 
     match &node.protocol {
-        Protocol::Vless { uuid, flow } => vless(node, uuid, *flow, &mut out, dropped)?,
-        Protocol::Vmess { uuid, cipher } => vmess(node, uuid, *cipher, &mut out, dropped)?,
-        Protocol::Trojan { password } => trojan(node, password, &mut out, dropped)?,
+        Protocol::Vless { uuid, flow } => vless(node, uuid, *flow, enhanced, &mut out, dropped)?,
+        Protocol::Vmess { uuid, cipher } => vmess(node, uuid, *cipher, enhanced, &mut out, dropped)?,
+        Protocol::Trojan { password } => trojan(node, password, enhanced, &mut out, dropped)?,
         Protocol::Shadowsocks { method, password } => {
             shadowsocks(node, method.wire_name(), password, &mut out, dropped)?;
         }
@@ -231,6 +249,7 @@ fn vless(
     node: &Node,
     uuid: &str,
     flow: Flow,
+    enhanced: bool,
     out: &mut String,
     dropped: &mut Vec<Dropped>,
 ) -> Result<(), EmitError> {
@@ -251,7 +270,7 @@ fn vless(
     // only way this file states what UDP encoding it expects.
     kv(out, 2, "packet-encoding", "xudp");
 
-    security(node, out, dropped, SniKey::Servername)?;
+    security(node, out, dropped, SniKey::Servername, enhanced)?;
     transport(node, out, dropped);
     smux(node, out, dropped);
     Ok(())
@@ -263,6 +282,7 @@ fn vmess(
     node: &Node,
     uuid: &str,
     cipher: VmessCipher,
+    enhanced: bool,
     out: &mut String,
     dropped: &mut Vec<Dropped>,
 ) -> Result<(), EmitError> {
@@ -296,7 +316,7 @@ fn vmess(
     );
     kv(out, 2, "udp", "true");
 
-    security(node, out, dropped, SniKey::Servername)?;
+    security(node, out, dropped, SniKey::Servername, enhanced)?;
     transport(node, out, dropped);
     smux(node, out, dropped);
     Ok(())
@@ -307,6 +327,7 @@ fn vmess(
 fn trojan(
     node: &Node,
     password: &str,
+    enhanced: bool,
     out: &mut String,
     dropped: &mut Vec<Dropped>,
 ) -> Result<(), EmitError> {
@@ -332,7 +353,7 @@ fn trojan(
              must terminate TLS or the connection will fail.",
         ));
     }
-    security(node, out, dropped, SniKey::Sni)?;
+    security(node, out, dropped, SniKey::Sni, enhanced)?;
     transport(node, out, dropped);
     smux(node, out, dropped);
     Ok(())
@@ -439,15 +460,16 @@ fn security(
     out: &mut String,
     dropped: &mut Vec<Dropped>,
     sni_key: SniKey,
+    enhanced: bool,
 ) -> Result<(), EmitError> {
     match &node.security {
         Security::None => kv(out, 2, "tls", "false"),
-        Security::Tls(t) => tls(node, t, out, dropped, sni_key),
+        Security::Tls(t) => tls(node, t, out, dropped, sni_key, enhanced),
         // Only one security mode may be present and every one of them needs
         // `tls: true`; mihomo fails with "security modes are mutually
         // exclusive" and "%s requires TLS" respectively. The model can hold
         // only one, so emitting exactly this block is what keeps that true.
-        Security::Reality(r) => reality(r, out, sni_key)?,
+        Security::Reality(r) => reality(r, out, sni_key, enhanced)?,
     }
     Ok(())
 }
@@ -458,6 +480,7 @@ fn tls(
     out: &mut String,
     dropped: &mut Vec<Dropped>,
     sni_key: SniKey,
+    enhanced: bool,
 ) {
     kv(out, 2, "tls", "true");
     let sni = match &t.sni {
@@ -501,7 +524,9 @@ fn tls(
         )),
         // Left unset rather than defaulted: injecting a browser ClientHello
         // changes what the server and every middlebox on the path see, and
-        // that is the user's decision to make, not this emitter's.
+        // that is the user's decision to make, not this emitter's. The
+        // Enhanced Reachability toggle is that decision, made explicitly.
+        None if enhanced => kv(out, 2, "client-fingerprint", &scalar(ENHANCED_FINGERPRINT)),
         None => {}
     }
 
@@ -509,7 +534,7 @@ fn tls(
     kv(out, 2, "skip-cert-verify", bool_str(t.allow_insecure));
 }
 
-fn reality(r: &RealitySettings, out: &mut String, sni_key: SniKey) -> Result<(), EmitError> {
+fn reality(r: &RealitySettings, out: &mut String, sni_key: SniKey, enhanced: bool) -> Result<(), EmitError> {
     // mihomo builds a REALITY client only when the public key parses. An
     // empty or malformed key does not stop the config from loading — either
     // the whole block is skipped, leaving a plain TLS connection the server
@@ -533,13 +558,31 @@ fn reality(r: &RealitySettings, out: &mut String, sni_key: SniKey) -> Result<(),
                 .to_owned(),
         ]));
     }
-    let Some(fp) = r.fingerprint.as_deref().filter(|f| FINGERPRINTS.contains(f)) else {
-        return Err(EmitError::Refused(vec![format!(
-            "REALITY's handshake is generated by uTLS, which needs a ClientHello identity, and \
-             mihomo raises no error when it is missing or unrecognised — it simply cannot \
-             complete the handshake. Set a client fingerprint to one of: {}.",
-            FINGERPRINTS.join(", ")
-        )]));
+    // REALITY's handshake is generated by uTLS, which needs a ClientHello
+    // identity, and mihomo raises no error when it is missing or unrecognised
+    // — it simply cannot complete the handshake. Enhanced Reachability fills
+    // in a missing value with a working default; an explicitly set but unknown
+    // fingerprint is still refused, since the toggle may complete a config,
+    // not silently override a wrong one.
+    let fp = match r.fingerprint.as_deref().filter(|f| !f.is_empty()) {
+        Some(f) if FINGERPRINTS.contains(&f) => f,
+        Some(f) => {
+            return Err(EmitError::Refused(vec![format!(
+                "mihomo does not know the uTLS fingerprint \"{f}\" for REALITY, and the \
+                 handshake cannot complete without a valid ClientHello identity. Set a client \
+                 fingerprint to one of: {}.",
+                FINGERPRINTS.join(", ")
+            )]));
+        }
+        None if enhanced => ENHANCED_FINGERPRINT,
+        None => {
+            return Err(EmitError::Refused(vec![format!(
+                "REALITY's handshake is generated by uTLS, which needs a ClientHello identity, \
+                 and mihomo raises no error when it is missing — it simply cannot complete the \
+                 handshake. Set a client fingerprint to one of: {}.",
+                FINGERPRINTS.join(", ")
+            )]));
+        }
     };
     if r.server_name.is_empty() {
         return Err(EmitError::Refused(vec![
@@ -1328,7 +1371,7 @@ mod tests {
 /// # Errors
 /// [`EmitError::Refused`] when the list is empty, when the target does not run
 /// mihomo, or when every node is rejected by [`gate`].
-pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitError> {
+pub fn emit_nodes(nodes: &[Node], target: ClientTarget, enhanced: bool) -> Result<Emitted, EmitError> {
     if target.core() != Core::Mihomo {
         return Err(EmitError::Refused(vec![format!(
             "{} does not run mihomo, so a mihomo YAML file is not what it can import — \
@@ -1362,7 +1405,7 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitE
         let mut renamed = node.clone();
         renamed.tag.clone_from(tag);
 
-        let mut node_dropped = match gate(&renamed, target) {
+        let mut node_dropped = match gate(&renamed, target, enhanced) {
             Ok(f) => f,
             Err(EmitError::Refused(reasons)) => {
                 refusals.extend(reasons.iter().map(|r| label_reason(r, tag, label)));
@@ -1370,7 +1413,7 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitE
             }
             Err(other) => return Err(other),
         };
-        match proxy_block(&renamed, &mut node_dropped) {
+        match proxy_block(&renamed, enhanced, &mut node_dropped) {
             Ok(block) => {
                 blocks.push(block);
                 usable_tags.push(tag.clone());
@@ -1398,6 +1441,17 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget) -> Result<Emitted, EmitE
     kv(&mut out, 0, "allow-lan", "false");
     kv(&mut out, 0, "mode", "rule");
     kv(&mut out, 0, "log-level", "info");
+
+    // AdGuard DNS over HTTPS as the default resolver. Prevents local DNS
+    // leaks; mihomo resolves DoH natively via https:// nameserver URLs.
+    kv_open(&mut out, 0, "dns");
+    kv(&mut out, 1, "enable", "true");
+    kv(&mut out, 1, "enhanced-mode", "fake-ip");
+    kv_open(&mut out, 1, "nameserver");
+    line(&mut out, 2, "- https://dns.adguard-dns.com/dns-query");
+    // Plain-IP fallbacks so the DoH hostname itself can be resolved.
+    line(&mut out, 2, "- 94.140.14.14");
+    line(&mut out, 2, "- 94.140.15.15");
 
     kv_open(&mut out, 0, "proxies");
     for block in &blocks {
@@ -1474,7 +1528,7 @@ mod multi_node_tests {
     }
 
     fn emit(nodes: &[Node]) -> String {
-        emit_nodes(nodes, ClientTarget::Mihomo).expect("emits").config
+        emit_nodes(nodes, ClientTarget::Mihomo, false).expect("emits").config
     }
 
     #[test]
@@ -1520,19 +1574,118 @@ mod multi_node_tests {
             host: None,
         };
         bad.worker_served = true;
-        let e = emit_nodes(&[node("good"), bad], ClientTarget::Mihomo).expect("emits");
+        let e = emit_nodes(&[node("good"), bad], ClientTarget::Mihomo, false).expect("emits");
         assert!(e.config.contains(r#"name: "good""#), "{}", e.config);
         assert!(!e.dropped.is_empty());
     }
 
     #[test]
     fn an_empty_list_is_refused() {
-        assert!(emit_nodes(&[], ClientTarget::Mihomo).is_err());
+        assert!(emit_nodes(&[], ClientTarget::Mihomo, false).is_err());
     }
 
     #[test]
     fn a_client_running_another_core_is_refused() {
-        assert!(emit_nodes(&[node("a")], ClientTarget::V2rayN).is_err());
-        assert!(emit_nodes(&[node("a")], ClientTarget::Hiddify).is_err());
+        assert!(emit_nodes(&[node("a")], ClientTarget::V2rayN, false).is_err());
+        assert!(emit_nodes(&[node("a")], ClientTarget::Hiddify, false).is_err());
+    }
+}
+
+/// Enhanced Reachability coverage. Off-state behaviour is pinned by the tests
+/// above, which all emit with the flag off.
+#[cfg(test)]
+mod enhanced_tests {
+    use super::*;
+    use crate::config::model::{Endpoint, Mux, TlsSettings};
+
+    fn node() -> Node {
+        Node {
+            tag: "cf-xhttp".into(),
+            server: Endpoint { address: "edge.example.com".into(), port: 443 },
+            protocol: Protocol::Vless {
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                flow: Flow::None,
+            },
+            transport: Transport::Xhttp {
+                mode: XhttpMode::PacketUp,
+                path: "/xh".into(),
+                host: None,
+            },
+            security: Security::Tls(TlsSettings::default()),
+            mux: Mux::default(),
+            chain_via: None,
+            worker_served: true,
+        }
+    }
+
+    fn reality_node(fingerprint: Option<&str>) -> Node {
+        Node {
+            worker_served: false,
+            transport: Transport::Raw,
+            security: Security::Reality(RealitySettings {
+                public_key: "xbnMTmz7HHhLbLmGnb1UnZfxOKmnPGnGnZmSPMHZfXc".into(),
+                short_id: "6ba85179e30d4fc2".into(),
+                server_name: "www.microsoft.com".into(),
+                fingerprint: fingerprint.map(ToOwned::to_owned),
+            }),
+            ..node()
+        }
+    }
+
+    /// mihomo has no equivalent of Xray's ClientHello fragment, so Enhanced
+    /// Reachability adds a browser fingerprint and nothing else.
+    #[test]
+    fn enhanced_adds_a_browser_fingerprint_and_nothing_else() {
+        let off = emit_nodes(&[node()], ClientTarget::Mihomo, false).expect("off emits");
+        let on = emit_nodes(&[node()], ClientTarget::Mihomo, true).expect("on emits");
+
+        assert!(!off.config.contains("client-fingerprint"));
+        assert!(on.config.contains(&format!("client-fingerprint: {}", scalar(ENHANCED_FINGERPRINT))));
+        // No fragment-shaped key may appear anywhere in the output.
+        assert!(!on.config.contains("fragment"));
+
+        let stripped = on
+            .config
+            .lines()
+            .filter(|l| !l.contains("client-fingerprint"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // lines() drops the final newline the emitter writes after the last
+        // rule line; put it back before comparing.
+        assert_eq!(stripped + "\n", off.config, "nothing else may change");
+    }
+
+    #[test]
+    fn an_explicit_fingerprint_is_kept_under_enhanced() {
+        let mut n = node();
+        n.security = Security::Tls(TlsSettings {
+            fingerprint: Some("firefox".into()),
+            ..Default::default()
+        });
+        let e = emit_nodes(&[n], ClientTarget::Mihomo, true).expect("emits");
+        assert!(e.config.contains("client-fingerprint: firefox"));
+        assert!(!e.config.contains("chrome"));
+    }
+
+    #[test]
+    fn enhanced_completes_a_reality_node_missing_its_fingerprint() {
+        // Without the toggle this node is refused: REALITY's uTLS handshake
+        // cannot build without a ClientHello identity. Enhanced completes it.
+        assert!(matches!(
+            emit_nodes(&[reality_node(None)], ClientTarget::Mihomo, false),
+            Err(EmitError::Refused(_))
+        ));
+        let e = emit_nodes(&[reality_node(None)], ClientTarget::Mihomo, true).expect("emits");
+        assert!(e.config.contains(&format!("client-fingerprint: {}", scalar(ENHANCED_FINGERPRINT))));
+        assert!(e.config.contains("reality-opts:"));
+    }
+
+    #[test]
+    fn enhanced_does_not_override_an_unknown_reality_fingerprint() {
+        // The toggle may complete a config, not silently patch a wrong one.
+        assert!(matches!(
+            emit_nodes(&[reality_node(Some("nosuchfp"))], ClientTarget::Mihomo, true),
+            Err(EmitError::Refused(_))
+        ));
     }
 }
