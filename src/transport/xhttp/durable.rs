@@ -63,6 +63,7 @@ use super::{UploadQueue, DEFAULT_MAX_BUFFERED_POSTS, DEFAULT_MAX_POST_BYTES};
 use crate::protocol::codec::{Decoder, Encoder};
 use crate::protocol::{detect, Credentials, ProtocolError};
 use crate::relay::outbound::OutboundConfig;
+use crate::relay::outbound_state::{self, OutboundState};
 #[allow(unused_imports)] // used by the socket-owning task below on some paths
 use crate::relay::{connect, write_chunked};
 
@@ -403,14 +404,29 @@ async fn own_session(
     // when KV is unavailable or the settings document is missing.
     // A clone for the settings read; the original stays here for the
     // SESSION_DIAG-gated publication at teardown.
-    let diag_env = env.clone();
+    let settings_env = env.clone();
     let settings_load = async move {
-        match diag_env.kv("SETTINGS") {
+        match settings_env.kv("SETTINGS") {
             Ok(kv) => match kv.get(crate::panel::store::KEY).text().await {
                 Ok(Some(raw)) => crate::relay::outbound::from_settings_json(&raw),
                 _ => OutboundConfig::default(),
             },
             Err(_) => OutboundConfig::default(),
+        }
+    };
+
+    // The last-known-good outbound preference rides along in the same join:
+    // one KV round trip that overlaps the header wait, and — like the settings
+    // read — any failure degrades to "nothing known" rather than blocking or
+    // failing the session.
+    let state_env = env.clone();
+    let state_load = async move {
+        match state_env.kv("SETTINGS") {
+            Ok(kv) => match kv.get(outbound_state::KV_KEY).text().await {
+                Ok(Some(raw)) => OutboundState::from_json(&raw),
+                _ => OutboundState::default(),
+            },
+            Err(_) => OutboundState::default(),
         }
     };
 
@@ -464,8 +480,8 @@ async fn own_session(
         }
     };
 
-    let (Some(header), outbound_cfg) =
-        futures_util::future::join(header_phase, settings_load).await
+    let (Some(header), outbound_cfg, known_state) =
+        futures_util::future::join3(header_phase, settings_load, state_load).await
     else {
         return;
     };
@@ -495,9 +511,17 @@ async fn own_session(
     // Route through the outbound layer using the session's loaded config. In
     // Off mode this is a single direct candidate; with Proxy IP or NAT64 each
     // candidate's handshake is verified before the session commits to it.
-    let plan = outbound_cfg.resolve(&target);
+    //
+    // A fresh last-known-good preference (see `outbound_state`) moves its
+    // candidate to the front before anything dials. Pure reorder: every
+    // candidate stays in the plan, so a stale preference costs nothing.
+    let plan = outbound_state::order_plan(
+        outbound_cfg.resolve(&target),
+        &known_state,
+        now_ms(),
+    );
     let started_ms = now_ms();
-    let Ok(sock) = connect::open_with_plan(&plan).await else { return };
+    let Ok((sock, winner_idx)) = connect::open_with_plan_tracked(&plan).await else { return };
 
     // Session diagnostics: counted always (a few adds per chunk), published
     // only when the deployment opts in via the SESSION_DIAG binding. The sid
@@ -703,6 +727,29 @@ async fn own_session(
             // A timer kill is never normal; surface it even without the KV
             // binding so a bench run sees it in the worker logs.
             worker::console_log!("trinity-diag sid={} idle_timer_fired", sid);
+        }
+    }
+    // Last-known-good bookkeeping, once per session at teardown. Only a win
+    // by a genuine proxy candidate records a preference: a direct win would
+    // write this session's destination host into shared state where it could
+    // never help another session. Every error on the way out is ignored — a
+    // failed bookkeeping write must never turn a finished tunnel into an
+    // observable failure.
+    if let Some(winner_target) = plan.candidates.get(winner_idx) {
+        if *winner_target != plan.logical
+            && outbound_state::should_record(winner_target, &known_state, now_ms())
+        {
+            let learned = OutboundState {
+                preferred: Some(outbound_state::candidate_key(winner_target)),
+                updated_at_ms: now_ms(),
+            };
+            if let Ok(document) = serde_json::to_string(&learned) {
+                if let Ok(kv) = env.kv("SETTINGS") {
+                    if let Ok(pending) = kv.put(outbound_state::KV_KEY, document) {
+                        let _ = pending.execute().await;
+                    }
+                }
+            }
         }
     }
     publish(&diag, &sid, &env).await;

@@ -25,6 +25,7 @@
 
 pub mod connect;
 pub mod outbound;
+pub mod outbound_state;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

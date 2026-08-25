@@ -140,6 +140,22 @@ mod imp {
     /// The error from the last candidate attempted, so the caller sees the
     /// most relevant failure rather than the first.
     pub async fn open_with_plan(plan: &DialPlan) -> Result<Socket, ConnectError> {
+        open_with_plan_tracked(plan).await.map(|(sock, _)| sock)
+    }
+
+    /// [`open_with_plan`], plus the index of the candidate that won.
+    ///
+    /// The session layer needs to know *which* route carried the tunnel — it
+    /// is what the last-known-good bookkeeping in
+    /// [`crate::relay::outbound_state`] records. Callers that do not care use
+    /// [`open_with_plan`].
+    ///
+    /// # Errors
+    /// The error from the last candidate attempted, so the caller sees the
+    /// most relevant failure rather than the first.
+    pub async fn open_with_plan_tracked(
+        plan: &DialPlan,
+    ) -> Result<(Socket, usize), ConnectError> {
         if let [only] = plan.candidates.as_slice() {
             let sock = open(only)?;
             let handshook = {
@@ -152,11 +168,11 @@ mod imp {
                 .await
             };
             handshook?;
-            return Ok(sock);
+            return Ok((sock, 0));
         }
 
         let mut last_err = ConnectError::Failed("no candidates".into());
-        for candidate in &plan.candidates {
+        for (idx, candidate) in plan.candidates.iter().enumerate() {
             match open(candidate) {
                 // A candidate that dials but never completes its handshake is
                 // not a working route. Verify before committing to it.
@@ -175,7 +191,7 @@ mod imp {
                         .await
                     };
                     match handshook {
-                        Ok(()) => return Ok(sock),
+                        Ok(()) => return Ok((sock, idx)),
                         Err(e) => last_err = e,
                     }
                 }
@@ -187,7 +203,7 @@ mod imp {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use imp::{open, open_with_plan};
+pub use imp::{open, open_with_plan, open_with_plan_tracked};
 
 #[cfg(test)]
 mod tests {
