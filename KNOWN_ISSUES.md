@@ -1,6 +1,6 @@
 # Known issues
 
-Current as of the initial public release. Everything here is drawn from reading
+Current as of 2026-08-25. Everything here is drawn from reading
 the code and from a live deployment. It documents the state as found.
 
 The project's own verification vocabulary is used throughout:
@@ -15,6 +15,34 @@ The project's own verification vocabulary is used throughout:
 ---
 
 ## Not working / not verified
+
+### 0. Live outage (measured 2026-08-25): free-tier Durable Object duration quota exhausts under idle zombie sessions
+
+On the production deployment (`trinity-cleanacct`), every new session began
+failing instantly from **~10:24 UTC** onward while earlier sessions that
+morning tore down cleanly (`setup_ms` 12–239 ms, healthy byte counts in
+`SESSION_DIAG`). Evidence, all read-only:
+
+- Hourly GraphQL shows DO invocations stop entirely after the 10:00 UTC hour,
+  while Worker-level requests keep succeeding (they serve decoys).
+- `SESSION_DIAG` teardown blobs — written once per session end — stop
+  mid-morning at exactly 10:24:08 UTC and never resume.
+- The namespace holds **1,933 live `XhttpSession` objects**; each lingering
+  object burns wall-clock duration against the free tier's daily allowance
+  whether or not any traffic flows through it.
+
+The mechanism matches the code: before supervised teardown existed, a session
+whose client vanished without closing cleanly had no path that ended it
+promptly, so abandoned half-sessions accumulated as objects that hold quota
+all day. Once the day's duration budget is gone, *every* DO fetch fails before
+an object wakes — the whole transport is down until 00:00 UTC resets the
+allowance.
+
+What exists for it: the supervisor (`src/transport/xhttp/supervise.rs`) ends
+receiver-gone and poisoned sessions immediately and keeps the 60 s true-idle
+teardown; it is merged to this tree but **not yet deployed**, so the live
+deployment remains exposed until the next deploy. Deploying does not clear
+existing zombies; they age out on their own schedule.
 
 ### 1. The panel UI is unverified end-to-end
 
