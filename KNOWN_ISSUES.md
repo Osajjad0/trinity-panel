@@ -41,9 +41,11 @@ gives EOF"**, which is why the derived Trojan node uses XHTTP rather than
 WebSocket. That reads as a known defect rather than a design note. It has not been
 investigated.
 
-Note that the live deployment has `WS_ENABLED=true` and `WS_PATH=/ws` set, so the
-WebSocket route is reachable there — on an unproven code path with a suspected
-relay bug.
+Note that `WS_ENABLED` is `"false"` everywhere it is set — in
+`wrangler.jsonc` and in `scripts/deploy.py` alike (deploy.py:411) — so the
+WebSocket route is unreachable on deployments made by either path. That is a
+deliberate default: WebSocket is an unproven code path with a suspected relay
+bug, and enabling it couples the transport's fate with XHTTP's hostname.
 
 ### 3. XHTTP `stream-up` and `stream-one` are not implemented
 
@@ -160,10 +162,9 @@ everything through it. The refusal is covered by a passing test case, not a gap.
   Both are overwritten by [the wizard](README.md#quick-start) and by
   `scripts/deploy.py`; deploying with `wrangler` without editing them first serves
   the transport on the root path and leaves an unproven transport disabled.
-  Prefer the wizard or the CLI script. The path placeholders and the
-  `WS_ENABLED` disagreement with `deploy.py` (which sets `"true"`) are deliberate
-  defaults in the file so a `wrangler`-only user does not accidentally enable an
-  unproven transport on the root path.
+  Prefer the wizard or the CLI script. `scripts/deploy.py` also ships
+  `WS_ENABLED: "false"` (deploy.py:411), so every supported deploy path keeps
+  the unproven transport off unless an operator opts in by hand.
 - **The crate in `Cargo.toml` is still named `tricore_panel`.** The build artefact
   is therefore `tricore_panel.wasm`. Renaming the crate was out of scope; the
   rebrand is user-facing only.

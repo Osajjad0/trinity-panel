@@ -10,6 +10,11 @@ secrets.json
 .wrangler/
 .cloudflare/
 store.json
+.clean_acct.env
+
+# ---- production artifacts (never commit; contain live settings/credentials) ----
+kv_prod_backup_*.json
+cleanacct_settings_backup.json
 
 # ---- build output ----
 dist/

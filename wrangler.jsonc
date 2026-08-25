@@ -84,8 +84,9 @@
     // WebSocket is off by default. It is the most heavily classified transport
     // in this space, and enabling it on the same hostname as XHTTP couples
     // their survival — a classifier that flags the hostname takes both down.
-    // scripts/deploy.py sets this to "true"; this file keeps it "false" so a
-    // CLI user does not enable an unproven transport by accident.
+    // scripts/deploy.py sets this to "false" as well (deploy.py:411); both
+    // supported deploy paths keep the unproven transport off unless an
+    // operator opts in by hand.
     "WS_ENABLED": "false",
     "WS_PATH": "/ws"
   },
