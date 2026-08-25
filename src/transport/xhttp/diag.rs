@@ -58,6 +58,11 @@ pub enum SessionEnd {
     ReceiverGone,
     /// Session state became unrecoverable while the owner still ran.
     Poisoned,
+    /// No outbound candidate connected; the session never had a socket.
+    DialFailed,
+    /// Refused before the relay stage (incomplete/invalid header, unsupported
+    /// request shape). Additive for teardown-finalizer visibility.
+    Refused,
 }
 
 impl SessionEnd {
@@ -68,6 +73,8 @@ impl SessionEnd {
             SessionEnd::IdleTimerFired => "idle_timer",
             SessionEnd::ReceiverGone => "receiver_gone",
             SessionEnd::Poisoned => "poisoned",
+            SessionEnd::DialFailed => "dial_failed",
+            SessionEnd::Refused => "refused",
         }
     }
 }
@@ -219,6 +226,8 @@ mod tests {
         let supervised = [
             (SessionEnd::ReceiverGone, "\"end\":\"receiver_gone\""),
             (SessionEnd::Poisoned, "\"end\":\"poisoned\""),
+            (SessionEnd::DialFailed, "\"end\":\"dial_failed\""),
+            (SessionEnd::Refused, "\"end\":\"refused\""),
         ];
         for (end, needle) in supervised {
             let d = SessionDiag::new();

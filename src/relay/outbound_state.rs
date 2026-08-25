@@ -120,12 +120,95 @@ pub fn order_plan(mut plan: DialPlan, state: &OutboundState, now_ms: u64) -> Dia
 /// past — so the first observation records immediately.
 #[must_use]
 pub fn should_record(winner: &Target, state: &OutboundState, now_ms: u64) -> bool {
-    if state.preferred.as_deref().is_some_and(|p| {
-        p.trim().to_ascii_lowercase() == candidate_key(winner)
-    }) {
+    should_record_key(
+        &candidate_key(winner),
+        state.preferred.as_deref(),
+        state.updated_at_ms,
+        now_ms,
+    )
+}
+
+fn should_record_key(winner_key: &str, preferred: Option<&str>, updated_at_ms: u64, now_ms: u64) -> bool {
+    if preferred.is_some_and(|p| p.trim().to_ascii_lowercase() == winner_key) {
         return false;
     }
-    now_ms.saturating_sub(state.updated_at_ms) >= WRITE_DEBOUNCE_SECS.saturating_mul(1000)
+    now_ms.saturating_sub(updated_at_ms) >= WRITE_DEBOUNCE_SECS.saturating_mul(1000)
+}
+
+/// What teardown should do with the stored preference after one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LkgAction {
+    /// Leave the stored document untouched.
+    Keep,
+    /// Remove the preference entirely (it steered this session wrong).
+    Clear,
+    /// Store this candidate as the new preference.
+    Record(String),
+}
+
+/// How the outbound dial phase ended for one session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialVerdict<'a> {
+    /// A candidate connected and carried the session.
+    Won {
+        /// Key of the winning candidate ([`candidate_key`]).
+        winner: &'a str,
+        /// True when the winner was the logical destination itself (direct).
+        is_direct: bool,
+        /// Key of the first candidate that failed en route to the win.
+        first_failed: Option<&'a str>,
+    },
+    /// Every candidate failed; no socket exists.
+    Failed,
+}
+
+/// Decide the teardown action for the stored preference.
+///
+/// Rules, in order:
+/// - a total dial failure clears any existing preference — it was probably
+///   what steered every attempt wrong, and keeping it would steer the next
+///   session identically;
+/// - a proxy win follows the ordinary record rules (changed AND debounced),
+///   and recording supersedes clearing because the fresh winner replaces the
+///   stale preference outright;
+/// - a direct win keeps nothing by convention, EXCEPT when the recorded
+///   preference is exactly the candidate that failed first this session —
+///   then it is demoted immediately rather than steering sessions onto a
+///   degraded proxy until its TTL expires (measured live: a stale cross-port
+///   preference cost every dial a full handshake timeout).
+#[must_use]
+pub fn lkg_on_session_result(
+    preferred: Option<&str>,
+    updated_at_ms: u64,
+    verdict: DialVerdict<'_>,
+    now_ms: u64,
+) -> LkgAction {
+    let pref_failed = |first_failed: Option<&str>| -> bool {
+        preferred.is_some_and(|p| {
+            p.trim().to_ascii_lowercase() == first_failed.unwrap_or_default()
+        })
+    };
+    match verdict {
+        DialVerdict::Failed => {
+            if preferred.is_some() {
+                LkgAction::Clear
+            } else {
+                LkgAction::Keep
+            }
+        }
+        DialVerdict::Won { winner, is_direct, first_failed } => {
+            if !is_direct
+                && should_record_key(winner, preferred, updated_at_ms, now_ms)
+            {
+                return LkgAction::Record(winner.to_owned());
+            }
+            if pref_failed(first_failed) {
+                LkgAction::Clear
+            } else {
+                LkgAction::Keep
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -324,8 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_then_order_keeps_every_candidate_across_modes() {
-        use crate::relay::outbound::OutboundConfig;
+    fn resolve_then_order_keeps_every_candidate_across_modes() {        use crate::relay::outbound::OutboundConfig;
 
         let cfg = OutboundConfig {
             mode: crate::relay::outbound::ProxyMode::ProxyIp,
@@ -343,5 +425,134 @@ mod tests {
         assert_eq!(ordered.candidates.len(), resolved.candidates.len());
         assert_eq!(candidate_key(&ordered.candidates[0]), "nima.nscl.ir:443");
         assert_eq!(ordered.logical, target);
+    }
+
+    mod lkg_decisions {
+        use super::*;
+
+        const PREF: Option<&str> = Some("di.nscl.ir:443");
+        const AT: u64 = NOW - 1_000;
+
+        #[test]
+        fn total_failure_clears_an_existing_preference() {
+            assert_eq!(
+                lkg_on_session_result(PREF, AT, DialVerdict::Failed, NOW),
+                LkgAction::Clear
+            );
+        }
+
+        #[test]
+        fn total_failure_without_preference_keeps() {
+            assert_eq!(
+                lkg_on_session_result(None, 0, DialVerdict::Failed, NOW),
+                LkgAction::Keep
+            );
+        }
+
+        #[test]
+        fn proxy_win_records_when_changed_and_debounced() {
+            let at = NOW - WRITE_DEBOUNCE_SECS * 1000;
+            assert_eq!(
+                lkg_on_session_result(
+                    PREF,
+                    at,
+                    DialVerdict::Won {
+                        winner: "nima.nscl.ir:443",
+                        is_direct: false,
+                        first_failed: None
+                    },
+                    NOW
+                ),
+                LkgAction::Record("nima.nscl.ir:443".into())
+            );
+            // Inside the debounce window a changed winner is NOT recorded.
+            assert_eq!(
+                lkg_on_session_result(
+                    PREF,
+                    NOW - 1_000,
+                    DialVerdict::Won {
+                        winner: "nima.nscl.ir:443",
+                        is_direct: false,
+                        first_failed: None
+                    },
+                    NOW
+                ),
+                LkgAction::Keep
+            );
+        }
+
+        #[test]
+        fn direct_win_demotes_a_preference_that_failed_first() {
+            assert_eq!(
+                lkg_on_session_result(
+                    PREF,
+                    AT,
+                    DialVerdict::Won {
+                        winner: "dest.example:443",
+                        is_direct: true,
+                        first_failed: Some("di.nscl.ir:443")
+                    },
+                    NOW
+                ),
+                LkgAction::Clear
+            );
+        }
+
+        #[test]
+        fn direct_win_keeps_an_unrelated_preference() {
+            assert_eq!(
+                lkg_on_session_result(
+                    PREF,
+                    AT,
+                    DialVerdict::Won {
+                        winner: "dest.example:443",
+                        is_direct: true,
+                        first_failed: Some("nima.nscl.ir:443")
+                    },
+                    NOW
+                ),
+                LkgAction::Keep
+            );
+        }
+
+        #[test]
+        fn proxy_win_supersedes_demotion_when_it_replaces_the_failure() {
+            // Preferred failed first but another proxy carried the session:
+            // recording the fresh winner is strictly better than clearing.
+            let at = NOW - WRITE_DEBOUNCE_SECS * 1000;
+            assert_eq!(
+                lkg_on_session_result(
+                    PREF,
+                    at,
+                    DialVerdict::Won {
+                        winner: "nima.nscl.ir:443",
+                        is_direct: false,
+                        first_failed: Some("di.nscl.ir:443")
+                    },
+                    NOW
+                ),
+                LkgAction::Record("nima.nscl.ir:443".into())
+            );
+        }
+
+        #[test]
+        fn unchanged_proxy_win_inside_debounce_keeps_and_still_demotes_failure() {
+            // Same preferred candidate won again after failing first once:
+            // nothing to record, but the failure demotion must still fire.
+            let at = NOW - (WRITE_DEBOUNCE_SECS * 1000 - 1);
+            assert_eq!(
+                lkg_on_session_result(
+                    PREF,
+                    at,
+                    DialVerdict::Won {
+                        winner: "di.nscl.ir:443",
+                        is_direct: false,
+                        first_failed: Some("di.nscl.ir:443")
+                    },
+                    NOW
+                ),
+                LkgAction::Clear
+            );
+        }
     }
 }

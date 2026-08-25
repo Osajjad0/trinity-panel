@@ -40,8 +40,8 @@
 //! `GET` and its first `POST` — either may arrive first and neither has to
 //! wait for the other.
 
-use core::cell::RefCell;
-use std::sync::Arc;
+use core::cell::{Cell, RefCell};
+use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use futures_channel::mpsc;
@@ -62,7 +62,7 @@ use super::{UploadQueue, DEFAULT_MAX_BUFFERED_POSTS, DEFAULT_MAX_POST_BYTES};
 #[allow(unused_imports)] // used by the socket-owning task below on some paths
 use crate::protocol::codec::{Decoder, Encoder};
 use crate::protocol::{detect, Credentials, ProtocolError};
-use crate::relay::outbound::OutboundConfig;
+use crate::relay::outbound::{DialPlan, OutboundConfig};
 use crate::relay::outbound_state::{self, OutboundState};
 #[allow(unused_imports)] // used by the socket-owning task below on some paths
 use crate::relay::{connect, write_chunked};
@@ -120,8 +120,17 @@ struct Inner {
     /// first uplink starts it.
     uplink: Option<mpsc::Sender<Bytes>>,
     down_rx: Option<DownReceiver>,
-    down_tx: Option<DownSender>,
-    /// Set when the session is unusable, so later requests fail fast.
+    /// Current downlink sender, shared with the pump so teardown can close
+    /// it from outside. `None` once the session has finished.
+    shared_down: Arc<Mutex<Option<DownSender>>>,
+    /// Set when the owner task has finished, for ANY reason — including the
+    /// idle timer and dial failure. Later requests on this sid answer 404:
+    /// unambiguous "this session is gone, build another one". The 400 they
+    /// answered before was read by clients as "retry later", which stranded
+    /// live tunnels on dead objects until a manual reset.
+    ended: Arc<Cell<bool>>,
+    /// Set when the session is unusable mid-flight (corrupt stream data), so
+    /// later requests fail fast even before the owner unwinds.
     poisoned: bool,
 }
 
@@ -153,7 +162,8 @@ impl DurableObject for XhttpSession {
                 queue: UploadQueue::new(DEFAULT_MAX_BUFFERED_POSTS, MAX_BUFFER_BYTES),
                 uplink: None,
                 down_rx: Some(rx),
-                down_tx: Some(tx),
+                shared_down: Arc::new(Mutex::new(Some(tx))),
+                ended: Arc::new(Cell::new(false)),
                 poisoned: false,
             }),
         }
@@ -234,6 +244,10 @@ impl XhttpSession {
     /// response headers are what tell intermediaries not to buffer, so they
     /// need to be on the wire ahead of the first payload rather than behind it.
     fn downlink(&self) -> Result<Response> {
+        if self.inner.borrow().ended.get() {
+            // Session over: 404 so the client rebuilds immediately.
+            return reply(Status::NotFound);
+        }
         let rx = self.inner.borrow_mut().down_rx.take();
         let Some(rx) = rx else {
             // Only one downlink exists per session, so a second `GET` is a
@@ -255,6 +269,10 @@ impl XhttpSession {
     /// `sid` rides along for the session diagnostics only — the relay is
     /// indifferent to it.
     async fn uplink(&self, mut req: Request, seq: u64, sid: String) -> Result<Response> {
+        if self.inner.borrow().ended.get() {
+            // Session over: 404 so the client rebuilds immediately.
+            return reply(Status::NotFound);
+        }
         if self.inner.borrow().poisoned {
             return reply(Status::Rejected);
         }
@@ -296,11 +314,6 @@ impl XhttpSession {
 
             if inner.uplink.is_none() {
                 let (tx, rx) = mpsc::channel(UPLINK_DEPTH);
-                let Some(down) = inner.down_tx.take() else {
-                    inner.poisoned = true;
-                    drop(inner);
-                    return reply(Status::Rejected);
-                };
                 inner.uplink = Some(tx);
                 // Tied to the object, not to this request.
                 //
@@ -312,13 +325,16 @@ impl XhttpSession {
                 // takes every connection on it down. The owner task has to
                 // wait for header bytes before it can dial anyway, so it
                 // loads the config there at no cost.
-                self.state.wait_until(own_session(
-                    rx,
-                    down,
+                let ctx = OwnerContext {
+                    uplink_rx: rx,
                     sid,
-                    self.credentials(),
-                    self.env.clone(),
-                ));
+                    creds: self.credentials(),
+                    env: self.env.clone(),
+                    shared_down: inner.shared_down.clone(),
+                    ended: inner.ended.clone(),
+                    diag: Arc::new(SessionDiag::new()),
+                };
+                self.state.wait_until(own_session(ctx));
             }
 
             // A clone is an independent handle to the same queue, so the
@@ -374,18 +390,62 @@ fn now_ms() -> u64 {
     worker::Date::now().as_millis()
 }
 
+/// Everything one owner task needs, bundled so the spawn site stays readable
+/// and so teardown can reach shared handles from outside the task.
+struct OwnerContext {
+    uplink_rx: mpsc::Receiver<Bytes>,
+    sid: String,
+    creds: Credentials,
+    env: Env,
+    shared_down: Arc<Mutex<Option<DownSender>>>,
+    ended: Arc<Cell<bool>>,
+    diag: Arc<SessionDiag>,
+}
+
+/// What the owner phase concluded, carrying exactly what teardown needs.
+enum OwnerOutcome {
+    /// A socket was won; relays ran to some ending. `winner_idx`/`failed_first`
+    /// feed last-known-good bookkeeping even when the session ended early.
+    Relays {
+        plan: DialPlan,
+        winner_idx: usize,
+        failed_first: Option<usize>,
+        preferred: Option<String>,
+        updated_at: u64,
+    },
+    /// No candidate connected.
+    DialFailed {
+        preferred: Option<String>,
+        updated_at: u64,
+    },
+    /// Refused before any dial (bad/incomplete header, unsupported shape).
+    Refused,
+}
+
+/// Push one encoded downlink chunk to whatever receiver is current.
+///
+/// `false` means the session's client is gone for good (no receiver left).
+async fn push_down(shared_down: &Mutex<Option<DownSender>>, wrapped: Bytes) -> bool {
+    let tx = shared_down.lock().ok().and_then(|g| g.clone());
+    let Some(mut tx) = tx else { return false };
+    tx.send(Ok(wrapped)).await.is_ok()
+}
+
 /// The single task that owns the outbound socket for one session.
 ///
 /// Everything that touches the socket happens here, sequentially. No request
 /// handler ever holds it, so no interleaving of requests can corrupt it and no
-/// cancelled request can lose it.
-async fn own_session(
-    mut uplink: mpsc::Receiver<Bytes>,
-    mut down: DownSender,
-    sid: String,
-    creds: Credentials,
-    env: Env,
-) {
+/// cancelled request can lose it. Whatever exit this task takes, its finalizer
+/// marks the session ended, releases the shared sender, completes the diag
+/// record, and settles last-known-good bookkeeping exactly once.
+async fn own_session(ctx: OwnerContext) {
+    let OwnerContext { uplink_rx, sid, creds, env, shared_down, ended, diag } = ctx;
+    let mut uplink = uplink_rx;
+    let sid: &str = &sid;
+    let env: &Env = &env;
+    let shared_down: &Mutex<Option<DownSender>> = &shared_down;
+
+    let outcome: OwnerOutcome = 'owner: {
     // The settings read and the arrival of the first header bytes are
     // independent waits, so they run concurrently. Loading the config before
     // listening for the header put the full KV round-trip on every session's
@@ -481,22 +541,22 @@ async fn own_session(
     let (Some(header), outbound_cfg, known_state) =
         futures_util::future::join3(header_phase, settings_load, state_load).await
     else {
-        return;
+        break 'owner OwnerOutcome::Refused;
     };
     let Ok(req) = detect::detect(&header, &creds, now_secs()) else {
-        return;
+        break 'owner OwnerOutcome::Refused;
     };
 
     // Vision splices the TLS record stream and cannot survive a CDN, which
     // terminates TLS at the edge.
     if req.flow_requested {
-        return;
+        break 'owner OwnerOutcome::Refused;
     }
-    let Some(target) = req.target else { return };
+    let Some(target) = req.target else { break 'owner OwnerOutcome::Refused };
     if !req.is_tcp {
         // UDP needs a datagram API this runtime does not have;
         // Mux needs framing this server does not implement.
-        return;
+        break 'owner OwnerOutcome::Refused;
     }
     // Before the socket, because it can fail: a client that negotiated a body
     // mode this server cannot frame is refused rather than served a corrupted
@@ -519,13 +579,19 @@ async fn own_session(
         now_ms(),
     );
     let started_ms = now_ms();
-    let Ok((sock, winner_idx)) = connect::open_with_plan_tracked(&plan).await else { return };
+    let Ok((sock, winner_idx, failed_first)) =
+        connect::open_with_plan_tracked(&plan).await
+    else {
+        break 'owner OwnerOutcome::DialFailed {
+            preferred: known_state.preferred.clone(),
+            updated_at: known_state.updated_at_ms,
+        };
+    };
 
     // Session diagnostics: counted always (a few adds per chunk), published
     // only when the deployment opts in via the SESSION_DIAG binding. The sid
     // comes from the uplink path prefix; when unavailable a short hash stands
     // in so bench keys still sort uniquely.
-    let diag = Arc::new(SessionDiag::new());
     diag.setup_ms.set(now_ms().saturating_sub(started_ms));
     let down_diag = diag.clone();
 
@@ -551,11 +617,23 @@ async fn own_session(
     // request that was already delivered to us, the client waits for a
     // response, and the session hangs with nothing logged anywhere.
     if decoder.decode(leading, &mut ready).is_err() {
-        return;
+        break 'owner OwnerOutcome::Relays {
+            plan,
+            winner_idx,
+            failed_first,
+            preferred: known_state.preferred.clone(),
+            updated_at: known_state.updated_at_ms,
+        };
     }
     for piece in ready.drain(..) {
         if write_chunked(&mut writer, &piece).await.is_err() {
-            return;
+            break 'owner OwnerOutcome::Relays {
+                plan,
+                winner_idx,
+                failed_first,
+                preferred: known_state.preferred.clone(),
+                updated_at: known_state.updated_at_ms,
+            };
         }
     }
 
@@ -620,7 +698,7 @@ async fn own_session(
 
         let pump_started_ms = now_ms();
         let Ok(prologue) = encoder.prologue() else { return };
-        if !prologue.is_empty() && down.send(Ok(prologue)).await.is_err() {
+        if !prologue.is_empty() && !push_down(shared_down, prologue).await {
             return;
         }
 
@@ -706,7 +784,7 @@ async fn own_session(
                 break;
             };
             let sent_len = wrapped.len();
-            if down.send(Ok(wrapped)).await.is_err() {
+            if !push_down(shared_down, wrapped).await {
                 down_diag.down_exit.set(Some(DownExit::ReceiverGone));
                 let _ = down_events
                     .unbounded_send(supervise::Event::DownDone(DownExit::ReceiverGone));
@@ -783,30 +861,79 @@ async fn own_session(
         }
     }
     diag.session_end.set(Some(end_reason));
-    // Last-known-good bookkeeping, once per session at teardown. Only a win
-    // by a genuine proxy candidate records a preference: a direct win would
-    // write this session's destination host into shared state where it could
-    // never help another session. Every error on the way out is ignored — a
-    // failed bookkeeping write must never turn a finished tunnel into an
-    // observable failure.
-    if let Some(winner_target) = plan.candidates.get(winner_idx) {
-        if *winner_target != plan.logical
-            && outbound_state::should_record(winner_target, &known_state, now_ms())
-        {
-            let learned = OutboundState {
-                preferred: Some(outbound_state::candidate_key(winner_target)),
-                updated_at_ms: now_ms(),
-            };
-            if let Ok(document) = serde_json::to_string(&learned) {
-                if let Ok(kv) = env.kv("SETTINGS") {
-                    if let Ok(pending) = kv.put(outbound_state::KV_KEY, document) {
-                        let _ = pending.execute().await;
-                    }
+    break 'owner OwnerOutcome::Relays {
+        plan,
+        winner_idx,
+        failed_first,
+        preferred: known_state.preferred.clone(),
+        updated_at: known_state.updated_at_ms,
+    };
+    };
+
+    // ---- teardown finalizer: the ONE path every session exits through ----
+    // Marks the object ended (later requests on this sid get 404, which
+    // clients rebuild from instantly), releases the shared sender so a
+    // half-open pump cannot outlive the decision, completes diagnostics even
+    // for sessions that never reached a socket, and settles last-known-good
+    // bookkeeping — including demoting a preference that just steered this
+    // session wrong.
+    ended.set(true);
+    if let Ok(mut slot) = shared_down.lock() {
+        *slot = None;
+    }
+    let default_end = match &outcome {
+        OwnerOutcome::Refused => SessionEnd::Refused,
+        OwnerOutcome::DialFailed { .. } => SessionEnd::DialFailed,
+        OwnerOutcome::Relays { .. } => SessionEnd::RelaysDone,
+    };
+    if diag.session_end.get().is_none() {
+        diag.session_end.set(Some(default_end));
+    }
+
+    let write_lkg = |doc: OutboundState| async move {
+        if let Ok(document) = serde_json::to_string(&doc) {
+            if let Ok(kv) = env.kv("SETTINGS") {
+                if let Ok(pending) = kv.put(outbound_state::KV_KEY, document) {
+                    let _ = pending.execute().await;
                 }
             }
         }
+    };
+    match &outcome {
+        OwnerOutcome::Relays { plan, winner_idx, failed_first, preferred, updated_at } => {
+            let winner_key = plan.candidates.get(*winner_idx).map(outbound_state::candidate_key);
+            let is_direct = plan.candidates.get(*winner_idx) == Some(&plan.logical);
+            let failed_key =
+                failed_first.and_then(|i| plan.candidates.get(i)).map(outbound_state::candidate_key);
+            match outbound_state::lkg_on_session_result(
+                preferred.as_deref(),
+                *updated_at,
+                outbound_state::DialVerdict::Won {
+                    winner: winner_key.as_deref().unwrap_or_default(),
+                    is_direct,
+                    first_failed: failed_key.as_deref(),
+                },
+                now_ms(),
+            ) {
+                outbound_state::LkgAction::Record(key) => {
+                    write_lkg(OutboundState {
+                        preferred: Some(key),
+                        updated_at_ms: now_ms(),
+                    })
+                    .await;
+                }
+                outbound_state::LkgAction::Clear => write_lkg(OutboundState::default()).await,
+                outbound_state::LkgAction::Keep => {}
+            }
+        }
+        OwnerOutcome::DialFailed { preferred, .. } => {
+            if preferred.is_some() {
+                write_lkg(OutboundState::default()).await;
+            }
+        }
+        OwnerOutcome::Refused => {}
     }
-    publish(&diag, &sid, &env).await;
+    publish(&diag, sid, env).await;
 }
 
 /// Map the terminal supervisor event onto its diagnostic reason.

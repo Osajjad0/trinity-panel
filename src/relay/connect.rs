@@ -140,22 +140,22 @@ mod imp {
     /// The error from the last candidate attempted, so the caller sees the
     /// most relevant failure rather than the first.
     pub async fn open_with_plan(plan: &DialPlan) -> Result<Socket, ConnectError> {
-        open_with_plan_tracked(plan).await.map(|(sock, _)| sock)
+        open_with_plan_tracked(plan).await.map(|(sock, _, _)| sock)
     }
 
-    /// [`open_with_plan`], plus the index of the candidate that won.
-    ///
-    /// The session layer needs to know *which* route carried the tunnel — it
-    /// is what the last-known-good bookkeeping in
-    /// [`crate::relay::outbound_state`] records. Callers that do not care use
-    /// [`open_with_plan`].
+    /// [`open_with_plan`], plus routing intel for the last-known-good
+    /// bookkeeping: the index of the candidate that won, and the index of the
+    /// FIRST candidate that failed (dial refusal or handshake timeout), if
+    /// any. The failure index is what lets teardown demote a preference that
+    /// just steered a session wrong instead of leaving it in place until its
+    /// TTL expires.
     ///
     /// # Errors
     /// The error from the last candidate attempted, so the caller sees the
     /// most relevant failure rather than the first.
     pub async fn open_with_plan_tracked(
         plan: &DialPlan,
-    ) -> Result<(Socket, usize), ConnectError> {
+    ) -> Result<(Socket, usize, Option<usize>), ConnectError> {
         if let [only] = plan.candidates.as_slice() {
             let sock = open(only)?;
             let handshook = {
@@ -168,10 +168,11 @@ mod imp {
                 .await
             };
             handshook?;
-            return Ok((sock, 0));
+            return Ok((sock, 0, None));
         }
 
         let mut last_err = ConnectError::Failed("no candidates".into());
+        let mut first_failed: Option<usize> = None;
         for (idx, candidate) in plan.candidates.iter().enumerate() {
             match open(candidate) {
                 // A candidate that dials but never completes its handshake is
@@ -191,11 +192,17 @@ mod imp {
                         .await
                     };
                     match handshook {
-                        Ok(()) => return Ok((sock, idx)),
-                        Err(e) => last_err = e,
+                        Ok(()) => return Ok((sock, idx, first_failed)),
+                        Err(e) => {
+                            first_failed = first_failed.or(Some(idx));
+                            last_err = e;
+                        }
                     }
                 }
-                Err(e) => last_err = e,
+                Err(e) => {
+                    first_failed = first_failed.or(Some(idx));
+                    last_err = e;
+                }
             }
         }
         Err(last_err)
