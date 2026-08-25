@@ -55,6 +55,7 @@ use worker::{
 };
 
 use super::diag::{SessionDiag, SessionEnd, DownExit};
+use super::deadlines;
 use super::supervise::{self, Supervisor};
 use super::wire::{self, Class};
 use super::{UploadQueue, DEFAULT_MAX_BUFFERED_POSTS, DEFAULT_MAX_POST_BYTES};
@@ -81,16 +82,6 @@ const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// part of the transition table that enforces it; the value (60s) and its
 /// semantics — reset by any successful transfer either direction — are
 /// unchanged.
-
-/// Seconds a session may sit before its protocol header completes.
-///
-/// A client sends the header with its first uplink chunk, so anything longer
-/// than a slow-link round trip means the client is gone. Without this bound
-/// the pre-socket phase has no timer at all: every abandoned half-session --
-/// and a client retry storm creates them by the hundred -- pins an object for
-/// as long as the platform tolerates, burning duration quota the whole time.
-/// Generous by design; this bounds a leak, it does not time out real traffic.
-const HEADER_TIMEOUT_SECS: u64 = 10;
 
 /// Size of one downlink read from the destination socket.
 ///
@@ -434,12 +425,12 @@ async fn own_session(
     // and a small scMaxEachPostBytes or an edge flush boundary is enough to
     // split it. Treating that as a failure would kill legitimate sessions.
     //
-    // Each chunk wait races HEADER_TIMEOUT_SECS. This phase has no other
-    // timer: without it, a client that opens posts and then vanishes -- which
-    // a retry storm produces en masse -- pins this object until the
-    // platform's idle reaping notices, burning duration quota the entire
-    // time. Real clients deliver the first chunk in well under a second; ten
-    // seconds is generous even for a bad mobile link.
+    // Each chunk wait races the deadline from [`deadlines::header_deadline`]:
+    // long for the first chunk, short for every later one, and all of it
+    // inside one total budget that chunk arrivals never extend. Without this
+    // bound, a client that opens posts and then vanishes -- which a retry
+    // storm produces en masse -- pins this object until the platform's idle
+    // reaping notices, burning duration quota the entire time.
     //
     // Borrows `uplink` rather than moving it: the receiver outlives this
     // phase and feeds the upstream relay for the rest of the session. Returns
@@ -448,18 +439,26 @@ async fn own_session(
     // is microseconds against a once-per-session cost.
     let header_phase = async {
         let mut header = BytesMut::new();
+        let phase_started_ms = now_ms();
         loop {
+            // No chunk yet means the first-chunk bound; after any arrival the
+            // shorter one applies. The elapsed budget only ever grows.
+            let wait = deadlines::header_deadline(
+                header.is_empty(),
+                core::time::Duration::from_millis(now_ms().saturating_sub(phase_started_ms)),
+            );
+            if wait.is_zero() {
+                return None; // total header budget spent without a full header
+            }
             let waited = {
                 match futures_util::future::select(
                     Box::pin(uplink.next()),
-                    Box::pin(gloo_timers::future::sleep(std::time::Duration::from_secs(
-                        HEADER_TIMEOUT_SECS,
-                    ))),
+                    Box::pin(gloo_timers::future::sleep(wait)),
                 )
                 .await
                 {
                     futures_util::future::Either::Left((chunk, _)) => chunk,
-                    futures_util::future::Either::Right(((), _)) => return None, // header never came
+                    futures_util::future::Either::Right(((), _)) => return None, // chunk never came in time
                 }
             };
             let Some(chunk) = waited else {
