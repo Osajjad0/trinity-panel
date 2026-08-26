@@ -41,9 +41,6 @@ use crate::config::model::{
 const INBOUND_TAG: &str = "socks-in";
 /// Tag of the freedom outbound that LAN and loopback traffic is routed to.
 const DIRECT_TAG: &str = "direct";
-/// Tag of the balancer that fans traffic across the nodes, when there is more
-/// than one.
-const BALANCER_TAG: &str = "balancer";
 
 /// Loopback port of the generated SOCKS inbound.
 ///
@@ -220,7 +217,7 @@ fn relabel(d: Dropped, tag: &str, label: bool) -> Dropped {
 /// Refusing is the only way to keep that from becoming an unexplainable
 /// "the wrong node is being used".
 fn check_tags(nodes: &[Node]) -> Result<(), EmitError> {
-    let reserved = [INBOUND_TAG, DIRECT_TAG, BALANCER_TAG];
+    let reserved = [INBOUND_TAG, DIRECT_TAG];
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut problems = Vec::new();
 
@@ -302,24 +299,18 @@ fn routing(nodes: &[Node]) -> Value {
     out.insert("domainStrategy".to_owned(), json!("AsIs"));
 
     if nodes.len() > 1 {
-        let selector: Vec<&str> = nodes.iter().map(tag_of).collect();
+        // Pin the inbound to the PRIMARY node. The previous behaviour fanned
+        // every connection across all protocols with a roundRobin balancer,
+        // dealing users' traffic to transports at random and making
+        // end-to-end performance the average of the weakest leg (measured
+        // live: balanced configs hung or crawled where the VLESS-pinned
+        // config ran at path ceiling). The remaining outbounds stay in the
+        // document so a user can switch manually inside their client.
         rules.push(json!({
             "type": "field",
             "inboundTag": [INBOUND_TAG],
-            "balancerTag": BALANCER_TAG
+            "outboundTag": tag_of(&nodes[0])
         }));
-        out.insert(
-            "balancers".to_owned(),
-            json!([{
-                "tag": BALANCER_TAG,
-                "selector": selector,
-                // roundRobin, not leastPing: the latency strategies need an
-                // `observatory` block probing every node continuously, which
-                // is a cost the user did not ask for and a fingerprint of its
-                // own. Cost: a slow node keeps getting its share of traffic.
-                "strategy": { "type": "roundRobin" }
-            }]),
-        );
     }
 
     out.insert("rules".to_owned(), Value::Array(rules));
@@ -941,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_node_becomes_multiple_outbounds_and_a_balancer() {
+    fn multi_node_pins_the_primary_and_keeps_the_rest_switchable() {
         // §9.8: a second member of vnext[] is a hard error, not a shorthand.
         let a = xhttp_node();
         let b = Node { tag: "second".into(), ..xhttp_node() };
@@ -950,19 +941,20 @@ mod tests {
 
         let obs = v["outbounds"].as_array().expect("outbounds is an array");
         assert_eq!(obs.len(), 3, "two nodes plus the direct outbound");
-        for ob in obs.iter().take(2) {
-            let users = ob["settings"]["vnext"][0]["users"]
-                .as_array()
-                .expect("users is an array");
-            assert_eq!(users.len(), 1, "Xray hard-errors on a second user");
-            assert_eq!(
-                ob["settings"]["vnext"].as_array().map(Vec::len),
-                Some(1),
-                "and on a second vnext member"
-            );
-        }
-        let balancers = v["routing"]["balancers"].as_array().expect("balancers");
-        assert_eq!(balancers[0]["selector"], json!(["proxy", "second"]));
+
+        // The SOCKS inbound must route to the FIRST (primary) node by tag —
+        // never a roundRobin balancer, which dealt connections to unproven
+        // transports at random.
+        assert!(v["routing"].get("balancers").is_none());
+        let pinned = v["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r.get("outboundTag").is_some() && r["inboundTag"] == json!(["socks-in"]))
+            .expect("a pinning rule exists")
+            ["outboundTag"]
+            .clone();
+        assert_eq!(pinned, json!("proxy"));
     }
 
     #[test]
@@ -980,7 +972,7 @@ mod tests {
             Err(EmitError::Refused(_))
         ));
 
-        for bad in ["direct", "socks-in", "balancer", "  "] {
+        for bad in ["direct", "socks-in", "  "] {
             let n = Node { tag: bad.into(), ..xhttp_node() };
             assert!(
                 matches!(emit_nodes(&[n], ClientTarget::V2rayN, false), Err(EmitError::Refused(_))),
