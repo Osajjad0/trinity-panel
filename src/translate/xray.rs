@@ -691,7 +691,12 @@ fn xhttp_settings(mode: XhttpMode, path: &str, host: &str) -> Value {
         // Range-syntax fields are strings even when they look numeric.
         "xPaddingBytes": "100-1000",
         "scMaxEachPostBytes": "1000000",
-        "scMinPostsIntervalMs": "30",
+        // Measured live: Xray's 30 ms pacing between uplink POSTs serialises
+        // behind connection RTT and collapses tunnelled upload to ~0.6 Mbps
+        // where the same path carries ~14 Mbps direct. 0 lets POSTs pipeline;
+        // ordering is still guaranteed by the server's sequence reordering,
+        // so this changes pacing only, never framing.
+        "scMinPostsIntervalMs": "0",
         // All three or none (§9.2). Any single field present cancels Xray's
         // whole default bundle and the rest fall back to 0 — unlimited — which
         // is strictly worse than omitting xmux altogether.
