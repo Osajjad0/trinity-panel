@@ -1,0 +1,16 @@
+{
+ "label": "direct-baseline",
+ "started": "smoke",
+ "runs": {
+  "1MB": {
+   "n": 3,
+   "median_mbps": 12.96815704122363,
+   "median_ttfb": 0.614886
+  },
+  "10MB": {
+   "n": 3,
+   "median_mbps": 88.62606799455266,
+   "median_ttfb": 0.563365
+  }
+ }
+}

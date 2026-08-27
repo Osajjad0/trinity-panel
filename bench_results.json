@@ -1,0 +1,72 @@
+{
+  "di.nscl.ir": {
+    "setup": 1.07,
+    "ttfb_1m": 1.92,
+    "ttfb_10m": 1.44,
+    "mbps_1m": 3.49,
+    "mbps_10m": 26.17,
+    "n10mb": 3,
+    "fails": 0,
+    "total": 9
+  },
+  "nima.nscl.ir": {
+    "setup": 1.23,
+    "ttfb_1m": 1.58,
+    "ttfb_10m": 1.79,
+    "mbps_1m": 4.26,
+    "mbps_10m": 20.93,
+    "n10mb": 3,
+    "fails": 0,
+    "total": 9
+  },
+  "bpb.yousef.isegaro.com": {
+    "setup": 1.22,
+    "ttfb_1m": 1.26,
+    "ttfb_10m": 2.77,
+    "mbps_1m": 4.47,
+    "mbps_10m": 18.29,
+    "n10mb": 3,
+    "fails": 0,
+    "total": 9
+  },
+  "proxyip.cmliussss.net": {
+    "setup": 1.19,
+    "ttfb_1m": 1.27,
+    "ttfb_10m": 1.85,
+    "mbps_1m": 5.62,
+    "mbps_10m": 19.52,
+    "n10mb": 3,
+    "fails": 0,
+    "total": 9
+  },
+  "tr.diam4.ggff.net": {
+    "setup": 1.49,
+    "ttfb_1m": 2.21,
+    "ttfb_10m": 2.95,
+    "mbps_1m": 2.84,
+    "mbps_10m": 7.11,
+    "n10mb": 3,
+    "fails": 0,
+    "total": 9
+  },
+  "pyip.ygkkk.dpdns.org": {
+    "setup": 1.74,
+    "ttfb_1m": null,
+    "ttfb_10m": null,
+    "mbps_1m": null,
+    "mbps_10m": null,
+    "n10mb": 0,
+    "fails": 6,
+    "total": 9
+  },
+  "proxy.farel.is-a.dev": {
+    "setup": 1.32,
+    "ttfb_1m": 1.91,
+    "ttfb_10m": 3.03,
+    "mbps_1m": 2.3,
+    "mbps_10m": 14.89,
+    "n10mb": 3,
+    "fails": 0,
+    "total": 9
+  }
+}

@@ -1,0 +1,284 @@
+{
+ "namespace": "trinity-fresh_XhttpSession",
+ "baseline": 0,
+ "A_normal": {
+  "before": 0,
+  "outcome": {
+   "code": 0,
+   "bytes": 0,
+   "seconds": 0.98,
+   "retry": {
+    "code": 0,
+    "bytes": 0,
+    "seconds": 1.21
+   }
+  },
+  "settle_s": 1.1,
+  "series": [
+   0
+  ]
+ },
+ "B_clean_disconnect": {
+  "before": 0,
+  "outcome": {
+   "code": 0,
+   "bytes": 0,
+   "seconds": 17.8
+  },
+  "settle_s": null,
+  "series": [
+   1,
+   1,
+   1,
+   1,
+   1,
+   1
+  ]
+ },
+ "C_receiver_gone": {
+  "before": 1,
+  "outcome": {
+   "curl_killed_mid_transfer": true,
+   "bytes_before_kill": 10485760
+  },
+  "settle_s": 2.4,
+  "series": [
+   1
+  ]
+ },
+ "D_client_abort": {
+  "before": 1,
+  "outcome": {
+   "aborted_by_max_time": true,
+   "code": 200,
+   "bytes": 3219968,
+   "seconds": 3.04
+  },
+  "settle_s": 2.3,
+  "series": [
+   1
+  ]
+ },
+ "E_upstream_failure": {
+  "before": 1,
+  "outcome": {
+   "code_or_fail": "000",
+   "seconds": 30.1
+  },
+  "settle_s": 2.4,
+  "series": [
+   1
+  ]
+ },
+ "F_reconnect": {
+  "before": 1,
+  "outcome": {
+   "code": 0,
+   "bytes": 0,
+   "seconds": 1.16
+  },
+  "settle_s": 4.9,
+  "series": [
+   1
+  ]
+ },
+ "final_objects": 1,
+ "objects_after_backstop_window": 2,
+ "diag": [
+  {
+   "sid": "45041e1c-b295-4621-aab0-f041ef2d1093",
+   "end": "idle_timer",
+   "down_exit": "none",
+   "err": null,
+   "read": 10367652,
+   "sent": 10302116,
+   "reads": 2724,
+   "sends": 163,
+   "max_read": 4096,
+   "max_send": 69280,
+   "max_gap_ms": 321,
+   "setup_ms": 25,
+   "pump_ms": 0
+  },
+  {
+   "sid": "116a9c4b-9656-40f9-b398-4c84ac25a6ac",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 7,
+   "sent": 7,
+   "reads": 1,
+   "sends": 1,
+   "max_read": 7,
+   "max_send": 7,
+   "max_gap_ms": 43,
+   "setup_ms": 179,
+   "pump_ms": 43
+  },
+  {
+   "sid": "5201db8d-7d2f-4b0d-b32f-7baf754972cf",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 10511037,
+   "sent": 10511037,
+   "reads": 2794,
+   "sends": 163,
+   "max_read": 4096,
+   "max_send": 68834,
+   "max_gap_ms": 379,
+   "setup_ms": 19,
+   "pump_ms": 9629
+  },
+  {
+   "sid": "a1564d4b-cad5-434c-a284-47c698d00a77",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 2756,
+   "sent": 2756,
+   "reads": 2,
+   "sends": 2,
+   "max_read": 1388,
+   "max_send": 1388,
+   "max_gap_ms": 14813,
+   "setup_ms": 16,
+   "pump_ms": 15042
+  },
+  {
+   "sid": "ea989685-1026-4b7a-9b52-c0e9256c7785",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 7,
+   "sent": 7,
+   "reads": 1,
+   "sends": 1,
+   "max_read": 7,
+   "max_send": 7,
+   "max_gap_ms": 41,
+   "setup_ms": 38,
+   "pump_ms": 41
+  },
+  {
+   "sid": "d91a8456-bed7-44f8-8671-42de1d2d43a6",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 7,
+   "sent": 7,
+   "reads": 1,
+   "sends": 1,
+   "max_read": 7,
+   "max_send": 7,
+   "max_gap_ms": 26,
+   "setup_ms": 114,
+   "pump_ms": 26
+  },
+  {
+   "sid": "8df4c1a8-b024-4986-a6ba-59cc5c501b9e",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 7,
+   "sent": 7,
+   "reads": 1,
+   "sends": 1,
+   "max_read": 7,
+   "max_send": 7,
+   "max_gap_ms": 38,
+   "setup_ms": 26,
+   "pump_ms": 38
+  },
+  {
+   "sid": "3883c22d-ecb7-435d-80ce-85327ebe898b",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 26268867,
+   "sent": 26268867,
+   "reads": 6883,
+   "sends": 408,
+   "max_read": 4096,
+   "max_send": 69512,
+   "max_gap_ms": 184,
+   "setup_ms": 7,
+   "pump_ms": 1533
+  },
+  {
+   "sid": "3ba0322d-3a46-43ab-a390-567ffbd32a28",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 26268615,
+   "sent": 26268615,
+   "reads": 6640,
+   "sends": 405,
+   "max_read": 4096,
+   "max_send": 68746,
+   "max_gap_ms": 206,
+   "setup_ms": 54,
+   "pump_ms": 1553
+  },
+  {
+   "sid": "77037ef2-3414-4187-a4db-81bb50fec46c",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 1056825,
+   "sent": 1056825,
+   "reads": 290,
+   "sends": 21,
+   "max_read": 4096,
+   "max_send": 65536,
+   "max_gap_ms": 196,
+   "setup_ms": 108,
+   "pump_ms": 605
+  },
+  {
+   "sid": "ecc11181-8580-4462-8605-6650ab04f313",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 7,
+   "sent": 7,
+   "reads": 1,
+   "sends": 1,
+   "max_read": 7,
+   "max_send": 7,
+   "max_gap_ms": 16,
+   "setup_ms": 199,
+   "pump_ms": 16
+  },
+  {
+   "sid": "a2f181a5-8cb5-4496-806f-1f98c7482405",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 7,
+   "sent": 7,
+   "reads": 1,
+   "sends": 1,
+   "max_read": 7,
+   "max_send": 7,
+   "max_gap_ms": 13,
+   "setup_ms": 133,
+   "pump_ms": 13
+  },
+  {
+   "sid": "0d72e007-f8eb-4bf2-a7e4-594391b231f8",
+   "end": "relays_done",
+   "down_exit": "eof",
+   "err": null,
+   "read": 1056773,
+   "sent": 1056773,
+   "reads": 303,
+   "sends": 21,
+   "max_read": 4096,
+   "max_send": 65536,
+   "max_gap_ms": 214,
+   "setup_ms": 27,
+   "pump_ms": 1092
+  }
+ ]
+}

@@ -1,0 +1,75 @@
+{
+ "phase5": {
+  "1": {
+   "n": 1,
+   "wall_s": 7.89,
+   "client_ok": 1,
+   "terminal_blobs": 1,
+   "pending_forever": [],
+   "end_reasons": {
+    "relays_done": 1
+   }
+  },
+  "5": {
+   "n": 5,
+   "wall_s": 8.08,
+   "client_ok": 5,
+   "terminal_blobs": 5,
+   "pending_forever": [],
+   "end_reasons": {
+    "relays_done": 5
+   }
+  },
+  "10": {
+   "n": 10,
+   "wall_s": 8.16,
+   "client_ok": 10,
+   "terminal_blobs": 10,
+   "pending_forever": [],
+   "end_reasons": {
+    "relays_done": 10
+   }
+  }
+ },
+ "dl_1MB_x5": {
+  "reps": 5,
+  "ok": 3,
+  "median_mbps": 1.91,
+  "ttfb_median": 3.87,
+  "truncated_or_failed": 2
+ },
+ "dl_10MB_x5": {
+  "reps": 5,
+  "ok": 5,
+  "median_mbps": 34.43,
+  "ttfb_median": 1.264,
+  "truncated_or_failed": 0
+ },
+ "dl_25MB_x3": {
+  "reps": 3,
+  "ok": 3,
+  "median_mbps": 45.1,
+  "ttfb_median": 1.131,
+  "truncated_or_failed": 0
+ },
+ "up64KB": {
+  "code": 200,
+  "seconds": 2.388865,
+  "mbps": 0.22
+ },
+ "up256KB": {
+  "code": 200,
+  "seconds": 7.152043,
+  "mbps": 0.29
+ },
+ "up1MB": {
+  "code": 200,
+  "seconds": 53.611641,
+  "mbps": 0.16
+ },
+ "up5MB": {
+  "code": 100,
+  "seconds": 90.912769,
+  "mbps": null
+ }
+}

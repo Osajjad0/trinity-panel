@@ -1,0 +1,177 @@
+{
+ "direct_100KB": {
+  "ok": true,
+  "ttfb_ms": 2.51,
+  "mb": 0.098,
+  "elapsed_s": 0.0026,
+  "mbps": 303.37
+ },
+ "relay_100KB": {
+  "ok": true,
+  "connect_ms": 6.79,
+  "ttfb_ms": 3.16,
+  "mb": 0.098,
+  "elapsed_s": 0.007,
+  "mbps": 108.58,
+  "up_error": null
+ },
+ "direct_1MB": {
+  "ok": true,
+  "ttfb_ms": 3.71,
+  "mb": 1.0,
+  "elapsed_s": 0.0045,
+  "mbps": 1769.25
+ },
+ "relay_1MB": {
+  "ok": true,
+  "connect_ms": 4.59,
+  "ttfb_ms": 3.55,
+  "mb": 1.0,
+  "elapsed_s": 0.062,
+  "mbps": 130.09,
+  "up_error": null
+ },
+ "direct_5MB": {
+  "ok": true,
+  "ttfb_ms": 2.38,
+  "mb": 5.0,
+  "elapsed_s": 0.0139,
+  "mbps": 2873.27
+ },
+ "relay_5MB": {
+  "ok": true,
+  "connect_ms": 6.29,
+  "ttfb_ms": 4.08,
+  "mb": 5.001,
+  "elapsed_s": 0.186,
+  "mbps": 214.54,
+  "up_error": null
+ },
+ "direct_10MB": {
+  "ok": true,
+  "ttfb_ms": 2.87,
+  "mb": 10.0,
+  "elapsed_s": 0.0137,
+  "mbps": 5856.52
+ },
+ "relay_10MB": {
+  "ok": true,
+  "connect_ms": 6.61,
+  "ttfb_ms": 2.51,
+  "mb": 10.002,
+  "elapsed_s": 0.382,
+  "mbps": 209.21,
+  "up_error": null
+ },
+ "sustained": {
+  "ok": true,
+  "duration_s": 60.0,
+  "total_mb": 1460.3,
+  "avg_mbps": 194.7,
+  "per_5s_samples_mbps": [
+   205.3,
+   208.1,
+   200.7,
+   195.1,
+   204.9,
+   208.7,
+   200.3,
+   204.4,
+   192.7,
+   203.4,
+   215.9
+  ],
+  "ttfb_ms": 4.31
+ },
+ "x1": {
+  "success": 1,
+  "failed": 0,
+  "errors": {},
+  "wall_s": 0.05,
+  "agg_mbps": 85.7,
+  "per_session_avg_mbps": 173.6,
+  "avg_connect_ms": 15.3,
+  "sessions_before": 0,
+  "sessions_after": 0,
+  "mem_before_mb": 24.7,
+  "mem_after_mb": 25.4
+ },
+ "x5": {
+  "success": 5,
+  "failed": 0,
+  "errors": {},
+  "wall_s": 0.11,
+  "agg_mbps": 188.4,
+  "per_session_avg_mbps": 82.0,
+  "avg_connect_ms": 12.1,
+  "sessions_before": 0,
+  "sessions_after": 0,
+  "mem_before_mb": 25.4,
+  "mem_after_mb": 25.6
+ },
+ "x10": {
+  "success": 10,
+  "failed": 0,
+  "errors": {},
+  "wall_s": 0.59,
+  "agg_mbps": 67.9,
+  "per_session_avg_mbps": 34.7,
+  "avg_connect_ms": 23.8,
+  "sessions_before": 0,
+  "sessions_after": 0,
+  "mem_before_mb": 25.6,
+  "mem_after_mb": 25.9
+ },
+ "x25": {
+  "success": 25,
+  "failed": 0,
+  "errors": {},
+  "wall_s": 1.15,
+  "agg_mbps": 86.8,
+  "per_session_avg_mbps": 41.3,
+  "avg_connect_ms": 151.7,
+  "sessions_before": 0,
+  "sessions_after": 0,
+  "mem_before_mb": 25.9,
+  "mem_after_mb": 26.2
+ },
+ "x50": {
+  "success": 50,
+  "failed": 0,
+  "errors": {},
+  "wall_s": 1.38,
+  "agg_mbps": 144.5,
+  "per_session_avg_mbps": 20.1,
+  "avg_connect_ms": 237.5,
+  "sessions_before": 0,
+  "sessions_after": 0,
+  "mem_before_mb": 26.2,
+  "mem_after_mb": 26.2
+ },
+ "reconnect": {
+  "first_session_ok": true,
+  "reconnect_same_sid_ok": true,
+  "reconnect_setup_ms": 5.0
+ },
+ "idle_cleanup": {
+  "idle_timeout_s": 45,
+  "sessions_before": 1,
+  "sessions_after_wait": 0
+ },
+ "failure_cleanup": {
+  "sessions_after_aborts": 2,
+  "sessions_after_explicit_close": 0,
+  "relay_alive": true
+ },
+ "resources": {
+  "baseline_rss_mb": 24.7,
+  "peak_rss_seen_mb": 26.3,
+  "final_rss_mb": 26.3,
+  "final_sessions": 0
+ },
+ "security": {
+  "no_auth_status": 401,
+  "wrong_secret_status": 401,
+  "unknown_session_status": 404
+ }
+}

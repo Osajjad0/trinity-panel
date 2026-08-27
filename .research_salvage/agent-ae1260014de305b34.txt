@@ -1,0 +1,32 @@
+
+
+=====TEXT BLOCKS=====
+
+----- block 0 -----
+<think>
+The user wants me to do read-only web research on external-relay architectures for Cloudflare Workers fronting VLESS+XHTTP packet-up while a non-DO component holds the TCP session. Let me break down the research tasks:
+
+1. PdYrust/cf-xray-proxy and similar "Worker bridges to a real backend Xray" projects — exact architecture, Worker-to-backend protocol, client-facing protocol unchanged?
+2. Could the Worker-to-backend hop be plain per-request HTTP POSTs reassembled by backend? Prior art for tiny reassembling relay (Go/Rust ~200 lines)? Ordering/buffering semantics needed?
+3. Backend hosting options: Oracle Cloud free tier, Fly.io, Railway, home PC + cloudflared — cost, latency, long TCP sessions, reliability.
+4. Security: hiding backend IP behind CF, rejecting non-CF traffic, credential handling.
+5. Does architecture preserve VLESS, XHTTP packet-up client-facing, Proxy IP feature, existing client configs?
+
+Let me start with web searches. I should do multiple independent searches in parallel.
+
+Let me plan searches:
+- "PdYrust/cf-xray-proxy" GitHub
+- "cf-xray-proxy" worker xray backend
+- "xhttp bridge worker backend"
+- "vless worker relay backend"
+- "vless over websocket worker backend xray" (the classic pattern)
+- Cloudflare Workers fetch streaming POST backend
+- Oracle Cloud free tier VPS latency
+- Fly.io pricing2026
+- Railway pricing- cloudflared tunnel home server latency proxy
+- Cloudflare authenticated origin pulls / IP allowlist
+- XHTTP packet-up documentationLet me also check the local repo context briefly? The question mentions "our Durable Object plays today" — the repo is a panel for Cloudflare Workers with XHTTP-first multi-protocol. Maybe I can peek at src/transport/xhttp/durable.rs to understand current architecture for context. That's local and cheap. But the task is web research; still, a quick grep helps ground claims about what "our DO does today". The deliverable is structured output though. Let me do a quick look at the repo to understand context, then do web research.
+
+Actually, time/token budget: 15M tokens available. Let me be efficient but thorough. Start with parallel web searches.
+
+Let me begin.

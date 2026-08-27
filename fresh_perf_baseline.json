@@ -1,0 +1,32 @@
+{
+ "dl_1MB_x3": {
+  "ok": 1,
+  "truncated_or_failed": 2,
+  "ttfb_median_s": 1.332,
+  "median_mbps": 4.57
+ },
+ "dl_10MB_x3": {
+  "ok": 3,
+  "truncated_or_failed": 0,
+  "ttfb_median_s": 1.367,
+  "median_mbps": 31.12
+ },
+ "dl_25MB_x3": {
+  "ok": 2,
+  "truncated_or_failed": 1,
+  "ttfb_median_s": 2.464,
+  "median_mbps": 17.95
+ },
+ "up_1MB_x3": {
+  "ok": 0,
+  "failed": 3,
+  "total_median_s": null,
+  "median_mbps": null
+ },
+ "up_5MB_x3": {
+  "ok": 1,
+  "failed": 2,
+  "total_median_s": 35.8,
+  "median_mbps": 1.17
+ }
+}

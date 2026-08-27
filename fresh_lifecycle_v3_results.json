@@ -1,0 +1,28 @@
+{
+ "clean": {
+  "expect": "relays_done",
+  "got": null,
+  "latency_s": null,
+  "ok": false,
+  "blob": null
+ },
+ "recv_gone": {
+  "expect": "receiver_gone",
+  "got": null,
+  "latency_s": null,
+  "ok": false,
+  "blob": null
+ },
+ "idle_open": {
+  "expect": "idle_timer",
+  "got": null,
+  "latency_s": null,
+  "ok": false,
+  "blob": null
+ },
+ "dial_fail": {
+  "expect": "no-diag-blob",
+  "got": "no-diag-blob",
+  "ok": true
+ }
+}

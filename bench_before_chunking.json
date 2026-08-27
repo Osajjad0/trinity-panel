@@ -1,0 +1,33 @@
+{
+ "label": "before_chunking",
+ "started": "2026-08-23T10:17:52",
+ "worker": "trinity-bench-ab.koxis91079.workers.dev",
+ "setup_s_median": 1.061,
+ "1MB": {
+  "n": 5,
+  "fail": 0,
+  "median_mbps": 3.9,
+  "max_mbps": 4.49,
+  "median_ttfb": 1.558,
+  "short": 0
+ },
+ "10MB": {
+  "n": 5,
+  "fail": 1,
+  "median_mbps": 30.2,
+  "max_mbps": 36.5,
+  "median_ttfb": 1.351,
+  "short": 1
+ },
+ "sustained60s": {
+  "bytes": 104857600,
+  "seconds": 10.0,
+  "avg_mbps": 83.8
+ },
+ "reconnect_s_median": 0.822,
+ "upload5MB": {
+  "ok": 0,
+  "total": 3,
+  "median_mbps": null
+ }
+}

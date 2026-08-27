@@ -15,6 +15,26 @@ store.json
 # ---- production artifacts (never commit; contain live settings/credentials) ----
 kv_prod_backup_*.json
 cleanacct_settings_backup.json
+# production xray configs (embed XHTTP path + UUID)
+xray*.json
+xray-*.json
+
+# ---- operational scripts with hardcoded deployment credentials (local only) ----
+bench_proxy.py
+bench_proxy2.py
+bench_rigorous.py
+bench_beforeafter.py
+bench_roadmap_baseline.py
+fresh_*.py
+uplink_*.py
+uplink_*.json
+interleave_probe.py
+invalidate_lkg_and_probe.py
+set_diag.py
+
+# ---- relay-poc runtime artifacts ----
+relay-poc/*.log
+relay-poc/__pycache__/
 
 # ---- build output ----
 dist/

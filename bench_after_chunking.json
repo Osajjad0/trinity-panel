@@ -1,0 +1,33 @@
+{
+ "label": "after_chunking",
+ "started": "2026-08-23T09:38:36",
+ "worker": "trinity-cleanacct.koxis91079.workers.dev",
+ "setup_s_median": null,
+ "1MB": {
+  "n": 5,
+  "fail": 0,
+  "median_mbps": 3.66,
+  "max_mbps": 6.45,
+  "median_ttfb": 1.673,
+  "short": 0
+ },
+ "10MB": {
+  "n": 5,
+  "fail": 0,
+  "median_mbps": 19.01,
+  "max_mbps": 26.26,
+  "median_ttfb": 1.723,
+  "short": 0
+ },
+ "sustained60s": {
+  "bytes": 104857600,
+  "seconds": 38.6,
+  "avg_mbps": 21.75
+ },
+ "reconnect_s_median": null,
+ "upload5MB": {
+  "ok": 1,
+  "total": 2,
+  "median_mbps": 1.12
+ }
+}

@@ -1,0 +1,134 @@
+{"verdict": "Duration accrual model: Wall-clock, not CPU. A Durable Object is billed for wall-clock time while it is (a) actively executing JavaScript or (b) merely resident in memory but NOT eligible for hibernation — idle-but-hibernation-eligible objects are not billed. Memory is billed at a flat 128 MB per active object regardless of actual usage, so one pinned object costs 0.125 GB-s/s (~10,800 GB-s/day if pinned 24/7). An open outbound TCP socket from connect() DOES accrue duration: per the live pricing and TCP-sockets docs (both fetched Aug 2026), 'an active outbound connection (via connect() or an outbound WebSocket) keeps a Durable Object in memory' and incurs duration 'for up to 15 minutes per connection,' even with zero incoming requests; after 15 minutes the socket is NOT killed — it 'stops keeping the Durable Object alive (the socket itself continues operating)' and standard eviction resumes, ending the duration charges. Free-tier ceiling in practical terms: 13,000 GB-s/day (with 100,000 requests/day, SQLite-only), resetting at a fixed 00:00 UTC — one object pinned 24/7 by a connect() socket consumes ~10,800 of those 13,000 GB-s, leaving room for only ~4.9 extra object-hours/day, so a single long-lived TCP tunnel plus any real traffic breaches the cap most days and all further operations error until 00:00 UTC. Cheapest paid escape: Workers Paid at $5/month, which converts the hard cap into 400,000 GB-s/month included (≈33x the free daily allowance ≈ 44 days of one always-pinned object) with $12.50 per additional million GB-s and $0.15 per million requests beyond the first million; for genuinely long-lived TCP endpoints, Cloudflare Containers (GA since 2025-06-26, also requires Workers Paid) sidestep DO duration entirely — billed per 10 ms of runtime (e.g. basic: 0.25 vCPU/1 GiB ≈ $6.5/mo if run 24/7 before included allowances), reachable from a Worker via Client → Worker → Durable Object → container.fetch() to its default port, with ~1–3 s cold starts and a 10-minute default sleepAfter.", "findings": [{"claim": "Free plan includes 13,000 GB-s of Durable Objects duration per day and 100,000 requests/day; exceeding limits makes operations fail with errors and daily limits reset at 00:00 UTC.", "evidence": "Direct fetch of the Durable Objects pricing page lists Free plan Duration as \"13,000 GB-s / day\" and Requests as \"100,000 / day\", states only SQLite-backed classes exist on Free, that exceeding a limit causes operations of that type to fail with an error, and that \"daily limits reset at 00:00 UTC\".", "url": "https://developers.cloudflare.com/durable-objects/platform/pricing/", "date": "2026-08-22 (page fetched live)", "confidence": "high"}, {"claim": "Duration accrues on wall-clock time whenever the object is executing OR is resident in memory without being eligible for hibernation; it is NOT limited to request-execution time, but idle hibernation-eligible time is not billed.", "evidence": "Pricing page: objects are billed \"for compute duration (wall-clock time) while the Durable Object is actively running\" or idle in memory but unable to hibernate; \"Durable Objects that are idle and eligible for hibernation are not billed for duration.\" Active = executing JS or idle without meeting hibernation conditions.", "url": "https://developers.cloudflare.com/durable-objects/platform/pricing/", "date": "2026-08-22 (page fetched live)", "confidence": "high"}, {"claim": "Each active Durable Object is billed for a flat 128 MB regardless of actual memory used; multiple co-located instances are each billed a full 128 MB.", "evidence": "Pricing page footnote: \"Duration billing charges for the 128 MB of memory your Durable Object is allocated, regardless of actual usage.\" Billable usage above included allowance is rounded up to the next billable unit.", "url": "https://developers.cloudflare.com/durable-objects/platform/pricing/", "date": "2026-08-22 (page fetched live)", "confidence": "high"}, {"claim": "An open outbound TCP socket from connect() accrues duration: it keeps the object in memory and bills duration for up to 15 minutes per connection, even with no incoming requests.", "evidence": "TCP Sockets docs (Considerations): a socket created inside a Durable Object \"keeps the Durable Object in memory and causes it to incur duration charges for up to 15 minutes per connection.\" Pricing page repeats this for \"connect() or an outbound WebSocket\", \"even with no incoming requests.\"", "url": "https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/", "date": "2026-08-22 (page fetched live)", "confidence": "high"}, {"claim": "After the 15-minute keep-alive window, the outbound socket is NOT killed: it stops pinning the object (and stops accruing keep-alive duration), and standard eviction rules resume while the socket continues operating.", "evidence": "TCP Sockets docs: \"After 15 minutes, the socket stops keeping the Durable Object alive (the socket itself continues operating)\" and \"the standard eviction rules resume.\" Practical caveat not addressed by docs: what happens to the 'continuing' socket if the object/isolate is actually evicted is unspecified — treat long-lived tunnels past 15 min as best-effort.", "url": "https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/", "date": "2026-08-22 (page fetched live)", "confidence": "medium"}, {"claim": "Workers Paid includes 400,000 GB-s of DO duration per month, then $12.50 per million GB-s; requests are 1 million/month included then $0.15 per million (requests include RPC sessions, WebSocket messages counted 20:1 inbound, alarm invocations). The 128 MB-per-active-object basis still applies.", "evidence": "Pricing page paid-plan table: Duration \"400,000 GB-s / month, + $12.50/million GB-s\"; Requests \"1 million / month, + $0.15/million\"; incoming WebSocket messages metered at \"a 20:1 ratio\"; footnote fixes billing at allocated 128 MB per object. (A secondary search snippet claimed $12.85/million GB-s; the primary doc says $12.50.) Minimum $5/mo Workers Paid commitment appears in the pricing examples.", "url": "https://developers.cloudflare.com/durable-objects/platform/pricing/", "date": "2026-08-22 (page fetched live)", "confidence": "high"}, {"claim": "WebSocket hibernation accrues zero duration while idle: 'Billable Duration (GB-s) charges do not accrue during hibernation', and setWebSocketAutoResponse replies are also unbilled.", "evidence": "WebSockets best-practices page: hibernating clients stay connected at Cloudflare's edge while in-memory state resets; auto-response messages \"will not incur additional wall-clock time, and so they will not be charged\" (pricing page). Incoming messages still count as metered requests at 20:1.", "url": "https://developers.cloudflare.com/durable-objects/best-practices/websockets/", "date": "2026-08-22 (page fetched live)", "confidence": "high"}, {"claim": "An OUTBOUND socket (TCP via connect(), or an outbound WebSocket) cannot coexist with free hibernation: it prevents eviction/hibernation and bills duration for up to 15 minutes per connection.", "evidence": "WebSockets page: \"Outgoing WebSockets do not hibernate\" and an active outbound WebSocket \"keeps the Durable Object alive\" / \"prevents eviction for up to 15 minutes per connection\"; pricing page applies the same 15-minutes-per-connection rule to connect(). Events, alarms, setTimeout/setInterval also block hibernation.", "url": "https://developers.cloudflare.com/durable-objects/best-practices/websockets/", "date": "2026-08-22 (page fetched live)", "confidence": "high"}, {"claim": "Cloudflare Containers went GA in 2025 (announced June 2025) and requires the Workers Paid plan; billing is per 10 ms of runtime with included monthly allowances on Workers Paid: 25 GiB-hours memory ($0.0000025/GiB-s after), 375 vCPU-minutes ($0.000020/vCPU-s after), 200 GB-hours disk ($0.00000007/GB-s after).", "evidence": "Containers pricing page (last updated Apr 21, 2026): \"Containers are billed for every 10ms that they are actively running\"; Free tier shows N/A; instance types lite (1/16 vCPU, 256 MiB) through standard-4 (4 vCPU, 12 GiB, 20 GB); egress $0.025/GB NA+EU with 1 TB included. GA date corroborated only via web-search snippets pointing at blog.cloudflare.com June 26, 2025 — my attempted blog fetches 404'd, so treat the exact GA day as medium confidence.", "url": "https://developers.cloudflare.com/containers/pricing/", "date": "2026-04-21 (page last-updated stamp; fetched 2026-08-22)", "confidence": "high"}, {"claim": "Container network path and lifecycle: Worker reaches the container only via its backing Durable Object (Client → Worker → DO → containerInstance.fetch() to defaultPort); end users cannot open non-HTTP TCP/UDP directly to a container; default sleepAfter is 10 minutes; cold starts are typically 1–3 seconds depending on image size.", "evidence": "Architecture page: \"end-users cannot make non-HTTP TCP or UDP requests to a Container instance\"; \"The Container class sets sleepAfter to 10 minutes by default\"; \"Container cold starts can often be in the 1-3 second range\"; DO and container are \"not guaranteed to run in the same location\"; shutdown = SIGTERM, up to 15 minutes grace, then SIGKILL; all disk ephemeral. A container process itself can hold long-lived outbound TCP sessions (egress configurable), which is the workaround for DOs' 15-minute pinning limit.", "url": "https://developers.cloudflare.com/containers/platform-details/architecture/", "date": "2026-08-22 (page fetched live)", "confidence": "high"}, {"claim": "Container scale limits: max custom instance 4 vCPU / 12 GiB / 20 GB disk; account-level concurrent caps of 6 TiB memory, 1,500 vCPU, 30 TB disk; 50 GB total image storage per account.", "evidence": "Containers limits page tables (predefined types, custom-instance constraints, account-level concurrent resource caps). Per-application max_instances is config-set rather than listed as a platform number on this page.", "url": "https://developers.cloudflare.com/containers/platform-details/limits/", "date": "2026-08-22 (page fetched live)", "confidence": "high"}, {"claim": "DO wall-time context: Durable Objects (RPC/HTTP) have unlimited wall time 'while a request, RPC call, response stream, WebSocket, or pending I/O is in flight'; alarm handlers cap at 15 minutes; 6 simultaneous outgoing connections per request; 30 s CPU per request (configurable to 5 min); soft limit of 1,000 requests/sec/object.", "evidence": "Workers platform limits page quotes DOs remaining active while pending I/O is in flight; DO limits page lists CPU, connection, and throughput numbers. These wall-time rules are why a held-open request (rather than a socket) also accrues duration.", "url": "https://developers.cloudflare.com/durable-objects/platform/limits/", "date": "2026-08-22 (pages fetched live)", "confidence": "high"}, {"claim": "COULD NOT CONFIRM: a specific dated ~June 2026 announcement (blog post or changelog entry) introducing the connect()-keeps-object-alive behavior. The semantics themselves are firmly in the live docs, but no dedicated changelog/blog entry was found.", "evidence": "The Durable Objects release-notes page (fetched 2026-08-22) contains nothing about outbound sockets/connect()/duration between 2025-02 and 2026-06-30 (nearest entries: 2026-06-30 declarative `exports`, 2026-01-07 SQLite storage billing enablement); the global changelog page served only Aug 14–22, 2026 entries. WebSearch returned only unverifiable synthesized text on this point. Flagging as an older-source/documentation-only confirmation.", "url": "https://developers.cloudflare.com/durable-objects/changelog/", "date": "2026-08-22 (page fetched live)", "confidence": "low"}, {"claim": "COULD NOT CONFIRM: community reports of the free-tier duration block persisting past the documented 00:00 UTC reset.", "evidence": "community.cloudflare.com search returns HTTP 403 to automated fetching, and WebSearch produced thread URLs/titles that could not be verified (likely hallucinated). The only authoritative statement is the pricing page's \"daily limits reset at 00:00 UTC\"; anecdotal persistence-past-reset claims remain unsubstantiated here.", "url": "https://community.cloudflare.com/", "date": "2026-08-22", "confidence": "low"}], "caveats": "Methodology warning: the WebSearch tool in this session repeatedly returned synthesized summaries with plausible-looking but unverifiable URLs (several 404'd when fetched directly), so every load-bearing number above comes from direct WebFetch of developers.cloudflare.com pages on 2026-08-22, not from search snippets. Three items failed verification entirely and are flagged low-confidence: (1) no dated announcement for the connect() 15-minute keep-alive rule — it is documented in live pricing + TCP-sockets pages but absent from the DO release notes I could see; (2) the Containers GA exact date (June 26, 2025) rests on search snippets because blog.cloudflare.com URL guesses 404'd; (3) community reports about the free-tier block outlasting 00:00 UTC could not be checked (forum 403s). Two numeric conflicts noted: one search snippet claimed $12.85/million GB-s vs the primary doc's $12.50 (doc wins); the DO limits page is internally inconsistent on free-tier storage (5 GB account total in the table vs 1 GB per-object in the FAQ). Also unspecified anywhere: what happens to a connect() socket that 'continues operating' if its object is actually evicted after minute 15 — do not build anything durability-critical past that boundary."}
+
+=====TEXT BLOCKS=====
+
+----- block 0 -----
+<think>
+The user wants me to research Cloudflare Durable Objects limits and billing semantics as of August 2026. This is a read-only web research task. Let me start with searches on the key topics:
+
+1. Free plan duration limit (13,000 GB-s) — how duration accrues
+2. ~2026-06 announcement about active connect() sockets keeping DO alive
+3. Free daily quota reset timing
+4. Workers Paid DO pricing
+5. Cloudflare Containers GA pricing6. WebSocket Hibernation
+
+Let me do parallel searches first.
+
+----- block 1 -----
+<think>
+The second search result was garbage (the search tool hallucinated no tools). Let me fetch the actual Cloudflare docs pages directly. Key pages:
+
+1. https://developers.cloudflare.com/durable-objects/platform/pricing/
+2. https://developers.cloudflare.com/durable-objects/platform/limits/
+3. https://developers.cloudflare.com/durable-objects/best-practices/access-durable-objects-storage/ (no)
+4. Sockets: https://developers.cloudflare.com/durable-objects/best-practices/sockets/
+5. Containers: https://developers.cloudflare.com/containers/pricing/
+6. WebSocket hibernation: https://developers.cloudflare.com/durable-objects/best-practices/websockets/
+
+Also the ~2026-06 announcement about connect() sockets keeping DO alive — search blog.cloudflare.com and changelog. Let me do parallel fetches.
+
+----- block 2 -----
+<think>
+Good progress. Key facts so far:
+- Free: 100k req/day, 13,000 GB-s/day, reset at 00:00 UTC (per pricing page).
+- Paid: 400,000 GB-s/month included, $12.50/million GB-s overage (note: earlier search said $12.85 — need to verify; docs fetch says $12.50).
+- 128 MB billed regardless of usage.
+- Outbound connect() keeps DO in memory, incurs duration "up to 15 minutes per connection", even with no incoming requests. This matches the ~2026-06 announcement question.
+- Hibernation: no duration when idle-eligible; auto-response free.
+
+Now I need:
+1. The changelog/blog announcement about connect() sockets keeping DO alive (~2026-06). Search blog.cloudflare.com and developers.cloudflare.com changelogs.
+2. What happens after 15 minutes — is socket killed?
+3. Free quota reset — fixed 00:00 UTC confirmed by pricing page fetch. Community reports of block persisting past reset — search community.cloudflare.com.
+4. Containers pricing/GA.
+5. WebSocket hibernation + outbound TCP coexistence.
+
+Let me search for the announcement and containers pricing in parallel.
+
+----- block 3 -----
+<think>
+The WebSearch tool seems to be returning garbage sometimes (hallucinated "no tools" responses). Let me try more searches with different queries, and also fetch the DO changelog and the sockets docs page directly.
+
+Key remaining items:
+1. The ~2026-06 announcement about connect() keeping DO alive — need a URL. Check the Cloudflare changelog for Durable Objects, blog posts. The pricing doc itself mentions it; there may be a changelog entry. Let me fetch https://developers.cloudflare.com/durable-objects/changelog/ and the sockets best-practices page.
+2. What happens after 15 minutes — socket killed? Check sockets page.
+3. Community reports of free block persisting past reset.
+4. Containers: cold start, sleep limits, TCP support — fetch containers overview/limits pages.
+
+Parallel fetches now.
+
+----- block 4 -----
+```html<think>
+404. The sockets page might be at a different path. Let me search for it and also fetch the changelog. Possible paths:
+- https://developers.cloudflare.com/durable-objects/best-practices/access-durable-objects-storage/ (no)
+- https://developers.cloudflare.com/durable-objects/api/tcp-sockets/ (maybe)
+- The runtime API: https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/
+
+Let me do parallel: fetch DO changelog, fetch workers TCP sockets API page, and search for the announcement blog post.
+
+----- block 5 -----
+<think>
+Excellent — the TCP sockets page gives the exact answer to question 2: "After 15 minutes, the socket stops keeping the Durable Object alive (the socket itself continues operating) and the standard eviction rules resume." So socket is NOT killed after 15 min; it just stops keeping the object alive and stops incurring duration.
+
+Wait — but there's a subtlety: if the DO is evicted from memory while a socket continues operating... how does that work? Actually per docs, the socket "continues operating" — but if the object is evicted, presumably the socket gets torn down with the isolate? The doc says "the socket itself continues operating" — I should report exactly what docs say, and flag ambiguity. Actually let me check the changelog for when this was announced. The question says "~2026-06 announcement". Let me search the Workers changelog / blog. Also need:
+
+1. Community reports of free block persisting past 00:00 UTC reset.
+2. Containers: cold start latency, sleep/instance limits, TCP support (containers overview page).
+3. WebSocket hibernation + outbound TCP coexistence — hibernation docs say an object can't hibernate while... actually hibernation requires no open sockets? Let me check the websockets page.
+
+Let me do parallel fetches: containers overview (cold start), containers limits, DO websockets best-practices page. And search community forum for duration block reset.The
+</think>
+```html TCP sockets page answered question 2 directly. Now:
+- Question1 nuance: does connect() accrue duration on FREE plan too (13k GB-s/day)? The pricing doc says active outbound connection incurs duration up to 15 min/connection. That's confirmed.
+- Question 3: reset at 00:00 UTC confirmed by pricing page; need community reports of block persisting.
+- Question 5: containers cold-start, sleep/instance limits, TCP path from Worker → container.
+- Question 6: hibernation + outbound socket coexistence.
+
+Parallel fetches: containers overview + limits, DO websockets page. Plus community search.
+
+
+----- block 6 -----
+<think>
+Good. Now remaining gaps:
+
+1. The ~2026-06 announcement (changelog/blog) about active connect() sockets keeping DO alive. The DO changelog didn't mention it. Maybe it's in the Workers changelog or a blog post. Let me search. Also "Cloudflare changelog Durable Objects outbound connections duration" — try WebSearch again, and maybe fetch the Workers runtime API changelog. Actually there might be a blog post "Durable Objects: zero latency SQLite" no... Let me search specifically.
+
+2. Community reports on free tier block persisting past reset.
+
+3. Containers: cold start latency, limits page, TCP support. Fetch https://developers.cloudflare.com/containers/limits/ and maybe image-management/best-practices for cold starts. Also the question asks "can a Container hold long-lived TCP sessions that a Worker reaches (over what network path)". Container docs: Workers reach containers via DO fetch over localhost-ish internal network. There's also documentation that containers get inbound network access only via the Worker... Actually containers docs have a page on networking? Let me check limits first.
+
+Parallel: WebSearch for the announcement; fetch containers limits page.
+
+----- block 7 -----
+<think>
+The search results are unreliable (the search tool keeps mixing hallucinated knowledge with results — the "REMINDER" says include sources, but some of these URLs may be fabricated, e.g., "pricing-plans-limits"). I need to verify by direct fetches. The containers limits page 404'd at /containers/limits/; maybe it's at /containers/image-management/limits/ or /containers/reference/limits/. Let me try a few candidate URLs. Also the blog post for GA: blog.cloudflare.com announced Containers GA on June 2025 ("Cloudflare Containers" GA announcement ~June 2025 Birthday Week? Actually GA was announced2025-04-07 Developer Week? Let me recall: Containers open beta announced April 2025 (Developer Week), GA announced... I think GA was June 2025. The question says "GA 2025". Let me fetch the blog.
+
+Candidate fetches in parallel:
+1. https://developers.cloudflare.com/containers/image-management/docs/limits/ — unsure.
+Let me instead fetch https://developers.cloudflare.com/containers/api-reference/configuration/ for sleepAfter defaults, and try Google-style via WebFetch on developers.cloudflare.com sitemap? Simpler: fetch https://developers.cloudflare.com/containers/reference/limits/ maybe? Hmm.
+
+Actually earlier fetch of /containers/pricing/ said last updated Apr 21, 2026, and mentioned instance types up to standard-4 (4 vCPU, 12 GiB, 20 GB disk) which matches "max vCPU 4,12 GiB memory, 20 GiB disk".
+
+Let me try:
+- https://developers.cloudflare.com/containers/reference/limits/
+- https://blog.cloudflare.com/cloudflare-containers-coming-in-june-2025/ (verify existence)
+
+----- block 8 -----
+<think>
+40
+</think>
+```html4. The blog URL might be different. Let me search for the exact blog URL. Try WebFetch on the blog index or a search. Known Cloudflare blog posts about Containers:
+- "Cloudflare Containers (open beta)" — April 2025 Developer Week: https://blog.cloudflare.com/introducing-cloudflare-containers/ maybe
+- GA: June 2025 — possibly https://blog.cloudflare.com/cloudflare-containers-ga/ ?
+
+Let me try fetching the introducing post and searching for the GA post slug. Alternatively use WebSearch with allowed_domains blog.cloudflare.com.
+
+
+----- block 9 -----
+Docs are converging. Two remaining items: community reports on free-tier block persistence past reset, and any primary-source trace of the ~2026-06 connect() keep-alive announcement.
+
+----- block 10 -----
+The community forum blocks direct fetches (403) and the synthesized thread URLs can't be trusted. Two last checks: the Workers platform limits page for reset/error semantics, and a domain-restricted search for the connect() keep-alive change.
+
+----- block 11 -----
+I have enough primary-source material. The WebSearch tool proved unreliable in this environment (it repeatedly returned synthesized content with unverifiable URLs), so I'm weighting the direct developers.cloudflare.com fetches as the load-bearing evidence and flagging everything else.
