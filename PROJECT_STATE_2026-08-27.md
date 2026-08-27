@@ -329,14 +329,23 @@ DNS emission, per emitter:
 
 ## 13. Open items, ranked
 
-1. **Push the 13 commits.** Everything in §5–§7 exists only locally.
-2. Refresh the three stale doc statements (§11) — each is a two-line edit.
-3. Decide the untracked file disposition (§12); benchmarks + relay-poc +
-   research salvage are worth committing, scratch captures are not.
+> Status (same day): items 1–3 completed and pushed (`cfcb97e`, `d57d339`,
+> `64b4d4d`, `2d42cd6`); item 5's first entry (architecture map) written at
+> `docs/architecture.md`. A credential was found and redacted before any of
+> this landed: the Aug 17 report carried a live disposable-worker panel
+> password, now `[REDACTED]` in the committed copy.
+
+1. ~~**Push the 13 commits.**~~ Done — tree and origin now match.
+2. ~~Refresh the three stale doc statements (§11)~~ — done, each verified
+   against `cargo test` output (483 passing) and the phase4 results.
+3. ~~Decide the untracked file disposition (§12)~~ — done: relay-poc, the
+   research salvage, and the credential-free benchmark harnesses + result
+   JSONs are committed; every credential-bearing ops script is now explicitly
+   gitignored with a comment; scratch captures moved to `scratch/`.
 4. KNOWN_ISSUES §1 (panel UI never driven by a browser end-to-end) and §2
    (WS relay EOF) remain the two genuinely unproven code paths.
-5. The pending docs list (docs/README.md) — architecture/module map first,
-   since the tree now has a story worth telling.
+5. The pending docs list (docs/README.md) — **architecture/module map done**;
+   next candidates: transport internals, build pipeline.
 
 ---
 *Compiled 2026-08-27 from direct reads of the tree: git history, 21 benchmark

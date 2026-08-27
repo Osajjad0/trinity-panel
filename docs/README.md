@@ -32,9 +32,7 @@ from one source of truth.
 
 ## Developer documentation
 
-*Written as each stage completes.*
-
-- Architecture and module map — pending
+- **[Architecture and module map](architecture.md)** — Done: module map, request path, DO lifecycle, runtime constants
 - Protocol implementation notes — pending
 - Transport internals — pending
 - Build pipeline — pending
