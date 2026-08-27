@@ -63,6 +63,7 @@ captured/
 # ---- core binaries (never commit; supplied by the operator) ----
 xray
 xray.exe
+trx_core*
 sing-box
 sing-box.exe
 mihomo

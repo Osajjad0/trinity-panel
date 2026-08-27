@@ -1,0 +1,271 @@
+{
+ "idle_ladder": {
+  "10": {
+   "tag": "after-10s",
+   "post": "HTTP/1.1 200 OK",
+   "get": "HTTP/1.1 200 OK",
+   "orig_get_peek_bytes": 64
+  },
+  "30": {
+   "tag": "after-30s",
+   "post": "HTTP/1.1 200 OK",
+   "get": "HTTP/1.1 200 OK",
+   "orig_get_peek_bytes": 64
+  },
+  "45": {
+   "tag": "after-45s",
+   "post": "HTTP/1.1 200 OK",
+   "get": "HTTP/1.1 200 OK",
+   "orig_get_peek_bytes": 64
+  },
+  "59": {
+   "tag": "after-59s",
+   "post": "HTTP/1.1 200 OK",
+   "get": "HTTP/1.1 200 OK",
+   "orig_get_peek_bytes": 64
+  },
+  "61": {
+   "tag": "after-61s",
+   "post": "HTTP/1.1 200 OK",
+   "get": "HTTP/1.1 200 OK",
+   "orig_get_peek_bytes": 64
+  }
+ },
+ "second_get": {
+  "get2_status": "HTTP/1.1 200 OK",
+  "get1_kept_flowing": false,
+  "get1_bytes_after": 0
+ },
+ "mixed_soak": {
+  "events": [
+   {
+    "t": 0.0,
+    "ev": "open",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 0.7,
+    "ev": "small#1",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 1.6,
+    "ev": "small#2",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 2.2,
+    "ev": "small#3",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 3.2,
+    "ev": "small#4",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 3.9,
+    "ev": "small#5",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 16.6,
+    "ev": "small#6",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 17.4,
+    "ev": "small#7",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 18.2,
+    "ev": "small#8",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 18.9,
+    "ev": "small#9",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 20.0,
+    "ev": "small#10",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 32.7,
+    "ev": "small#11",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 33.4,
+    "ev": "small#12",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 33.9,
+    "ev": "small#13",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 34.8,
+    "ev": "small#14",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 35.7,
+    "ev": "small#15",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 48.2,
+    "ev": "small#16",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 48.8,
+    "ev": "small#17",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 49.5,
+    "ev": "small#18",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 50.3,
+    "ev": "small#19",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 51.0,
+    "ev": "small#20",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 63.5,
+    "ev": "small#21",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 64.4,
+    "ev": "small#22",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 65.3,
+    "ev": "small#23",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 66.1,
+    "ev": "small#24",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 66.8,
+    "ev": "small#25",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 79.7,
+    "ev": "small#26",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 80.5,
+    "ev": "small#27",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 81.5,
+    "ev": "small#28",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 82.3,
+    "ev": "small#29",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 83.0,
+    "ev": "small#30",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 95.7,
+    "ev": "small#31",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 96.7,
+    "ev": "small#32",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 97.1,
+    "ev": "small#33",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 98.3,
+    "ev": "small#34",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 99.1,
+    "ev": "small#35",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 111.9,
+    "ev": "small#36",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 112.7,
+    "ev": "small#37",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 113.3,
+    "ev": "small#38",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 113.8,
+    "ev": "small#39",
+    "status": "HTTP/1.1 200 OK"
+   },
+   {
+    "t": 114.5,
+    "ev": "small#40",
+    "status": "HTTP/1.1 200 OK"
+   }
+  ],
+  "failed_at": null
+ },
+ "post_ladder": {
+  "65536": {
+   "status": "(none)",
+   "accept_s": 9.19
+  },
+  "262144": {
+   "status": "HTTP/1.1 200 OK",
+   "accept_s": 1.07
+  },
+  "524288": {
+   "status": "(none)",
+   "accept_s": 8.52
+  },
+  "921600": {
+   "status": "(none)",
+   "accept_s": 8.21
+  },
+  "999999": {
+   "status": "HTTP/1.1 200 OK",
+   "accept_s": 0.95
+  }
+ }
+}
