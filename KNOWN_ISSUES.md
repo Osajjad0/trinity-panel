@@ -40,9 +40,12 @@ allowance.
 
 What exists for it: the supervisor (`src/transport/xhttp/supervise.rs`) ends
 receiver-gone and poisoned sessions immediately and keeps the 60 s true-idle
-teardown; it is merged to this tree but **not yet deployed**, so the live
-deployment remains exposed until the next deploy. Deploying does not clear
-existing zombies; they age out on their own schedule.
+teardown. It was deployed and lifecycle-verified on `trinity-fresh` on
+2026-08-25/26 (`fresh_phase4_results.json`: receiver-gone and idle sessions end
+fast with terminal SESSION_DIAG verdicts; dead sessions answer 404 so clients
+rebuild). Deployments still running pre-supervision builds (e.g. an undeployed
+`trinity-cleanacct`) remain exposed until their next deploy. Deploying does not
+clear existing zombies; they age out on their own schedule.
 
 ### 1. The panel UI is unverified end-to-end
 
@@ -98,14 +101,19 @@ succeeding on a live deployment, with a request after the burst still working. T
 is real evidence, but it is one measurement rather than a regression test, so a
 future change can break it silently.
 
-### 5. Measurements are incomplete
+### 5. Measurement coverage
 
 Measured on a live deployment: 20/20 sequential requests, p50 891 ms, p95 1661 ms,
-and the 12-request concurrency burst above.
+and the 12-request concurrency burst above. Sustained throughput was measured in
+the 2026-08-22/23 benchmark campaign (60 s runs, `bench_after_chunking_v3.json`
+and siblings) and again in the enhanced-reachability A/B
+(`ENHANCED_VERIFICATION_REPORT.md`), which also covered the obfuscation on/off
+delta (VLESS setup +0.3%; throughput deltas within path noise).
 
-**Not measured:** sustained throughput, cold-start time, and the obfuscation on/off
-delta. These are absent from the README rather than guessed; the project reports
-only numbers that come from measurement.
+**Still not measured:** cold-start time, and tunnelled upload against a
+non-Cloudflare endpoint (every candidate proved unreliable — see the
+ENHANCED_VERIFICATION_REPORT upload section). These are absent from the README
+rather than guessed; the project reports only numbers that come from measurement.
 
 ### 6. NAT64 outbound mode does not work on `workers.dev`
 

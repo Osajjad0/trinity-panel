@@ -81,7 +81,7 @@ an identical status code. There is no distinguishable 404 and no error body. A
 scanner that can tell those apart has learned that something is here.
 
 Written in Rust, compiled to WebAssembly, `#![forbid(unsafe_code)]`, with
-`unwrap`/`expect` denied by lint on every request-handling path. 369 tests run on
+`unwrap`/`expect` denied by lint on every request-handling path. 483 tests run on
 the host in seconds without a WASM harness or a live deployment.
 
 ---
