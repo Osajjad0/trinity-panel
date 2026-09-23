@@ -118,9 +118,14 @@ pub struct Claims {
     /// Ref that triggered the run.
     #[serde(default)]
     pub r#ref: Option<String>,
-    /// Workflow file path, e.g. `.github/workflows/scanner.yml`.
-    #[serde(default, rename = "workflow")]
-    pub workflow: Option<String>,
+    /// Full workflow ref: `owner/repo/.github/workflows/file.yml@ref`.
+    /// GitHub sets this server-side; unlike `workflow` (which carries the
+    /// workflow's display *name*) it always identifies the file.
+    #[serde(default)]
+    pub workflow_ref: Option<String>,
+    /// Not-before, seconds since epoch. Enforced when present.
+    #[serde(default)]
+    pub nbf: Option<i64>,
     /// Event that triggered the run.
     #[serde(default)]
     pub event_name: Option<String>,
@@ -156,6 +161,11 @@ pub fn time_window_ok(claims: &Claims, now: i64) -> bool {
             return false;
         }
     }
+    if let Some(nbf) = claims.nbf {
+        if now + CLOCK_SKEW_SECS < nbf {
+            return false;
+        }
+    }
     true
 }
 
@@ -172,7 +182,15 @@ pub fn identity_ok(claims: &Claims) -> Result<(), Rejection> {
     if claims.r#ref.as_deref() != Some(TRUSTED_REF) {
         return Err(Rejection::Untrusted);
     }
-    if claims.workflow.as_deref() != Some(TRUSTED_WORKFLOW) {
+    // `workflow` carries the workflow's display NAME; `workflow_ref` carries
+    // the file path the mission binds to. Require the full
+    // `owner/repo/.github/workflows/scanner.yml@refs/heads/main` form so
+    // repo and ref are re-pinned by the same server-set string.
+    let expected_workflow_ref = format!(
+        "{}/{}@{}",
+        TRUSTED_REPO, TRUSTED_WORKFLOW, TRUSTED_REF
+    );
+    if claims.workflow_ref.as_deref() != Some(expected_workflow_ref.as_str()) {
         return Err(Rejection::Untrusted);
     }
     let event_ok = claims
@@ -348,7 +366,11 @@ mod tests {
             iat: Some(1_799_999_000),
             repository: TRUSTED_REPO.into(),
             r#ref: Some(TRUSTED_REF.into()),
-            workflow: Some(TRUSTED_WORKFLOW.into()),
+            workflow_ref: Some(format!(
+                "{}/{}@{}",
+                TRUSTED_REPO, TRUSTED_WORKFLOW, TRUSTED_REF
+            )),
+            nbf: Some(1_799_999_000),
             event_name: Some("schedule".into()),
             sub: Some("repo:Osajjad0/trinity-proxy-catalog:ref:refs/heads/main".into()),
         }
@@ -437,7 +459,9 @@ mod tests {
                 c
             },
             |mut c: Claims| {
-                c.workflow = Some(".github/workflows/other.yml".into());
+                // Another workflow file in the same repo is still untrusted.
+                c.workflow_ref =
+                    Some("Osajjad0/trinity-proxy-catalog/.github/workflows/other.yml@refs/heads/main".into());
                 c
             },
             |mut c: Claims| {
