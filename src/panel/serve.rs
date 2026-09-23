@@ -680,10 +680,11 @@ async fn probe_one(host: &str, port: u16) -> core::result::Result<Trace, ProbeEr
     // DIAL: exactly the candidate address + port. SNI/Host are separate
     // layers below and are NOT rewritten into the dial address.
     let t0 = worker::Date::now().as_millis();
+    let dial_addr = probe_dial_address(host);
     let mut sock = worker::Socket::builder()
         .allow_half_open(true)
         .secure_transport(SecureTransport::On)
-        .connect(host, port)
+        .connect(&dial_addr, port)
         // On dial failure the attempted target IS the evidence: candidate:port.
         .map_err(|e| (e.to_string(), format!("{host}:{port}"), None))?;
     let dial_ip = match sock.opened().await {
@@ -807,13 +808,34 @@ async fn fetch_verified_feed() -> Result<crate::catalog::Snapshot, String> {
 /// relay dials a Proxy-IP (the session protocol supplies SNI inside). Returns
 /// the same Trace shape with probe/country fields empty.
 #[cfg(target_arch = "wasm32")]
+/// Dial address for the panel probes: bare IPv6 literals from the verified
+/// feed must be bracketed for workerd's `connect(address, port)` (same
+/// boundary rule as `Target::socket_address`; V24.6.11). Domains and IPv4
+/// pass through unchanged; an already-bracketed string is left alone.
+#[must_use]
+fn probe_dial_address(host: &str) -> String {
+    let host = host.trim();
+    if host.starts_with('[') || !host.contains(':') {
+        return host.to_owned();
+    }
+    // Bare IPv6: parses as an address exactly when it contains a colon and
+    // is not a bracketed string. Domains never contain colons.
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| match ip {
+            std::net::IpAddr::V6(_) => format!("[{host}]"),
+            std::net::IpAddr::V4(_) => host.to_owned(),
+        })
+        .unwrap_or_else(|_| host.to_owned())
+}
+
 async fn probe_tcp_one(host: &str, port: u16) -> core::result::Result<Trace, ProbeError> {
     use worker::SecureTransport;
     let t0 = worker::Date::now().as_millis();
+    let dial_addr = probe_dial_address(host);
     let mut sock = worker::Socket::builder()
         .allow_half_open(true)
         .secure_transport(SecureTransport::Off)
-        .connect(host, port)
+        .connect(&dial_addr, port)
         .map_err(|e| (e.to_string(), format!("{host}:{port}"), None))?;
     let dial_ip = match sock.opened().await {
         Ok(info) => {

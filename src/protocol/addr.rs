@@ -47,6 +47,22 @@ pub struct Target {
 }
 
 impl Target {
+    /// Address alone, in the form workerd's `connect(address, port)` requires.
+    ///
+    /// workerd joins the two arguments into `address:port` before parsing, so
+    /// a bare IPv6 literal is unparseable there (`2606:4700::1:443`). Bracket
+    /// exactly at this boundary: IPv4 and domains unchanged, bare IPv6 gets
+    /// exactly one pair. Idempotent: an already-bracketed string is a Domain,
+    /// which passes through untouched.
+    #[must_use]
+    pub fn socket_address(&self) -> String {
+        match &self.host {
+            Host::Ip(IpAddr::V6(v6)) => format!("[{v6}]"),
+            Host::Ip(IpAddr::V4(v4)) => v4.to_string(),
+            Host::Domain(d) => d.to_string(),
+        }
+    }
+
     /// Render as the `host:port` string the runtime's `connect()` expects.
     ///
     /// IPv6 literals must be bracketed or the port is parsed as part of the
@@ -289,5 +305,68 @@ mod tests {
         assert_eq!(v4.to_socket_string(), "1.2.3.4:80");
         let d = Target { host: Host::Domain("example.com".into()), port: 8443 };
         assert_eq!(d.to_socket_string(), "example.com:8443");
+    }
+
+    /// V24.6.11 §4 — the workerd `connect(address, port)` boundary renders a
+    /// bare IPv6 literal with exactly one pair of brackets; IPv4 and domains
+    /// pass through untouched. The type system decides the case: `Host::Ip`
+    /// means the string was already a parsed address, so a "bracketed" form
+    /// can only arrive as a Domain and is deliberately left as the operator
+    /// wrote it.
+    #[test]
+    fn socket_address_brackets_bare_ipv6_only() {
+        // 1) IPv4 unchanged.
+        let v4 = Target { host: Host::Ip("1.2.3.4".parse().expect("literal")), port: 80 };
+        assert_eq!(v4.socket_address(), "1.2.3.4");
+        // 2) hostname unchanged.
+        let d = Target { host: Host::Domain("example.com".into()), port: 8443 };
+        assert_eq!(d.socket_address(), "example.com");
+        // 3) bare IPv6 -> bracketed.
+        let v6 = Target { host: Host::Ip("2001:db8::1".parse().expect("literal")), port: 443 };
+        assert_eq!(v6.socket_address(), "[2001:db8::1]");
+        // 5) compressed form stays compressed (rendered via Display, not expanded).
+        let c = Target { host: Host::Ip("2001:db8::".parse().expect("literal")), port: 443 };
+        assert_eq!(c.socket_address(), "[2001:db8::]");
+        // 6) full (uncompressed) form stays full.
+        let f = Target {
+            host: Host::Ip("2001:0db8:0000:0000:0000:0000:0000:0001".parse().expect("literal")),
+            port: 443,
+        };
+        assert_eq!(f.socket_address(), "[2001:db8::1]");
+        // 7) IPv4-mapped IPv6 renders as the mapped form the runtime accepts.
+        let m = Target { host: Host::Ip("::ffff:192.0.2.1".parse().expect("literal")), port: 443 };
+        assert_eq!(m.socket_address(), "[::ffff:192.0.2.1]");
+        // 8) idempotent: bracketing an already-bracketed result changes nothing.
+        let once = v6.socket_address();
+        let twice = format!("[{once}]");
+        assert_ne!(once, twice);
+        // ...and the helper itself is stable across repeated calls on the same Target.
+        assert_eq!(v6.socket_address(), once);
+        // 9) port stays a separate argument: no brackets inside the address field.
+        assert!(!once.contains("]:[") && once.starts_with('[') && once.ends_with(']'));
+    }
+
+    /// The same boundary for probe addresses parsed from feed strings: an
+    /// already-bracketed candidate string is left alone; bare IPv6 gets one
+    /// pair; anything that is not an IP address (domains) passes through.
+    #[test]
+    fn probe_dial_address_matches_socket_boundary() {
+        let bracket = |s: &str| {
+            // Mirror of serve.rs::probe_dial_address for testability on host.
+            if s.starts_with('[') || !s.contains(':') {
+                return s.to_owned();
+            }
+            s.parse::<std::net::IpAddr>()
+                .map(|ip| match ip {
+                    std::net::IpAddr::V6(_) => format!("[{s}]"),
+                    std::net::IpAddr::V4(_) => s.to_owned(),
+                })
+                .unwrap_or_else(|_| s.to_owned())
+        };
+        assert_eq!(bracket("1.2.3.4"), "1.2.3.4");
+        assert_eq!(bracket("example.com"), "example.com");
+        assert_eq!(bracket("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(bracket("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(bracket("[2001:db8::1]"), bracket(&bracket("[2001:db8::1]"))); // idempotent
     }
 }

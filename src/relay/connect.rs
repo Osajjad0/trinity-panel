@@ -99,10 +99,11 @@ mod imp {
         if !is_permitted(target) {
             return Err(ConnectError::Forbidden);
         }
-        let host = match &target.host {
-            crate::protocol::Host::Domain(d) => d.to_string(),
-            crate::protocol::Host::Ip(ip) => ip.to_string(),
-        };
+        // Bracketed at this boundary (see `Target::socket_address`): workerd
+        // joins host+port into `host:port`, which a bare IPv6 literal breaks.
+        // This masked itself for pool deployments — the direct dial failed and
+        // a Proxy-IP candidate relayed instead (V24.6.11 reproduction).
+        let host = target.socket_address();
         Socket::builder()
             // Let the destination's FIN through rather than tearing the whole
             // socket down on it. Half-close is normal for HTTP/1.1 and for
