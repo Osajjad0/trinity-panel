@@ -1,0 +1,2175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Trinity Panel</title>
+<script>
+// Theme init BEFORE paint (V24.5.3): localStorage wins; first visit = light.
+try {
+  const t = localStorage.getItem("trinity-theme");
+  if (t === "dark") document.documentElement.dataset.theme = "dark";
+} catch { /* storage blocked; light stays */ }
+</script>
+<style>
+/* Trinity Panel
+   Dark IDE / command-center aesthetic. Reference tokens adapted from the
+   AgentQL design set: near-black canvas, deep navy surfaces, achromatic text,
+   one restrained violet accent. Same class and id vocabulary as the previous UI
+   document — only the presentation differs, so every control keeps working. */
+:root{
+  /* V24.5.3 tokens — LIGHT is the default theme. Semantic names; the legacy
+     aliases at the bottom keep every existing rule working unchanged. */
+  --bg:#f7f8fa;            /* page canvas */
+  --surface:#ffffff;       /* card background */
+  --surface-raised:#f1f3f7;/* controls, elevated chips */
+  --surface-hover:#eceff5; /* card hover lift */
+  --border:#e3e6ec;        /* card borders */
+  --border-strong:#c9cfda; /* control borders */
+  --text:#181c23;          /* primary text */
+  --text-muted:#5b6472;    /* secondary text */
+  --text-subtle:#8a93a3;   /* tertiary text */
+  --accent:#2563eb;        /* THE blue */
+  --accent-hover:#1d4ed8;
+  --accent-soft:rgba(37,99,235,.10);
+  --accent-border:rgba(37,99,235,.22);
+  --success:#166534; --warning:#b45309; --danger:#dc2626;
+  --focus-ring:#2563eb;
+  --radius-sm:7px; --radius-md:10px; --radius-lg:14px;
+  --shadow-sm:0 1px 2px rgba(16,24,40,.06);
+  --shadow-md:0 4px 16px rgba(16,24,40,.08);
+  --motion-fast:150ms; --motion-base:240ms; --motion-slow:380ms;
+  --ease-standard:cubic-bezier(.2,0,0,1);
+  --ease-emphasis:cubic-bezier(.785,.135,.15,.86);
+  --ease-reveal:cubic-bezier(.4,0,.2,1);
+  --radius:var(--radius-md);
+  --shadow:var(--shadow-md);
+  /* Alias tokens (old vocabulary, kept for existing rules). */
+  --panel:var(--surface);
+  --panel2:var(--surface-raised);
+  --ink:var(--text);
+  --dim:var(--text-muted);
+  --line:var(--border);
+  --hairline:var(--border-strong);
+  --accent-ink:#ffffff;
+  --ok:var(--success); --warn:var(--warning); --bad:var(--danger); --fatal:#ef4444;
+  --chip:#eef0f4;
+  --sans:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+[data-theme="dark"]{
+  /* Softer slate dark (V24.5.7 spec 10): calm, no pure black. */
+  --bg:#111827; --surface:#171f2b; --surface-raised:#1d2633; --surface-hover:#232e3c;
+  --border:#2b3747; --border-strong:#3a4a5e;
+  --text:#f3f4f6; --text-muted:#aab4c3; --text-subtle:#7f8a9a;
+  --accent:#3b82f6; --accent-hover:#2563eb;
+  --accent-soft:rgba(59,130,246,.16); --accent-border:rgba(59,130,246,.32);
+  --success:#4ade80; --warning:#fbbf24; --danger:#f87171; --fatal:#fca5a5;
+  --accent-ink:#0f172a; --chip:#202b3b;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.3); --shadow-md:0 8px 24px rgba(0,0,0,.28);
+}
+/* Status vocabulary (spec 13): one visual treatment per state, colour never
+   the only signal — each chip also carries its word. */
+.st{display:inline-block;padding:.14rem .55rem;border-radius:999px;font-size:.75rem;
+    font-weight:500;border:1px solid var(--border);background:var(--chip);color:var(--text-muted)}
+.st-ready,.st-saved,.st-active{color:var(--success);border-color:color-mix(in srgb, var(--success) 35%, transparent)}
+.st-syncing{color:var(--text)}
+.st-warning{color:var(--warning);border-color:color-mix(in srgb, var(--warning) 35%, transparent)}
+.st-error{color:var(--danger);border-color:color-mix(in srgb, var(--danger) 40%, transparent)}
+.st-off{color:var(--text-muted)}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important;
+    animation-iteration-count:1!important}
+}
+/* Motion system (V24.5.1 spec 12): one vocabulary, event-driven only. */
+:root{
+  --motion-fast:150ms; --motion-base:240ms; --motion-slow:380ms;
+  --ease-standard:cubic-bezier(.2,0,0,1);
+  --ease-emphasis:cubic-bezier(.785,.135,.15,.86); /* ObsidianUI Arrow Fill easing */
+  --ease-reveal:cubic-bezier(.4,0,.2,1); /* ObsidianUI Rectangular Text Reveal easing */
+}
+/* ObsidianUI Rectangular Text Reveal -> Trinity page title, v2 (V24.5.3).
+   v1 (accent cover + text pop) read as a flash. v2 keeps the text visible at
+   all times: a slim blue bar sweeps left-to-right beneath the title (the
+   pattern's directional wipe), then fades out. Geometric, ~0.9s, plays once
+   per load, no layout shift. */
+#app h1#panel-title{position:relative}
+#app h1#panel-title::after{
+  content:""; position:absolute; left:0; bottom:-0.28rem;
+  width:var(--reveal-w, 100%); height:3px; border-radius:2px;
+  background:var(--accent); opacity:0; pointer-events:none;
+  transform-origin:0 50%;
+}
+#app h1#panel-title.title-reveal::after,
+.signin-title.title-reveal::after{
+  animation:title-bar 0.45s var(--ease-reveal) forwards;
+}
+.signin-title{position:relative;display:inline-block}
+.signin-title::after{
+  content:""; position:absolute; left:50%; bottom:-0.28rem;
+  width:calc(100% - 2px); height:3px; border-radius:2px;
+  background:var(--accent); opacity:0; pointer-events:none;
+  transform:translateX(-50%) scaleX(0); transform-origin:0 50%;
+}
+@media (prefers-reduced-motion: reduce){
+  .signin-title::after{display:none}
+}
+@keyframes title-bar{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+/* Reduced motion: title appears immediately, no bar. */
+@media (prefers-reduced-motion: reduce){
+  #app h1#panel-title::after{display:none}
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font:15px/1.55 var(--sans);
+  -webkit-font-smoothing:antialiased;
+}
+/* ObsidianUI Dotted Grid -> Trinity: static CSS-only texture, developer-surface
+   feel. No JS, no animation. Hidden on small screens (readability first). */
+body::before{
+  content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background-image:radial-gradient(circle, var(--dot, rgba(16,24,40,.05)) 1px, transparent 1px);
+  background-size:22px 22px;
+  -webkit-mask-image:radial-gradient(ellipse 70% 55% at 50% 0%, #000 30%, transparent 75%);
+          mask-image:radial-gradient(ellipse 70% 55% at 50% 0%, #000 30%, transparent 75%);
+}
+@media (max-width:767px){ body::before{display:none} }
+[data-theme="dark"] body::before{--dot:rgba(255,255,255,.04)}
+a{color:var(--accent)}
+h1,h2,h3{line-height:1.25;margin:0 0 .4rem;letter-spacing:-.02em;text-wrap:balance}
+h1{font-size:1.45rem;font-weight:700} h2{font-size:1.08rem;font-weight:600} h3{font-size:.95rem;font-weight:600}
+p{margin:0 0 .7rem}
+.wrap{max-width:960px;margin:0 auto;padding:1rem}
+.card{
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  padding:1rem; margin-bottom:1rem; box-shadow:var(--shadow);
+}
+.muted{color:var(--dim);font-size:.87rem}
+
+/* ObsidianUI Apple Spotlight -> Trinity: extremely subtle luminance lift on
+   the hovered/focused card only. Pointer devices only; no JS; nothing moves. */
+@media (hover:hover) and (pointer:fine){
+  .card{
+    transition:border-color var(--motion-fast) var(--ease-standard),
+               background-color var(--motion-fast) var(--ease-standard);
+  }
+  .card:hover,.card:focus-within{
+    background:var(--surface-raised);
+    border-color:var(--border-strong);
+  }
+}
+.row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+.spread{display:flex;justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap}
+button{
+  font:inherit; padding:.45rem .8rem; border-radius:8px; cursor:pointer;
+  border:1px solid var(--hairline); background:var(--panel2); color:var(--ink);
+}
+button{transition:border-color .15s ease,background-color .15s ease,transform .1s ease}
+button:hover{border-color:var(--accent)}
+button:active{transform:translateY(1px)}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--focus-ring);outline-offset:1px}
+
+/* V24.5.4: controls — restored + restyled (they were lost in the V24.5.3 file
+   mishap). Native elements stay native (craft floor: no div widgets). */
+input,select,textarea{
+  font:inherit; width:100%; max-width:100%; padding:.55rem .7rem;
+  border-radius:var(--radius-sm); border:1px solid var(--border-strong);
+  background:var(--surface); color:var(--text);
+  transition:border-color var(--motion-fast) var(--ease-standard);
+  min-height:44px;
+}
+input:hover,select:hover,textarea:hover{border-color:var(--text-subtle)}
+input::placeholder,textarea::placeholder{color:var(--text-subtle)}
+textarea{font-family:var(--mono);font-size:.82rem;min-height:8rem;resize:vertical}
+input[type=checkbox]{width:auto;min-height:0;accent-color:var(--accent)}
+label{display:block;font-weight:600;margin-bottom:.2rem;font-size:.9rem}
+code,.mono,.mono p{
+  font-family:var(--mono); font-size:.85rem;
+  overflow-wrap:anywhere; word-break:break-word; min-width:0; max-width:100%;
+}
+/* Selects: custom chevron, consistent height, no browser chrome. */
+select{
+  appearance:none; -webkit-appearance:none; padding-right:2.2rem; cursor:pointer;
+  background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%235b6472' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat; background-position:right .8rem center;
+}
+select:focus{border-color:var(--accent)}
+select:disabled{opacity:.55;cursor:not-allowed}
+/* Long-value containment everywhere (spec 2): flexible children may shrink. */
+.card,.row,.spread,.field,.acc-hint{min-width:0}
+.card *{max-width:100%}
+p,.help,.muted,.acc-hint{overflow-wrap:anywhere}
+table{table-layout:fixed}
+td,th{overflow-wrap:anywhere}
+.sub{background:transparent;border:0;border-radius:0;
+  box-shadow:none;padding:.2rem 1.1rem .4rem;margin:0 0 .8rem}
+.sub>:first-child{margin-top:0}
+.sub>h3:first-child,.sub .spread>h3{margin-top:0}
+.cand-list{display:flex;flex-direction:column;gap:.3rem;min-width:0}
+.cand-row{display:flex;align-items:center;gap:.55rem;padding:.42rem .6rem;
+  background:var(--surface-raised);border:1px solid var(--border);
+  border-radius:var(--radius-sm);min-width:0}
+.cand-idx{flex:none;width:1.3rem;text-align:right;color:var(--text-subtle);font-size:.8rem}
+.cand-host{font-family:var(--mono);font-size:.84rem;overflow-wrap:anywhere;min-width:0;flex:1}
+.cand-copy{flex:none;padding:.25rem .6rem;min-height:0;font-size:.78rem}
+.err-wrap{display:inline}
+.err-details{display:inline;margin-left:.35rem}
+.err-details summary{display:inline;cursor:pointer;color:var(--accent);text-decoration:underline}
+.err-details code{display:block;margin-top:.3rem;padding:.5rem .6rem;white-space:pre-wrap;
+  background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-sm)}
+/* Switch (liq-toggle principle, native checkbox): track+knob, 44px target. */
+.switch{position:relative;display:inline-block;width:44px;height:26px;flex:none}
+.switch input{position:absolute;opacity:0;width:44px;height:26px;margin:0;cursor:pointer}
+.switch .track{position:absolute;inset:0;border-radius:999px;background:var(--border-strong);
+  transition:background var(--motion-fast) var(--ease-standard);pointer-events:none}
+.switch .track::before{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;
+  border-radius:50%;background:#fff;box-shadow:var(--shadow-sm);
+  transition:transform var(--motion-fast) var(--ease-standard)}
+.switch input:checked+.track{background:var(--accent)}
+.switch input:checked+.track::before{transform:translateX(18px)}
+.switch input:focus-visible+.track{outline:2px solid var(--focus-ring);outline-offset:2px}
+.switch input:disabled+.track{opacity:.5}
+/* Real app icons inside the dropdown (24px, contained). */
+.esel-ic{width:24px;height:24px;flex:none;border-radius:6px;background:var(--surface-raised)}
+.esel{position:relative;min-width:0}
+.esel-btn{display:flex;align-items:center;justify-content:space-between;gap:.5rem;
+  width:100%;min-height:44px;text-align:left;
+  background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:var(--radius-sm);padding:.55rem .7rem;color:var(--text)}
+.esel-btn::after{content:"";flex:none;width:9px;height:9px;margin-left:auto;
+  border-right:2px solid var(--text-subtle);border-bottom:2px solid var(--text-subtle);
+  transform:rotate(45deg);transition:transform var(--motion-fast) var(--ease-standard)}
+.esel-open .esel-btn::after{transform:rotate(225deg)}
+.esel-btn:hover{border-color:var(--text-subtle)}
+.esel-open .esel-btn{border-color:var(--accent)}
+.esel-btn:focus-visible{outline:2px solid var(--focus-ring);outline-offset:1px}
+.esel-native{display:none}
+.esel-menu{display:none;position:fixed;z-index:1000;
+  max-height:280px;overflow:auto;background:var(--surface);
+  border:1px solid var(--border-strong);border-radius:var(--radius-md);
+  box-shadow:var(--shadow-md);padding:.375rem;
+  opacity:0;transform:translateY(-2px) scale(.985)}
+.esel-menu.esel-shown{display:block;
+  animation:esel-in 150ms var(--ease-standard) forwards}
+.esel-main{min-width:0;overflow-wrap:anywhere}
+.esel-col{display:flex;flex-direction:column;gap:.05rem;min-width:0;flex:1}
+.esel-sub{font-size:.72rem;color:var(--dim);font-family:var(--mono)}
+.esel-glider{position:absolute;left:0.375rem;right:0.375rem;top:0;
+  background:var(--accent-soft);border-radius:var(--radius-sm);
+  box-shadow:inset 3px 0 0 0 var(--accent);
+  transition:transform 180ms var(--ease-standard), height 180ms var(--ease-standard);
+  pointer-events:none;z-index:0}
+.esel-opt{position:relative;z-index:1;transition:background-color 150ms var(--ease-standard)}
+.esel-opt[aria-selected=true]{
+  /* tint + rail live on the shared glider layer (Detail: Smooth Highlight Block
+     Transition) — the highlight physically travels; the row keeps only text styling. */
+}
+.esel-opt[aria-selected=true]:hover{background:var(--accent-soft)}
+
+@keyframes esel-in{to{opacity:1;transform:none}}
+.esel-opt{padding:.5rem .6rem;border-radius:var(--radius-sm);cursor:pointer;
+  display:flex;align-items:center;gap:.5rem;min-height:42px;overflow-wrap:anywhere}
+.esel-opt:hover,.esel-opt.esel-active:not([aria-selected=true]){background:var(--surface-hover)}
+.esel-opt[aria-selected=true]{color:var(--accent);font-weight:600}
+.app-img{width:30px;height:30px;flex:none;object-fit:contain}
+.app-ic{display:inline-flex;align-items:center;justify-content:center;flex:none;
+  width:30px;height:30px;border-radius:var(--radius-sm);background:var(--accent-soft);
+  color:var(--accent);font-weight:700;font-size:.85rem}
+.proto-ic{display:inline-flex;align-items:center;flex:none}
+.chip{
+  display:inline-block;padding:.1rem .45rem;border-radius:999px;
+  background:var(--chip);font-size:.75rem;color:var(--dim);
+}
+.sev-degraded,.sev-untranslatable{color:var(--warn)}
+.sev-broken{color:var(--bad)} .sev-fatal{color:var(--fatal)}
+.ok{color:var(--ok)}
+.grid{display:grid;gap:.8rem;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
+.field{margin-bottom:.9rem}
+.field .help{color:var(--dim);font-size:.83rem;margin:.2rem 0 .35rem}
+.finding{border-left:2px solid var(--line);padding:.15rem 0 .15rem .6rem;margin:.35rem 0}
+.finding.sev-broken,.finding.sev-fatal{border-color:var(--bad)}
+.finding.sev-degraded,.finding.sev-untranslatable{border-color:var(--warn)}
+details summary{cursor:pointer}
+table{border-collapse:collapse;width:100%;font-size:.87rem}
+th,td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid var(--line);vertical-align:top}
+.qr{background:#fff;padding:.4rem;border-radius:8px;width:190px;height:190px}
+
+/* V24.5.3 accordion system: ONE style, native <details>/<summary>. */
+html{interpolate-size:allow-keywords}
+details.acc{
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-lg);
+  margin-bottom:.9rem; box-shadow:var(--shadow-sm); overflow:hidden;
+}
+details.acc>summary{
+  list-style:none; cursor:pointer; display:flex; align-items:center; gap:.6rem;
+  padding:.85rem 1.1rem; user-select:none; min-height:44px;
+}
+details.acc>summary::-webkit-details-marker{display:none}
+/* Detail "Smooth Highlight Block Transition" language: content settles, not flashes. */
+details.acc>.acc-body,details.acc>div{animation:acc-in 200ms var(--ease-standard)}
+@keyframes acc-in{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+.shake-x{animation:shake-x 220ms var(--ease-standard)}
+@keyframes shake-x{0%,100%{transform:none}25%{transform:translateX(-2px)}60%{transform:translateX(2px)}80%{transform:translateX(-1px)}}
+details.acc>summary h2{margin:0; font-size:1.02rem}
+details.acc>summary::after{
+  content:""; width:9px; height:9px; margin-left:auto; flex:none;
+  border-right:2px solid var(--text-subtle); border-bottom:2px solid var(--text-subtle);
+  transform:rotate(45deg); transition:transform var(--motion-fast) var(--ease-standard);
+}
+details.acc[open]>summary::after{transform:rotate(225deg)}
+details.acc>summary:hover{background:var(--surface-hover)}
+details.acc>summary:focus-visible{outline:2px solid var(--focus-ring); outline-offset:-2px}
+details.acc>*:not(summary):not(details){padding:.2rem 1.1rem 1rem}
+details.acc>details{margin:0 1.1rem 1rem}
+details.acc[open]>summary{border-bottom:1px solid var(--border)}
+.acc-hint{font-size:.85rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  max-width:60%; margin-left:auto; margin-right:.4rem}
+.hidden{display:none !important}
+.split{display:grid;gap:1rem;grid-template-columns:220px minmax(0,1fr)}
+@media (max-width:760px){.split{grid-template-columns:1fr}}
+.nodelist button{width:100%;text-align:left;margin-bottom:.3rem;
+  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nodelist button span{min-width:0}
+.nodelist button[aria-current=true]{border-color:var(--accent);background:var(--chip)}
+
+/* Section hierarchy, spacing, mobile comfort (carried over from the previous UI). */
+.card > h2,.card > h3{border-bottom:1px solid var(--line);padding-bottom:.4rem;margin-bottom:.7rem}
+.card > h2:only-child,.card > h3:only-child{border:0;padding:0;margin:0}
+.card{padding:1.1rem}
+.field:last-child,.field:last-of-type{margin-bottom:0}
+.grid{gap:.9rem}
+.nodelist button{padding:.5rem .6rem;line-height:1.3}
+.nodelist{gap:.3rem}
+.chip{margin-left:.35rem;vertical-align:middle}
+table th{font-family:var(--mono);font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:500}
+table tr:last-child td{border-bottom:0}
+details.card > summary{padding:.15rem 0;font-size:1.02rem}
+@media (max-width:760px){
+  .acc-hint{display:none}
+  details.acc>summary{padding:.75rem .9rem}
+  details.acc>*:not(summary):not(details){padding:0 .9rem .9rem}
+  details.acc>details{margin:0 .9rem .9rem}
+  .wrap{padding:.8rem}
+  .card{padding:.9rem;margin-bottom:.8rem}
+  h1{font-size:1.2rem}
+  .grid{grid-template-columns:1fr}
+  .field .help{font-size:.85rem}
+  .split{gap:.8rem}
+}
+/* ObsidianUI-style toast: slide+fade enter/exit, transform only. */
+.toast{
+  position:fixed;left:50%;bottom:1rem;transform:translateX(-50%) translateY(8px);
+  background:var(--chip);color:var(--ink);border:1px solid var(--hairline);
+  padding:.5rem .9rem;border-radius:8px;box-shadow:var(--shadow);
+  font-size:.87rem;opacity:0;pointer-events:none;
+  transition:opacity var(--motion-fast) var(--ease-standard),
+             transform var(--motion-fast) var(--ease-standard);
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* ObsidianUI Arrow Fill Button -> Trinity: a directional luminance fill that
+   sweeps in on hover AND keyboard focus (same treatment, spec 15), using the
+   library's emphasis easing at a panel-appropriate 240ms. CSS-only. */
+button.primary{position:relative;overflow:hidden;background:var(--accent);
+  color:var(--accent-ink);border-color:transparent;font-weight:600}
+button.primary::after{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background:linear-gradient(100deg, transparent 20%, rgba(255,255,255,.28) 50%, transparent 80%);
+  transform:translateX(-101%);
+  transition:transform var(--motion-base) var(--ease-emphasis);
+}
+button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:translateX(0)}
+
+/* D: busy loader: ONE style everywhere (inline SVG spinner injected by JS
+   into .busy buttons), event-driven only, reduced-motion collapses. */
+.busy{position:relative;overflow:hidden;color:var(--text)!important}
+.busy .spinner{display:inline-block;vertical-align:-2px;margin-right:.4rem;
+  animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.busy::before{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background:linear-gradient(100deg, transparent 30%, rgba(255,255,255,.25) 50%, transparent 70%);
+  transform:translateX(-100%);
+  animation:trinity-shimmer 1.2s var(--ease-standard) 3;
+}
+@keyframes trinity-shimmer{to{transform:translateX(100%)}}
+
+/* E: count/value swap: light fade on change, event-driven only. */
+.val-swap{animation:val-in var(--motion-base) var(--ease-standard)}
+@keyframes val-in{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+.banner{
+  border:1px solid var(--warning); background:color-mix(in srgb, var(--warning) 8%, transparent);
+  border-radius:8px; padding:.6rem .8rem; margin-bottom:1rem;
+}
+
+/* Sign in. The one screen seen before anything else: a single centered
+   command-center card, deliberate and quiet. */
+.signin{display:flex;align-items:center;justify-content:center;
+  min-height:calc(100vh - 4rem);padding:1.5rem;position:relative}
+.signin-card{
+  position:relative;z-index:1;width:100%;max-width:376px;text-align:center;
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg,#16px);
+  padding:2rem 1.75rem 1.85rem;box-shadow:var(--shadow-md)}
+.signin-mark{display:inline-flex;align-items:center;justify-content:center;
+  width:52px;height:52px;border-radius:16px;margin-bottom:.9rem;
+  background:var(--accent-soft);color:var(--accent);
+  transition:transform var(--motion-base) var(--ease-emphasis)}
+.signin-mark svg{width:26px;height:26px}
+.signin-card:hover .signin-mark{transform:translateY(-2px)}
+.signin-title{margin:0;font-size:1.5rem;letter-spacing:-.01em}
+.signin-sub{margin:.35rem 0 1.4rem;color:var(--dim);font-size:.9rem}
+.signin-card form{text-align:left}
+.signin-btn{width:100%;min-height:44px;justify-content:center}
+.signin-error{min-height:1.15rem;margin:.6rem 0 0;font-size:.85rem;color:var(--danger,#b42318)}
+.signin-card .field{max-width:none}
+.signin h1{font-size:1.35rem;line-height:1.3;margin-bottom:.4rem}
+.signin .muted{font-size:.9rem;line-height:1.5;margin-bottom:1.25rem}
+.signin button[type=submit]{width:auto;min-width:7.5rem;min-height:44px}
+.signin .with-action button{min-height:44px}
+.with-action{display:flex;gap:.4rem;align-items:stretch}
+.with-action input{flex:1;min-width:0}
+.with-action button{white-space:nowrap}
+#signin-error{margin:.6rem 0 0;min-height:1.1em;font-size:.87rem}
+.signin .with-action{position:relative}
+.signin .with-action input{padding-right:2.9rem}
+.signin .with-action .eye{
+  position:absolute;right:6px;top:50%;transform:translateY(-50%);
+  display:inline-flex;align-items:center;justify-content:center;
+  width:34px;height:34px;border:0;background:transparent;color:var(--dim);
+  border-radius:8px;cursor:pointer;
+  transition:color var(--motion-fast) var(--ease-standard),
+             background-color var(--motion-fast) var(--ease-standard)}
+.signin .with-action .eye:hover{color:var(--ink);background:var(--surface-hover)}
+.signin .with-action .eye:focus-visible{outline:2px solid var(--focus-ring);outline-offset:-2px}
+.signin .with-action .eye svg{width:19px;height:19px}
+.signin-card .field{margin-bottom:1.1rem}
+.signin-btn{margin-top:.35rem}
+.signin::before{
+  content:"";position:absolute;inset:0;z-index:0;pointer-events:none;
+  background-image:
+    radial-gradient(circle at 22% 18%, var(--accent-soft), transparent 42%),
+    radial-gradient(circle at 78% 82%, var(--accent-soft), transparent 40%),
+    radial-gradient(rgba(37,99,235,.10) 1px, transparent 1px);
+  background-size:auto,auto,22px 22px}
+
+@media (max-width:420px){
+  .signin{margin:0}
+  .signin h1{font-size:1.35rem;line-height:1.3;margin-bottom:.4rem}
+  .signin .muted{font-size:.84rem}
+}
+
+/* Core-first subscription cards (V24.5.10 spec 8/12). */
+.cores{display:grid;gap:.9rem;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.core-card{display:flex;flex-direction:column;gap:.55rem}
+.core-head{display:flex;align-items:center;gap:.65rem;min-width:0}
+.core-ic{display:inline-flex;align-items:center;justify-content:center;flex:none;
+  width:38px;height:38px;border-radius:var(--radius-sm);background:var(--accent-soft);color:var(--accent)}
+.core-ic svg{width:22px;height:22px}
+.core-ic img{width:26px;height:26px;object-fit:contain}
+.core-title{margin:0;font-size:1.02rem}
+.core-sub{margin:0;color:var(--dim);font-size:.82rem}
+.core-clients{display:flex;flex-wrap:wrap;gap:.3rem;align-items:center;min-width:0}
+.core-client{display:inline-flex;align-items:center;gap:.35rem;padding:.22rem .55rem;
+  border:1px solid var(--hairline);border-radius:999px;font-size:.78rem;color:var(--ink2);min-width:0}
+.core-client img{width:16px;height:16px;object-fit:contain;flex:none}
+.core-actions{display:flex;gap:.45rem;flex-wrap:wrap;margin-top:.15rem}
+
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <!-- Sign in ------------------------------------------------------------- -->
+  <section id="signin" class="signin hidden">
+      <div class="signin-card">
+        <div class="signin-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2.5 4.5 5.6v5.9c0 4.3 3 8.2 7.5 9.9 4.5-1.7 7.5-5.6 7.5-9.9V5.6z"/>
+            <path d="m8.8 11.9 2.3 2.3 4.4-4.6"/>
+          </svg>
+        </div>
+        <h1 class="signin-title">Trinity Panel</h1>
+        <p class="signin-sub">Sign in to your panel</p>
+        <form id="signin-form" novalidate>
+          <div class="field">
+            <label for="password">Password</label>
+            <div class="with-action">
+              <input id="password" type="password" autocomplete="current-password"
+                     autofocus required aria-describedby="signin-error">
+              <button type="button" id="reveal" class="eye" aria-pressed="false"
+                      aria-label="Show password" title="Show password">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2.5 12S6 5.8 12 5.8 21.5 12 21.5 12 18 18.2 12 18.2 2.5 12 2.5 12Z"/>
+                  <circle cx="12" cy="12" r="2.6"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <button class="primary signin-btn" type="submit" id="signin-btn">Sign in</button>
+          <p id="signin-error" class="signin-error" role="alert" aria-live="polite"></p>
+        </form>
+      </div>
+    </section>
+
+  <!-- Panel ---------------------------------------------------------------- -->
+  <main id="app" class="hidden">
+    <div class="spread" style="margin-bottom:1rem">
+      <div>
+        <h1 id="panel-title">Trinity Panel</h1>
+        <div class="muted mono" id="host"></div>
+      </div>
+      <div class="row">
+        <button type="button" id="save" class="primary" disabled>Save</button>
+        <button id="theme-toggle" type="button" aria-label="Switch to dark theme" title="Theme">◐</button>
+        <button type="button" id="signout">Sign out</button>
+      </div>
+    </div>
+
+    <div id="banner"></div>
+
+    <!-- ONE PAGE: four accordions (V24.5.3). Inner ids unchanged. -->
+    <details class="acc" id="sec-connection">
+      <summary><h2>Connection</h2><span class="acc-hint muted">Saved connections.</span></summary>
+      <div id="clients" class="grid"></div>
+
+      <details class="sub">
+        <summary><strong>Add one server by hand</strong></summary>
+        <p class="muted">Single links for apps that don't take subscriptions.</p>
+        <div class="field" style="max-width:320px">
+          <label for="link-client">Show links for</label>
+          <select id="link-client"></select>
+        </div>
+        <div id="links"></div>
+      </details>
+    </details>
+
+    <details class="acc" id="sec-outbound">
+      <summary><h2>Routing</h2><span class="acc-hint muted">How Trinity sends traffic.</span><span id="save-note" class="acc-note" aria-live="polite"></span></summary>
+
+      <div class="sub">
+        <div class="field" style="max-width:320px">
+          <label for="ob-mode">Mode</label>
+          <div class="help">How traffic leaves this deployment.</div>
+          <select id="ob-mode">
+            <option value="off">Off: direct dial</option>
+            <option value="proxyIp">Proxy-IP: Custom</option>
+            <option value="pool">Proxy Pool: Location</option>
+            <option value="nat64">NAT64: experimental</option>
+          </select>
+        </div>
+
+        <div id="ob-proxy" class="hidden">
+          <div class="field">
+            <label for="ob-proxies">Proxy candidates</label>
+            <div class="help">One address or hostname per line. Tried in order.</div>
+            <textarea id="ob-proxies" rows="4" spellcheck="false" placeholder="1.2.3.4&#10;edge.example.com"></textarea>
+          </div>
+          <details style="margin:.5rem 0">
+            <summary class="muted">Advanced</summary>
+            <div class="field" style="max-width:160px;margin-top:.5rem">
+              <label for="ob-attempts">Max attempts</label>
+              <div class="help">How many candidates to try before giving up (1–8).</div>
+              <input id="ob-attempts" type="number" min="1" max="8" value="3">
+            </div>
+            <div class="row" style="margin-top:.4rem">
+              <button type="button" id="ob-unpin">Unpin / Auto</button>
+              <button type="button" id="ob-probe">Test manual candidates</button>
+              <span id="ob-probe-note" class="muted"></span>
+            </div>
+            <div id="ob-health" class="field" style="margin-top:.5rem"></div>
+          </details>
+        </div>
+
+        <div id="ob-nat64" class="hidden">
+          <div class="field">
+            <label for="ob-prefixes">NAT64 prefixes</label>
+            <div class="help">One /96 prefix per line. The first valid one
+               is used; <code>64:ff9b::/96</code> is the default if none apply.</div>
+            <textarea id="ob-prefixes" rows="3" spellcheck="false" placeholder="64:ff9b::/96"></textarea>
+          </div>
+          <p class="muted sev-degraded">Experimental: not working on workers.dev
+             as of 2026-08. Proxy IP is the working path.</p>
+        </div>
+      </div>
+    </details>
+
+    <details class="acc" id="sec-proxyip">
+      <summary><h2>Proxy Pool</h2><span class="acc-hint muted">Verified feed.</span></summary>
+      <div class="sub hidden" id="cat-card">
+        <div class="spread">
+          <h3 style="margin:0">Proxy-IP Pool</h3>
+          <span class="st st-ready" id="cat-status">never synced</span>
+        </div>
+        <p class="muted" style="margin:.3rem 0 .5rem">
+          <span id="cat-countries">—</span> locations ·
+          <span id="cat-endpoints">—</span> verified ·
+          last sync <span id="cat-sync-time">—</span></p>
+        <div class="field" style="max-width:340px">
+          <label for="cat-country">Location</label>
+          <select id="cat-country">
+            <option value="">Auto: spread across locations</option>
+          </select>
+          <div class="help">Only this location's verified candidates.</div>
+        </div>
+        <p class="muted" style="margin:.2rem 0 .4rem">
+          <strong id="cat-runtime-count">0</strong> runtime candidates ·
+          source <span id="cat-runtime-loc">AUTO</span> · revision
+          <span id="cat-rev" class="mono">—</span></p>
+        <div id="cat-runtime" class="cand-list"></div>
+        <div id="cat-fallback" class="st st-warning" style="margin:.4rem 0 .2rem"></div>
+        <div class="row" style="margin-top:.4rem">
+          <button type="button" id="cat-sync-btn" class="primary">Sync feed</button>
+          <span id="cat-note" class="muted"></span>
+        </div>
+      </div>
+    </details>
+
+    <details class="acc" id="sec-advanced">
+      <summary><h2>Advanced</h2><span class="acc-hint muted">Exports · reachability · diagnostics</span><span class="muted mono" style="font-size:.72rem" id="app-version-badge"></span></summary>
+
+      <div class="split">
+        <aside>
+          <div class="sub">
+            <div class="spread">
+              <h3>Connections</h3>
+              <button type="button" id="add-node">Add connection</button>
+            </div>
+            <div id="nodelist" class="nodelist"></div>
+          </div>
+        </aside>
+
+        <div>
+          <div class="sub">
+            <div class="field" style="max-width:320px">
+              <label for="editor-client">Checking against</label>
+              <div class="help">Warnings below match this app.</div>
+              <select id="editor-client"></select>
+            </div>
+            <div id="findings"></div>
+          </div>
+
+          <div class="sub">
+            <h3>Settings</h3>
+            <div id="controls"></div>
+            <div class="row" style="margin-top:.6rem">
+              <button type="button" id="delete-node" class="danger">Delete this connection</button>
+            </div>
+          </div>
+
+          <div class="sub">
+            <h3>What each app receives</h3>
+            <table id="matrix"></table>
+          </div>
+        </div>
+      </div>
+
+
+      <div class="sub">
+        <h3>Enhanced reachability</h3>
+        <div class="field">
+          <div class="row" style="gap:.7rem;justify-content:flex-start">
+            <span class="switch">
+              <input type="checkbox" id="enh-reach" role="switch">
+              <span class="track" aria-hidden="true"></span>
+            </span>
+            <label for="enh-reach" style="margin:0">Enhanced reachability</label>
+          </div>
+          <div class="help">Harder-to-interrupt TLS settings for restrictive networks.</div>
+        </div>
+        <details>
+          <summary class="muted">What each app receives</summary>
+          <ul class="muted" style="margin:.3rem 0 0 1.2rem">
+            <li>Xray apps (v2rayN/v2rayNG): TLS ClientHello fragmentation +
+                browser TLS fingerprint (full config only).</li>
+            <li>sing-box / Mihomo apps (Hiddify, Karing, Clash): browser TLS
+                fingerprint.</li>
+          </ul>
+        </details>
+      </div>
+
+      <div class="sub">
+        <h3>Share &amp; export</h3>
+        <div class="row" style="margin-bottom:.6rem">
+          <div style="min-width:200px;flex:1"><select id="export-client"></select></div>
+          <div style="min-width:200px;flex:1">
+            <select id="export-shape">
+              <option value="base64">Subscription body (what the URL returns)</option>
+              <option value="links">Share links, one per line</option>
+              <option value="config">Full configuration file</option>
+            </select>
+          </div>
+          <button type="button" id="export-run">Show</button>
+          <button type="button" id="export-copy">Copy</button>
+        </div>
+        <div id="export-note" class="muted"></div>
+        <textarea id="export-body" readonly spellcheck="false"></textarea>
+      </div>
+    </details>
+  </main>
+
+
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+// Trinity Panel release version (shown only as the Advanced badge).
+const APP_VERSION = "1.9.3";
+{
+  const badge = document.getElementById("app-version-badge");
+  if (badge) badge.textContent = `v${APP_VERSION}`;
+}
+
+// The panel lives under a secret prefix, so every request is built from the
+// path this page was served on rather than from a hardcoded root.
+const BASE = location.pathname.replace(/\/+$/, "");
+const api = (p) => `${BASE}/api/${p}`;
+
+let STATE = null;      // last /api/state response
+let NODES = [];        // working copy; saved as a whole
+let CURRENT = 0;       // index into NODES
+let OUTBOUND = null;   // working copy of outbound routing config
+let DIRTY = false;
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, kids = []) => {
+  const n = Object.assign(document.createElement(tag), props);
+  // Created buttons never submit a surrounding form by default — a fresh
+  // <button> is ALREADY type="submit", so the type is always forced here
+  // (V24.6.8 §8: the invariant lives at the factory, not per caller).
+  if (tag === "button") n.type = "button";
+  for (const k of [].concat(kids)) n.append(k);
+  return n;
+};
+
+function toast(message) {
+  const t = $("toast");
+  t.textContent = message;
+  t.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove("show"), 1800);
+}
+// Manually dismissible (spec 14): click or Escape closes the current toast.
+$("toast").onclick = () => $("toast").classList.remove("show");
+
+async function copy(text, what) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`${what} copied`);
+  } catch {
+    // Clipboard access is refused outside a secure context and in some
+    // embedded browsers. Selecting the text is a worse experience but one the
+    // user can still complete, which silence is not.
+    const box = el("textarea", { value: text, style: "position:fixed;opacity:0" });
+    document.body.append(box);
+    box.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    box.remove();
+    toast(ok ? `${what} copied` : "Copy it by hand — the browser refused");
+  }
+}
+
+function copyButton(text, what, label = "Copy") {
+  const b = el("button", { textContent: label });
+  b.onclick = () => copy(text, what);
+  return b;
+}
+
+// A QR toggle, used for both subscription links and single connections.
+function qrToggle(query, alt) {
+  const box = el("div", { style: "margin-top:.6rem" });
+  const btn = el("button", { textContent: "Show QR" });
+  btn.onclick = () => {
+    if (box.firstChild) {
+      box.textContent = "";
+      btn.textContent = "Show QR";
+      return;
+    }
+    box.append(el("img", { className: "qr", alt, src: api(`qr?${query}`) }));
+    btn.textContent = "Hide QR";
+  };
+  return { btn, box };
+}
+
+// ---- requests --------------------------------------------------------------
+
+//  state fetches carry the panel's LOCAL location selection so the
+// runtime preview derives from the UI state, not the persisted config. The
+// relay itself keeps dialing from the SAVED config until Save succeeds.
+function statePath() {
+  const cc = (OUTBOUND && OUTBOUND.catalogCountry || "").toUpperCase();
+  return cc.length === 2 ? `state?preview_country=${encodeURIComponent(cc)}` : "state";
+}
+
+async function send(path, options = {}) {
+  const res = await fetch(api(path), {
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  let body = null;
+  try { body = await res.json(); } catch { /* the decoy page, or no body */ }
+  if (!res.ok) throw new Error(body?.error || "That did not work.");
+  return body;
+}
+
+// ---- sign in ---------------------------------------------------------------
+
+$("reveal").onclick = () => {
+  const shown = $("password").type === "text";
+  $("password").type = shown ? "password" : "text";
+  $("reveal").setAttribute("aria-pressed", String(!shown));
+  $("reveal").setAttribute("aria-label", shown ? "Show password" : "Hide password");
+  $("password").focus();
+};
+
+// Clear a stale failure as soon as the operator starts correcting it: leaving
+// the old message up while they retype reads as though the new attempt failed.
+$("password").addEventListener("input", () => { $("signin-error").textContent = ""; });
+
+$("signin-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const form = $("signin-form");
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit.disabled) return;
+  submit.disabled = true;
+  submit.innerHTML = SPINNER + "Signing in…";
+  form.setAttribute("aria-busy", "true");
+  $("signin-error").textContent = "";
+  const pw = $("password").value;
+  try {
+    await send("login", {
+      method: "POST",
+      body: JSON.stringify({ password: pw }),
+    });
+    $("password").value = "";
+    await boot();
+  } catch (err) {
+    // Spec 16: never surface JS/WASM internals or status codes. Wrong password and
+    // network trouble read differently; anything unrecognised reads as the latter.
+    const m = String(err && err.message ? err.message : "");
+    $("signin-error").textContent = /password|credential/i.test(m)
+      ? "Sign-in failed. Check your credentials."
+      : "Couldn’t sign in. Try again.";
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "Sign in";
+    form.removeAttribute("aria-busy");
+  }
+};
+
+$("signout").onclick = async () => {
+  DIRTY = false;
+  try { await send("logout", { method: "POST" }); } catch { /* leaving anyway */ }
+  location.reload();
+};
+
+// ---- boot ------------------------------------------------------------------
+
+async function boot() {
+  try {
+    STATE = await send(statePath());
+  } catch {
+    $("app").classList.add("hidden");
+    $("signin").classList.remove("hidden");
+    // Same one-play reveal for the sign-in title (P1-4); reduced-motion skips.
+    if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      const t = document.querySelector(".signin-title");
+      if (t) {
+      t.classList.remove("title-reveal");
+      void t.offsetWidth;
+      t.classList.add("title-reveal");
+      }
+    }
+    $("password").focus();
+    return;
+  }
+  $("signin").classList.add("hidden");
+  $("app").classList.remove("hidden");
+
+  NODES = structuredClone(STATE.nodes);
+  OUTBOUND = structuredClone(STATE.outbound ?? { mode: "off", proxyCandidates: [], nat64Prefixes: [], maxProxyAttempts: 3, catalogPool: false, catalogCountry: "", verifiedCatalogCandidates: [] });
+  HEALTH = structuredClone(STATE.proxyHealth ?? []);
+  CURRENT = 0;
+  DIRTY = false;
+  $("save").disabled = true;
+
+  $("host").textContent = STATE.host;
+
+  const banner = $("banner");
+  banner.textContent = "";
+  if (STATE.warning) {
+    banner.append(el("div", { className: "banner sev-degraded", textContent: STATE.warning }));
+  }
+
+  fillClientSelects();
+  renderClients();
+  renderNodeList();
+  renderOutbound();
+  renderCatalog();
+  // State is camelCase on the way in; the save payload names its fields
+  // after the Rust struct, which is snake_case.
+  $("enh-reach").checked = !!STATE.enhancedReachability;
+  await renderEditor();
+  renderLinks();
+  // ObsidianUI Rectangular Text Reveal on the page title: play once per load,
+  // only when motion is welcome (reduced-motion shows the title instantly).
+  if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    const t = $("panel-title");
+    t.classList.remove("title-reveal");
+    t.style.setProperty("--reveal-w", `${Math.min(t.offsetWidth, 260)}px`);
+    void t.offsetWidth;
+    t.classList.add("title-reveal");
+  }
+}
+
+// ---- outbound routing ------------------------------------------------------
+//
+// Server-side relay behaviour, so it is not part of a node and does not appear
+// in any share link. Kept as one working copy that `save` collects from the
+// form, the same way NODES is collected from the editor.
+
+// Last measured health per candidate, newest first. Replaced wholesale by a
+// probe; never merged, so what is shown is always one consistent measurement.
+let HEALTH = [];
+
+function renderOutbound() {
+  const mode = OUTBOUND.mode || "off";
+  $("ob-mode").value = mode;
+  if ($("ob-mode")._syncEsel) $("ob-mode")._syncEsel();
+  $("ob-proxies").value = (OUTBOUND.proxyCandidates || []).join("\n");
+  $("ob-prefixes").value = (OUTBOUND.nat64Prefixes || []).join("\n");
+  $("ob-attempts").value = OUTBOUND.maxProxyAttempts ?? 3;
+  renderHealth();
+  showOutboundMode(mode);
+}
+
+/// The candidate list: what was measured, and which one is pinned.
+///
+/// Renders from HEALTH, which the server sends on load and the probe refreshes,
+/// so an operator who never probes sees "not measured yet" instead of an empty
+/// box that looks broken.
+function renderHealth() {
+  const box = $("ob-health");
+  box.textContent = "";
+  if (!HEALTH.length) {
+    box.append(el("div", { className: "help", textContent: "No candidates measured yet. Measure to see country, latency and status." }));
+    return;
+  }
+  const pinned = (OUTBOUND.pinnedProxy || "").toLowerCase();
+  // Structured result table: one row per candidate, dial/SNI/timing columns.
+  // Source-listed is NOT healthy — health comes only from these probes.
+  const table = el("table", { style: "width:100%;border-collapse:collapse;font-size:.92rem" });
+  const head = el("tr");
+  for (const h of ["", "Candidate", "Dial", "TCP", "Probe", "RTT", "Exit country", "Status", "Reason"]) {
+    head.append(el("th", { style: "text-align:left;padding:.25rem .5rem;border-bottom:1px solid var(--border)", textContent: h }));
+  }
+  table.append(head);
+  let healthyCount = 0;
+  for (const r of HEALTH) {
+    const tr = el("tr");
+    const pin = el("input", { type: "radio", name: "ob-pin", value: r.host });
+    pin.checked = pinned === r.host.toLowerCase();
+    pin.title = "Always try this candidate first";
+    pin.onchange = () => { OUTBOUND.pinnedProxy = r.host; renderHealth(); markDirty(); };
+    const pinTd = el("td", { style: "padding:.25rem .5rem" });
+    pinTd.append(pin);
+    tr.append(pinTd);
+    const mark = !r.measured ? "·" : r.healthy ? "✓" : "✗";
+    const cls = !r.measured ? "muted" : r.healthy ? "" : "sev-degraded";
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: cls, textContent: `${r.host}${r.port ? ":" + r.port : ""}` }));
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.dialIp ? (r.dialIp.includes(":") ? r.dialIp : `${r.dialIp}:${r.port ?? 443}`) : "—" }));
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: r.tcpMs != null ? "" : "muted", textContent: r.tcpMs != null ? `PASS ${r.tcpMs} ms` : "FAIL" }));
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: r.probeMs != null ? "" : "muted", textContent: r.probeMs != null ? `PASS ${r.probeMs} ms` : "FAIL" }));
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.measured ? `${r.latencyMs} ms` : "—" }));
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.ok ? `${r.country || "?"}${r.colo ? " · " + r.colo : ""}` : "—" }));
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: cls, textContent: !r.measured ? "unknown" : r.healthy ? "healthy" : "failed" }));
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", title: r.error || "", textContent: r.error ? (r.error.length > 40 ? r.error.slice(0, 40) + "…" : r.error) : "—" }));
+    if (r.healthy) healthyCount++;
+    table.append(tr);
+  }
+  box.append(table);
+  if (HEALTH.length && !healthyCount) {
+    const warn = el("div", { className: "banner sev-degraded", style: "margin-top:.5rem" });
+    warn.append(el("span", { textContent: "No usable Proxy-IP candidates found. Source listing is not usability — the catalog provides candidates only." }));
+    box.append(warn);
+  }
+  box.append(el("div", { className: "help", style: "margin-top:.4rem", textContent: "TCP / TLS probe (not ICMP ping). Dial = the address the socket actually connected to; Probe = TLS handshake + trace round trip. Direct is always tried before any proxy." }));
+}
+
+/// Only the fields the selected mode actually uses are shown. A visible
+/// NAT64 box in Proxy IP mode reads as "this applies too", and it does not.
+function showOutboundMode(mode) {
+  $("ob-proxy").classList.toggle("hidden", mode !== "proxyIp");
+  $("ob-nat64").classList.toggle("hidden", mode !== "nat64");
+  // Pool mode: the Proxy-IP Pool card carries the Location control; the
+  // manual editor stays hidden so sources never mix.
+  const poolCard = $("cat-card");
+  if (poolCard) poolCard.classList.toggle("hidden", mode !== "pool");
+}
+
+/// Read the form back into the shape the API expects.
+///
+/// Blank lines are dropped here rather than sent: the relay would skip them
+/// anyway, and a stored config full of empty strings is harder to read back.
+function collectOutbound() {
+  const lines = (id) => $(id).value.split("\n").map((s) => s.trim()).filter(Boolean);
+  const attempts = Number.parseInt($("ob-attempts").value, 10);
+  const candidates = lines("ob-proxies");
+  const mode = $("ob-mode").value;
+  return {
+    mode,
+    proxyCandidates: candidates,
+    nat64Prefixes: lines("ob-prefixes"),
+    maxProxyAttempts: Number.isFinite(attempts) ? Math.min(8, Math.max(1, attempts)) : 3,
+    // A pin for a candidate that has since been removed from the textarea is
+    // dropped here: the server refuses one that is not in the list.
+    pinnedProxy: candidates.includes((OUTBOUND.pinnedProxy || "").trim()) ? (OUTBOUND.pinnedProxy || "").trim() : "",
+    //  explicit mode is the single contract. The legacy
+    // catalogPool flag is no longer sent — it triggered Settings::parse's
+    // legacy migration, which silently rewrote Custom saves back to Pool.
+    catalogPool: mode === "pool",
+    catalogCountry: (OUTBOUND.catalogCountry || "").trim().toUpperCase(),
+    verifiedCatalogCandidates: OUTBOUND.verifiedCatalogCandidates || [],
+  };
+}
+
+
+// ---- Proxy-IP catalog ------------------------------------------------------
+// Panel state only: the catalog snapshot lives server-side; the panel shows
+// its metadata and the operator's preference (persisted via outbound config).
+
+
+// ISO-3166 alpha-2 → flag emoji + English name (feed countries only; unknown
+// codes fall back to the raw code — never invented).
+function flag(code) {
+  if (!/^[A-Za-z]{2}$/.test(code)) return "";
+  return String.fromCodePoint(...[...code.toUpperCase()].map((ch) => 0x1f1e6 + ch.charCodeAt(0) - 65));
+}
+const COUNTRY_NAMES = {
+  AD:"Andorra",
+  AE:"United Arab Emirates",
+  AF:"Afghanistan",
+  AG:"Antigua and Barbuda",
+  AI:"Anguilla",
+  AL:"Albania",
+  AM:"Armenia",
+  AO:"Angola",
+  AQ:"Antarctica",
+  AR:"Argentina",
+  AS:"American Samoa",
+  AT:"Austria",
+  AU:"Australia",
+  AW:"Aruba",
+  AX:"Åland Islands",
+  AZ:"Azerbaijan",
+  BA:"Bosnia and Herzegovina",
+  BB:"Barbados",
+  BD:"Bangladesh",
+  BE:"Belgium",
+  BF:"Burkina Faso",
+  BG:"Bulgaria",
+  BH:"Bahrain",
+  BI:"Burundi",
+  BJ:"Benin",
+  BL:"Saint Barthélemy",
+  BM:"Bermuda",
+  BN:"Brunei Darussalam",
+  BO:"Bolivia",
+  BQ:"Bonaire, Sint Eustatius and Saba",
+  BR:"Brazil",
+  BS:"Bahamas",
+  BT:"Bhutan",
+  BV:"Bouvet Island",
+  BW:"Botswana",
+  BY:"Belarus",
+  BZ:"Belize",
+  CA:"Canada",
+  CC:"Cocos (Keeling) Islands",
+  CD:"DR Congo",
+  CF:"Central African Republic",
+  CG:"Congo",
+  CH:"Switzerland",
+  CI:"Côte d’Ivoire",
+  CK:"Cook Islands",
+  CL:"Chile",
+  CM:"Cameroon",
+  CN:"China",
+  CO:"Colombia",
+  CR:"Costa Rica",
+  CU:"Cuba",
+  CV:"Cabo Verde",
+  CW:"Curaçao",
+  CX:"Christmas Island",
+  CY:"Cyprus",
+  CZ:"Czechia",
+  DE:"Germany",
+  DJ:"Djibouti",
+  DK:"Denmark",
+  DM:"Dominica",
+  DO:"Dominican Republic",
+  DZ:"Algeria",
+  EC:"Ecuador",
+  EE:"Estonia",
+  EG:"Egypt",
+  EH:"Western Sahara",
+  ER:"Eritrea",
+  ES:"Spain",
+  ET:"Ethiopia",
+  FI:"Finland",
+  FJ:"Fiji",
+  FK:"Falkland Islands (Malvinas)",
+  FM:"Micronesia, Federated States of",
+  FO:"Faroe Islands",
+  FR:"France",
+  GA:"Gabon",
+  GB:"United Kingdom",
+  GD:"Grenada",
+  GE:"Georgia",
+  GF:"French Guiana",
+  GG:"Guernsey",
+  GH:"Ghana",
+  GI:"Gibraltar",
+  GL:"Greenland",
+  GM:"Gambia",
+  GN:"Guinea",
+  GP:"Guadeloupe",
+  GQ:"Equatorial Guinea",
+  GR:"Greece",
+  GS:"South Georgia and the South Sandwich Islands",
+  GT:"Guatemala",
+  GU:"Guam",
+  GW:"Guinea-Bissau",
+  GY:"Guyana",
+  HK:"Hong Kong",
+  HM:"Heard Island and McDonald Islands",
+  HN:"Honduras",
+  HR:"Croatia",
+  HT:"Haiti",
+  HU:"Hungary",
+  ID:"Indonesia",
+  IE:"Ireland",
+  IL:"Israel",
+  IM:"Isle of Man",
+  IN:"India",
+  IO:"British Indian Ocean Territory",
+  IQ:"Iraq",
+  IR:"Iran, Islamic Republic of",
+  IS:"Iceland",
+  IT:"Italy",
+  JE:"Jersey",
+  JM:"Jamaica",
+  JO:"Jordan",
+  JP:"Japan",
+  KE:"Kenya",
+  KG:"Kyrgyzstan",
+  KH:"Cambodia",
+  KI:"Kiribati",
+  KM:"Comoros",
+  KN:"Saint Kitts and Nevis",
+  KP:"North Korea",
+  KR:"South Korea",
+  KW:"Kuwait",
+  KY:"Cayman Islands",
+  KZ:"Kazakhstan",
+  LA:"Laos",
+  LB:"Lebanon",
+  LC:"Saint Lucia",
+  LI:"Liechtenstein",
+  LK:"Sri Lanka",
+  LR:"Liberia",
+  LS:"Lesotho",
+  LT:"Lithuania",
+  LU:"Luxembourg",
+  LV:"Latvia",
+  LY:"Libya",
+  MA:"Morocco",
+  MC:"Monaco",
+  MD:"Moldova",
+  ME:"Montenegro",
+  MF:"Saint Martin (French part)",
+  MG:"Madagascar",
+  MH:"Marshall Islands",
+  MK:"North Macedonia",
+  ML:"Mali",
+  MM:"Myanmar",
+  MN:"Mongolia",
+  MO:"Macao",
+  MP:"Northern Mariana Islands",
+  MQ:"Martinique",
+  MR:"Mauritania",
+  MS:"Montserrat",
+  MT:"Malta",
+  MU:"Mauritius",
+  MV:"Maldives",
+  MW:"Malawi",
+  MX:"Mexico",
+  MY:"Malaysia",
+  MZ:"Mozambique",
+  NA:"Namibia",
+  NC:"New Caledonia",
+  NE:"Niger",
+  NF:"Norfolk Island",
+  NG:"Nigeria",
+  NI:"Nicaragua",
+  NL:"Netherlands",
+  NO:"Norway",
+  NP:"Nepal",
+  NR:"Nauru",
+  NU:"Niue",
+  NZ:"New Zealand",
+  OM:"Oman",
+  PA:"Panama",
+  PE:"Peru",
+  PF:"French Polynesia",
+  PG:"Papua New Guinea",
+  PH:"Philippines",
+  PK:"Pakistan",
+  PL:"Poland",
+  PM:"Saint Pierre and Miquelon",
+  PN:"Pitcairn",
+  PR:"Puerto Rico",
+  PS:"Palestine, State of",
+  PT:"Portugal",
+  PW:"Palau",
+  PY:"Paraguay",
+  QA:"Qatar",
+  RE:"Réunion",
+  RO:"Romania",
+  RS:"Serbia",
+  RU:"Russia",
+  RW:"Rwanda",
+  SA:"Saudi Arabia",
+  SB:"Solomon Islands",
+  SC:"Seychelles",
+  SD:"Sudan",
+  SE:"Sweden",
+  SG:"Singapore",
+  SH:"Saint Helena, Ascension and Tristan da Cunha",
+  SI:"Slovenia",
+  SJ:"Svalbard and Jan Mayen",
+  SK:"Slovakia",
+  SL:"Sierra Leone",
+  SM:"San Marino",
+  SN:"Senegal",
+  SO:"Somalia",
+  SR:"Suriname",
+  SS:"South Sudan",
+  ST:"Sao Tome and Principe",
+  SV:"El Salvador",
+  SX:"Sint Maarten (Dutch part)",
+  SY:"Syria",
+  SZ:"Eswatini",
+  TC:"Turks and Caicos Islands",
+  TD:"Chad",
+  TF:"French Southern Territories",
+  TG:"Togo",
+  TH:"Thailand",
+  TJ:"Tajikistan",
+  TK:"Tokelau",
+  TL:"Timor-Leste",
+  TM:"Turkmenistan",
+  TN:"Tunisia",
+  TO:"Tonga",
+  TR:"Türkiye",
+  TT:"Trinidad and Tobago",
+  TV:"Tuvalu",
+  TW:"Taiwan",
+  TZ:"Tanzania",
+  UA:"Ukraine",
+  UG:"Uganda",
+  UM:"United States Minor Outlying Islands",
+  US:"United States",
+  UY:"Uruguay",
+  UZ:"Uzbekistan",
+  VA:"Holy See (Vatican City State)",
+  VC:"Saint Vincent and the Grenadines",
+  VE:"Venezuela",
+  VG:"Virgin Islands, British",
+  VI:"Virgin Islands, U.S.",
+  VN:"Vietnam",
+  VU:"Vanuatu",
+  WF:"Wallis and Futuna",
+  WS:"Samoa",
+  YE:"Yemen",
+  YT:"Mayotte",
+  ZA:"South Africa",
+  ZM:"Zambia",
+  ZW:"Zimbabwe",
+};
+
+function renderCatalog() {
+  const c = STATE.catalog || null;
+  const status = $("cat-status");
+  status.textContent = !c ? "never synced"
+    : c.contentRevision ? "READY: verified feed" : "ERROR: unavailable";
+  status.className = "st " + (!c ? "" : c.contentRevision ? "st-ready" : "st-error");
+  $("cat-rev").textContent = c && c.contentRevision ? c.contentRevision.slice(0, 12) + "…" : "—";
+  $("cat-sync-time").textContent = c && c.fetchedAt ? new Date(c.fetchedAt).toLocaleString() : "—";
+  setVal("cat-countries", c ? String(c.countryCount ?? "—") : "—");
+  setVal("cat-endpoints", c ? String(c.endpointCount ?? "—") : "—");
+
+  // Country options: Auto + the countries the catalog actually has.
+  const saved = (OUTBOUND.catalogCountry || "").toUpperCase();
+  const sel = $("cat-country");
+  sel.textContent = "";
+  sel.append(el("option", { value: "", textContent: "Auto (catalog spread)" }));
+  const counts = (c && c.countryCounts) || {};
+  for (const code of (c && c.countries) || []) {
+    const n = counts[code];
+    const o = el("option", {
+      value: code,
+      textContent: `${flag(code)} ${COUNTRY_NAMES[code] || code}`,
+    });
+    // Structured row data for the dropdown renderer (spec 6): code + count.
+    if (n != null) o.dataset.sub = `${code} · ${n} verified`;
+    sel.append(o);
+  }
+  sel.value = saved;
+  if (sel.value !== saved) { sel.value = ""; OUTBOUND.catalogCountry = ""; }
+  if (sel._syncEsel) sel._syncEsel();
+
+  // Local evidence for the selected location's catalog candidates: measured
+  // rows carry a port (configured candidates never do). Source-listed is NOT
+  // healthy — these counters only count Trinity's own probe results.
+  // Runtime candidates: the exact list the routing engine dials, derived
+  // server-side from the verified snapshot for the selected mode/location.
+  // Runtime pool summary + candidate ROWS (V24.5.5 spec 13): one row per
+  // candidate — index, monospace host:port, copy button, source badge.
+  const runtime = (STATE.runtimeCandidates || []);
+  setVal("cat-runtime-count", String(runtime.length));
+  const listBox = $("cat-runtime");
+  listBox.textContent = "";
+  listBox.className = "cand-list";
+  if (!runtime.length) {
+    listBox.append(el("p", { className: "muted", textContent: "No verified candidates for this location." }));
+  }
+  const loc = (OUTBOUND.catalogCountry || "AUTO").toUpperCase();
+  runtime.forEach((h, i) => {
+    const row = el("div", { className: "cand-row" });
+    row.append(el("span", { className: "cand-idx", textContent: String(i + 1) }));
+    row.append(el("code", { className: "cand-host", textContent: h }));
+    row.append(el("span", { className: "st st-ready", textContent: "verified" }));
+    const cp = el("button", {
+      type: "button", className: "cand-copy", textContent: "Copy",
+      title: `Copy ${h}`, "aria-label": `Copy ${h}`,
+    });
+    cp.onclick = () => copy(h, h);
+    row.append(cp);
+    listBox.append(row);
+  });
+  $("cat-runtime-loc").textContent = (OUTBOUND.catalogCountry || "AUTO").toUpperCase();
+  // V24.4.4 runtime fallback (spec 5): warning chip, no blinking. The
+  // configured location is never rewritten.
+  const fb = STATE.fallback;
+  const fbEl = $("cat-fallback");
+  if (fbEl) {
+    fbEl.textContent = (fb && fb.active)
+      ? `AUTO fallback: ${fb.active} (primary ${fb.primary || OUTBOUND.catalogCountry})`
+      : "";
+    fbEl.className = (fb && fb.active) ? "st st-warning" : "";
+  }
+}
+
+$("cat-country").onchange = () => {
+  OUTBOUND.catalogCountry = ($("cat-country").value || "").trim().toUpperCase();
+  // Verified candidates are location-scoped; clear on switch.
+  OUTBOUND.verifiedCatalogCandidates = [];
+  markDirty();
+  //  the runtime preview follows the LOCAL selection immediately
+  // (read-only server derivation — no KV write, Save still owns persistence).
+  send(statePath()).then((st) => { if (st) { STATE = st; renderCatalog(); } })
+    .catch(() => { /* preview refresh is best-effort */ });
+};
+$("cat-sync-btn").onclick = async () => {
+  const note = $("cat-note");
+  const btn = $("cat-sync-btn");
+  if (btn.disabled) return;
+  setBusy(btn, true, "Syncing…");
+  note.textContent = "";
+  try {
+    const body = await send("catalog-sync", { method: "POST", body: "{}" });
+    if (!body || !body.ok) {
+      note.textContent = "";
+      note.append(errorWithDetails((body && body.error) || "unknown error"));
+      note.append(el("span", { className: "muted", textContent: " Previous feed kept. " }));
+      const retry = el("button", { type: "button", className: "cand-copy", textContent: "Retry" });
+      retry.onclick = () => $("cat-sync-btn").click();
+      note.append(retry);
+      toast("Sync failed. Previous feed kept.");
+      return;
+    }
+    if (!body.changed) {
+      note.textContent = "Already up to date.";
+      toast("Already up to date");
+      return;
+    }
+    note.textContent = `Synced: ${body.endpointCount} verified, ${body.countryCount} locations`;
+    toast(`Synced: ${body.endpointCount} verified`);
+  } catch (e) {
+    note.textContent = "";
+    note.append(errorWithDetails(e));
+    note.append(el("span", { className: "muted", textContent: " Previous feed kept." }));
+    toast("Sync failed. Previous feed kept.");
+  } finally {
+    setBusy(btn, false, "Sync feed");
+    //  Sync refreshes the FEED only. It must never touch the local
+    // Outbound selection (an unsaved US must stay US, even when DE is saved).
+    // Refresh STATE (feed meta + runtime preview inputs) but keep OUTBOUND.
+    try {
+      STATE = await send(statePath());
+      if (STATE) renderCatalog();
+    } catch { /* keep the sync message visible */ }
+  }
+};
+
+$("ob-mode").onchange = () => {
+  showOutboundMode($("ob-mode").value);
+  markDirty();
+};
+
+$("enh-reach").onchange = markDirty;
+for (const id of ["ob-proxies", "ob-prefixes", "ob-attempts"]) {
+  $(id).oninput = markDirty;
+}
+
+$("ob-unpin").onclick = () => {
+  OUTBOUND.pinnedProxy = "";
+  renderHealth();
+  markDirty();
+};
+
+$("ob-probe").onclick = async () => {
+  const note = $("ob-probe-note");
+  note.textContent = "measuring…";
+  try {
+    const body = await send("probe-proxy", { method: "POST", body: "{}" });
+    if (!body || !body.ok) {
+      note.textContent = (body && body.error) || "probe failed";
+      return;
+    }
+    HEALTH = (body.results || []).map((r) => ({ ...r, measured: true }));
+    // Manual-candidate probe only. Catalog candidates are verified by the
+    // GitHub scanner and flow to runtime straight from the verified feed.
+    renderHealth();
+    const okCount = HEALTH.filter((r) => r.healthy).length;
+    note.textContent = HEALTH.length ? `measured ${HEALTH.length}, ${okCount} healthy` : "no candidates";
+    // Health is persisted by the backend probe route itself (health KV doc,
+    // shared with the dial path). The panel must NOT issue a settings PUT
+    // here: V24.5.9 spec 3 — only Save may persist OutboundConfig, and a
+    // PUT from this handler would silently persist an UNSAVED location.
+  } catch (e) {
+    note.textContent = String(e);
+  }
+};
+
+function fillClientSelects() {
+  for (const id of ["link-client", "editor-client", "export-client"]) {
+    const sel = $(id);
+    const keep = sel.value;
+    sel.textContent = "";
+    for (const c of STATE.clients) {
+      sel.append(el("option", { value: c.slug, textContent: c.name }));
+    }
+    if (keep) sel.value = keep;
+  }
+}
+
+// ---- simple view -----------------------------------------------------------
+
+// REAL app icons (V24.5.6 spec 12): fetched from official repositories
+// (SagerNet/sing-box docs icon; hiddify-app logo — inline data URIs, no CDN
+// at runtime). Apps without a usable official vector asset use the neutral
+// monogram tile (spec 12 fallback rule; v2rayN only ships a 61KB .ico).
+// Xray official logo (XTLS/Xray-docs-next, docs/public/logo-light.svg), inlined.
+const XRAY_LOGO_SVG = `<svg viewBox="0 0 1000 1000" fill="currentColor" aria-hidden="true"><polygon points="530,530 900,530 650,650 530,1000"/><polygon points="470,530 470,900 350,650 0,530"/><polygon points="530,470 530,100 650,350 1000,470"/><polygon points="470,470 100,470 350,350 470,0"/></svg>`;
+
+const APP_ICONS = {
+  "sing-box": "data:image/svg+xml;base64,PHN2ZyBjbGFzcz0iYXBwLXN2ZyIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB2aWV3Qm94PSIxNDggOTAgNzI4IDgyMCI+CiAgPGRlZnM+CiAgICA8bGluZWFyR3JhZGllbnQgaWQ9ImJnMjUiIHgxPSIwIiB5MT0iMCIgeDI9IjAiIHkyPSIxIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjMjQyRjM3Ii8+CiAgICAgIDxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzBEMTMxNyIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICAgIDxyYWRpYWxHcmFkaWVudCBpZD0ic3BvdDI1IiBjeD0iMC41IiBjeT0iMC41IiByPSIwLjUiPgogICAgICA8c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiM0NjU2NUYiIHN0b3Atb3BhY2l0eT0iMC40NSIvPgogICAgICA8c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiM0NjU2NUYiIHN0b3Atb3BhY2l0eT0iMCIvPgogICAgPC9yYWRpYWxHcmFkaWVudD4KICAgIDxmaWx0ZXIgaWQ9InNvZnQyNSIgeD0iLTQwJSIgeT0iLTQwJSIgd2lkdGg9IjE4MCUiIGhlaWdodD0iMTgwJSI+CiAgICAgIDxmZUdhdXNzaWFuQmx1ciBzdGREZXZpYXRpb249IjE4Ii8+CiAgICA8L2ZpbHRlcj4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0idG9wMjUiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIiB4MT0iMzMwIiB5MT0iMzIwIiB4Mj0iNzAwIiB5Mj0iNDkwIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjNDQ1ODYzIi8+CiAgICAgIDxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzM5NEM1NyIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0ibGVmdDI1IiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSIgeDE9IjI2OS41IiB5MT0iNDgwIiB4Mj0iNTEyIiB5Mj0iNzIwIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjMjYzMjNBIi8+CiAgICAgIDxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzFGMkEzMSIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0icmlnaHQyNSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiIHgxPSI1MTIiIHkxPSI2NTAiIHgyPSI3NTQuNSIgeTI9IjUwMCI+CiAgICAgIDxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzMwNDA0QSIvPgogICAgICA8c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiMzNzQ4NTQiLz4KICAgIDwvbGluZWFyR3JhZGllbnQ+CiAgICA8ZmlsdGVyIGlkPSJncmFpbjI1IiB4PSIwIiB5PSIwIiB3aWR0aD0iMjgwIiBoZWlnaHQ9IjI4MCIgZmlsdGVyVW5pdHM9InVzZXJTcGFjZU9uVXNlIj4KICAgICAgPGZlVHVyYnVsZW5jZSB0eXBlPSJmcmFjdGFsTm9pc2UiIGJhc2VGcmVxdWVuY3k9IjAuMjIiIG51bU9jdGF2ZXM9IjQiIHNlZWQ9IjE3IiByZXN1bHQ9Im4iLz4KICAgICAgPGZlQ29sb3JNYXRyaXggaW49Im4iIHR5cGU9Im1hdHJpeCIgdmFsdWVzPSIwIDAgMCAwIDEgIDAgMCAwIDAgMSAgMCAwIDAgMCAxICAwLjQ1IDAgMCAwIC0wLjEiLz4KICAgIDwvZmlsdGVyPgogICAgPGZpbHRlciBpZD0iZ3JhaW5EMjUiIHg9IjAiIHk9IjAiIHdpZHRoPSIyODAiIGhlaWdodD0iMjgwIiBmaWx0ZXJVbml0cz0idXNlclNwYWNlT25Vc2UiPgogICAgICA8ZmVUdXJidWxlbmNlIHR5cGU9ImZyYWN0YWxOb2lzZSIgYmFzZUZyZXF1ZW5jeT0iMC4yOCIgbnVtT2N0YXZlcz0iNCIgc2VlZD0iNDEiIHJlc3VsdD0ibiIvPgogICAgICA8ZmVDb2xvck1hdHJpeCBpbj0ibiIgdHlwZT0ibWF0cml4IiB2YWx1ZXM9IjAgMCAwIDAgMC4wMiAgMCAwIDAgMCAwLjA1ICAwIDAgMCAwIDAuMDcgIDAuNDUgMCAwIDAgLTAuMSIvPgogICAgPC9maWx0ZXI+CiAgICA8Y2xpcFBhdGggaWQ9ImNsaXBUb3BEIj48cGF0aCBkPSJNNTEyIDI2MiA3NTQuNSA0MDIgNTEyIDU0MiAyNjkuNSA0MDJaIi8+PC9jbGlwUGF0aD4KICAgIDxjbGlwUGF0aCBpZD0iY2xpcExlZnREIj48cGF0aCBkPSJNMjY5LjUgNDAyIDUxMiA1NDIgNTEyIDgxMiAyNjkuNSA2NzJaIi8+PC9jbGlwUGF0aD4KICAgIDxjbGlwUGF0aCBpZD0iY2xpcFJpZ2h0RCI+PHBhdGggZD0iTTUxMiA1NDIgNzU0LjUgNDAyIDc1NC41IDY3MiA1MTIgODEyWiIvPjwvY2xpcFBhdGg+CiAgPC9kZWZzPgogIDxnIHRyYW5zZm9ybT0idHJhbnNsYXRlKC0yMjUuMjggLTI3My4yOCkgc2NhbGUoMS40NCkiPgo8IS0tIGRlZXAgY2FyZGJvYXJkIGZhY2VzIC0tPgogIDxwYXRoIGQ9Ik01MTIgMjYyIDc1NC41IDQwMiA1MTIgNTQyIDI2OS41IDQwMloiIGZpbGw9InVybCgjdG9wMjUpIi8+CiAgPHBhdGggZD0iTTI2OS41IDQwMiA1MTIgNTQyIDUxMiA4MTIgMjY5LjUgNjcyWiIgZmlsbD0idXJsKCNsZWZ0MjUpIi8+CiAgPHBhdGggZD0iTTUxMiA1NDIgNzU0LjUgNDAyIDc1NC41IDY3MiA1MTIgODEyWiIgZmlsbD0idXJsKCNyaWdodDI1KSIvPgoKICA8IS0tIHBhcGVyIGdyYWluLCBmb3Jlc2hvcnRlbmVkIHBlciBmYWNlIC0tPgogIDxnIGNsaXAtcGF0aD0idXJsKCNjbGlwVG9wRCkiPjxnIHRyYW5zZm9ybT0ibWF0cml4KDAuODY2IDAuNSAwLjg2NiAtMC41IDI2OS41IDQwMikiPgogICAgPHJlY3Qgd2lkdGg9IjI4MCIgaGVpZ2h0PSIyODAiIGZpbHRlcj0idXJsKCNncmFpbjI1KSIgb3BhY2l0eT0iMC4zMCIvPgogICAgPHJlY3Qgd2lkdGg9IjI4MCIgaGVpZ2h0PSIyODAiIGZpbHRlcj0idXJsKCNncmFpbkQyNSkiIG9wYWNpdHk9IjAuMzgiLz4KICA8L2c+PC9nPgogIDxnIGNsaXAtcGF0aD0idXJsKCNjbGlwTGVmdEQpIj48ZyB0cmFuc2Zvcm09Im1hdHJpeCgwLjg2NiAwLjUgMCAwLjk2NDI4IDI2OS41IDQwMikiPgogICAgPHJlY3Qgd2lkdGg9IjI4MCIgaGVpZ2h0PSIyODAiIGZpbHRlcj0idXJsKCNncmFpbjI1KSIgb3BhY2l0eT0iMC4yMCIvPgogICAgPHJlY3Qgd2lkdGg9IjI4MCIgaGVpZ2h0PSIyODAiIGZpbHRlcj0idXJsKCNncmFpbkQyNSkiIG9wYWNpdHk9IjAuMzQiLz4KICA8L2c+PC9nPgogIDxnIGNsaXAtcGF0aD0idXJsKCNjbGlwUmlnaHREKSI+PGcgdHJhbnNmb3JtPSJtYXRyaXgoMC44NjYgLTAuNSAwIDAuOTY0MjggNTEyIDU0MikiPgogICAgPHJlY3Qgd2lkdGg9IjI4MCIgaGVpZ2h0PSIyODAiIGZpbHRlcj0idXJsKCNncmFpbjI1KSIgb3BhY2l0eT0iMC4yNSIvPgogICAgPHJlY3Qgd2lkdGg9IjI4MCIgaGVpZ2h0PSIyODAiIGZpbHRlcj0idXJsKCNncmFpbkQyNSkiIG9wYWNpdHk9IjAuMzQiLz4KICA8L2c+PC9nPgoKICA8IS0tIGxpZCBmbGFwIHNlYW06IHR3byBsaWQgaGFsdmVzLCBwYXBlci1lZGdlIGNhdGNobGlnaHQgLS0+CiAgPHBhdGggZD0iTTM5MC43NSA0NzIgNjMzLjI1IDMzMiIgc3Ryb2tlPSIjMTQxRTI0IiBzdHJva2Utd2lkdGg9IjQiIGZpbGw9Im5vbmUiIG9wYWNpdHk9IjAuOSIvPgogIDxwYXRoIGQ9Ik0zOTAuNzUgNDcyIDYzMy4yNSAzMzIiIHN0cm9rZT0iIzZFODc5NCIgc3Ryb2tlLXdpZHRoPSIyIiBmaWxsPSJub25lIiBvcGFjaXR5PSIwLjciIHRyYW5zZm9ybT0idHJhbnNsYXRlKDAgLTMpIi8+CgogIDwhLS0gc29mdCBhbWJpZW50IG9jY2x1c2lvbiBhdCBqdW5jdGlvbnMgLS0+CiAgPHBhdGggZD0iTTI2OS41IDQwMiA1MTIgNTQyIiBzdHJva2U9IiMwQjE0MUEiIHN0cm9rZS13aWR0aD0iMTAiIG9wYWNpdHk9IjAuMjgiIGZpbHRlcj0idXJsKCNzb2Z0MjUpIiBmaWxsPSJub25lIi8+CiAgPHBhdGggZD0iTTUxMiA1NDIgNzU0LjUgNDAyIiBzdHJva2U9IiMwQjE0MUEiIHN0cm9rZS13aWR0aD0iMTAiIG9wYWNpdHk9IjAuMjIiIGZpbHRlcj0idXJsKCNzb2Z0MjUpIiBmaWxsPSJub25lIi8+CiAgPHBhdGggZD0iTTUxMiA1NDIgNTEyIDgxMiIgc3Ryb2tlPSIjMDYwRDExIiBzdHJva2Utd2lkdGg9IjkiIG9wYWNpdHk9IjAuMzAiIGZpbHRlcj0idXJsKCNzb2Z0MjUpIiBmaWxsPSJub25lIi8+CgogIDwhLS0gcGFwZXItZWRnZSBoaWdobGlnaHRzIG9uIHRoZSB0b3AgZWRnZXMgLS0+CiAgPHBhdGggZD0iTTUxMiAyNjIgNzU0LjUgNDAyIiBzdHJva2U9IiM2NjgwOEQiIHN0cm9rZS13aWR0aD0iMi41IiBmaWxsPSJub25lIi8+CiAgPHBhdGggZD0iTTUxMiAyNjIgMjY5LjUgNDAyIiBzdHJva2U9IiM1QTczN0YiIHN0cm9rZS13aWR0aD0iMi41IiBmaWxsPSJub25lIi8+CiAgPHBhdGggZD0iTTI2OS41IDQwMiA1MTIgNTQyIDc1NC41IDQwMiIgc3Ryb2tlPSIjNEU2NzczIiBzdHJva2Utd2lkdGg9IjIiIGZpbGw9Im5vbmUiIG9wYWNpdHk9IjAuOSIvPgogIDxwYXRoIGQ9Ik01MTIgNTQyIDUxMiA4MTIiIHN0cm9rZT0iIzQ0NTk2MyIgc3Ryb2tlLXdpZHRoPSIyIiBmaWxsPSJub25lIiBvcGFjaXR5PSIwLjkiLz4KCiAgPCEtLSBvcmlnaW5hbCB0d28tdG9uZSB0YXBlLCBhbGlnbmVkIHRhaWxzIC0tPgogIDxwYXRoIGQ9Ik0zNTYuOCAzNTEuNiAzOTAuNzUgMzMyIDYzMy4yNSA0NzIgNTk5LjMgNDkxLjZaIiBmaWxsPSIjOTlBQUI1Ii8+CiAgPHBhdGggZD0iTTM5MC43NSAzMzIgNDI0LjcgMzEyLjQgNjY3LjIgNDUyLjQgNjMzLjI1IDQ3MloiIGZpbGw9IiNFMUU4RUQiLz4KICA8cGF0aCBkPSJNNTk5LjMgNDkxLjYgNjMzLjI1IDQ3MiA2MzMuMjUgNTkyIDU5OS4zIDYxMS42WiIgZmlsbD0iIzgyOTZBMSIvPgogIDxwYXRoIGQ9Ik02MzMuMjUgNDcyIDY2Ny4yIDQ1Mi40IDY2Ny4yIDU3Mi40IDYzMy4yNSA1OTJaIiBmaWxsPSIjQ0NENkREIi8+CiAgPCEtLSB0YXBlIHNvZnQgc2hhZG93IG9udG8gdGhlIHBhcGVyIC0tPgogIDxwYXRoIGQ9Ik0zNjAgMzU4IDYwMi41IDQ5OCIgc3Ryb2tlPSIjMDAwMDAwIiBvcGFjaXR5PSIwLjI1IiBzdHJva2Utd2lkdGg9IjciIGZpbHRlcj0idXJsKCNzb2Z0MjUpIiBmaWxsPSJub25lIi8+CiAgPC9nPgo8L3N2Zz4K",
+  "hiddify": "data:image/svg+xml;base64,PHN2ZyBjbGFzcz0iYXBwLXN2ZyIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiB2aWV3Qm94PSIwIDAgNjQgNjQiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxnIGNsaXAtcGF0aD0idXJsKCNjbGlwMF80MDhfNTYpIj4KPHBhdGggZD0iTTQ3LjE1ODIgMTQuNDI4M0M0Ny4xNTgyIDEzLjgzNjggNDcuNDY4NCAxMy4yODg2IDQ3Ljk3NTcgMTIuOTg0Mkw2MS40NDk0IDQuODk4OTFDNjIuNTcyMSA0LjIyNTI5IDY0LjAwMDMgNS4wMzM4OSA2NC4wMDAzIDYuMzQzMDZWMjAuMjEwM0M2NC4wMDAzIDIxLjE0MDUgNjMuMjQ2MSAyMS44OTQ1IDYyLjMxNjEgMjEuODk0NUg0OC44NDI0QzQ3LjkxMjQgMjEuODk0NSA0Ny4xNTgyIDIxLjE0MDUgNDcuMTU4MiAyMC4yMTAzVjE0LjQyODNaIiBmaWxsPSIjNDU1RkU5Ii8+CjxwYXRoIGZpbGwtcnVsZT0iZXZlbm9kZCIgY2xpcC1ydWxlPSJldmVub2RkIiBkPSJNMjQuMzk2NiAyNi40NTkzQzIzLjg4OTMgMjYuNzYzNyAyMy41Nzg5IDI3LjMxMTggMjMuNTc4OSAyNy45MDM0VjQzLjc5MjFMMjMuNTc4OSA0NS40NzUxTDIzLjU3ODkgNDUuNDc2M0wyMy41Nzg5IDQ4LjAwMDFDMjMuNTc4OSA0OC45MzAxIDIyLjgyNDkgNDkuNjAwMSAyMS44OTQ3IDQ5LjYwMDFIMTguNTI2M0MxNy41OTYyIDQ5LjYwMDEgMTYuODQyMSA0OC45MzAxIDE2Ljg0MjEgNDguMDAwMVY0NS40NzUxVjM0Ljk3NkMxNi44NDIxIDMzLjY2NjkgMTUuNDEzOSAzMi44NTgzIDE0LjI5MTMgMzMuNTMxOUwwLjgxNzYwNyA0MS42MTcxQzAuMzEwMzYyIDQxLjkyMTYgMCA0Mi40Njk2IDAgNDMuMDYxNVY2MC42MzQyQzAgNjEuNTY0MiAwLjc1NDA0OCA2Mi4zMTg0IDEuNjg0MjEgNjIuMzE4NEgxNS4xNTc5QzE2LjA4ODEgNjIuMzE4NCAxNi44NDIxIDYxLjU2NDIgMTYuODQyMSA2MC42MzQyVjU4Ljk0ODhWNTYuODMxNEMxNi44NDIxIDU1LjkwMTEgMTcuNTk2MiA1NS4zMzc2IDE4LjUyNjMgNTUuMzM3NkgyMS44OTQ3QzIyLjgyNDkgNTUuMzM3NiAyMy41Nzg5IDU1LjkwMTEgMjMuNTc4OSA1Ni44MzE0VjU4Ljk0ODhMMjMuNTc4OSA2MC42MzQyQzIzLjU3ODkgNjEuNTY0MiAyNC4zMzMgNjIuMzE4NCAyNS4yNjMyIDYyLjMxODRIMzguNzM2OEMzOS42NjY5IDYyLjMxODQgNDAuNDIxMSA2MS41NjQyIDQwLjQyMTEgNjAuNjM0MlY0NS40NzYzVjQzLjc5MjFWMTkuODE4MkM0MC40MjExIDE4LjUwOSAzOC45OTI4IDE3LjcwMDQgMzcuODcwMSAxOC4zNzRMMjQuMzk2NiAyNi40NTkzWiIgZmlsbD0iIzQ1NUZFOSIvPgo8cGF0aCBkPSJNNDcuMTU5MiAyOC43OTk5VjYwLjc5OTlDNDcuMTU5MiA2MS42ODM2IDQ3LjkxMzIgNjIuMzk5OSA0OC44NDM0IDYyLjM5OTlINjIuMzE3MUM2My4yNDcyIDYyLjM5OTkgNjQuMDAxMyA2MS42ODM2IDY0LjAwMTMgNjAuNzk5OVYyOC43OTk5QzY0LjAwMTMgMjcuOTE2MiA2My4yNDcyIDI3LjE5OTkgNjIuMzE3MSAyNy4xOTk5SDQ4Ljg0MzRDNDcuOTEzMiAyNy4xOTk5IDQ3LjE1OTIgMjcuOTE2MiA0Ny4xNTkyIDI4Ljc5OTlaIiBmaWxsPSIjNDU1RkU5Ii8+CjwvZz4KPGRlZnM+Cgo8L2RlZnM+Cjwvc3ZnPgo=",
+  "v2rayn": "data:image/png;base64,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",
+  "v2rayng": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAEtklEQVR42u1ZO0ssSRT+qrpnxmGvrxUUDQx0RRkMTEyEBUGTYURFdjEQTAQFE4MFkUUYwchgQRBhYUcmMFGX8YXzCxYVNFEDBV0FNVK5O654vU53VZ0bON34Gl/zDO6BpofuruH76pzz1ak6wHfLrLGXXhIRywqQjNG7BhARIyItW2aZiLR4k/maB/IBfAKgXvs2FbgBcADXjLH/432kxwkZN4A/lFJtAH7IsAO+ENESgN8AfH0xpKywIaI/Kcvs8vLyr/sYn3iAiBhjTB4fHxdKKX/VNE1KKRFzYyZNaZoGzvkvExMTQ4yxzzGs9IDAyMgIA0CRSKSgtLTUpWmaBoAYYyzDCczvooY58/PzCwF8trA+O7u3t7dZqfdExKLR6JPnTwiYpsmQpSaEYC+q0DtmA0TPCwHnr6eMUiruu7eMT5jAXXq8H5xFWtf1D41PmAARgXOOi4sLnJycPJgtpRRyc3NRVVX1rHeUUtA0DYwxbG1tQSkFxpj9n0IIuN1ueDwe+13SCUgpoWkaFhcX0dfXB13XYZomOOdQSqGhoQGrq6tPACilwDkHEaGnpwfBYNAGb90dDgeWlpbg8Xjs5ykLIcMwQEQwTdMqth7cH5N2OByIRqPo6upCKBSyCTPG7GtmZgZerxdCiHflAX9v7BMRvF4vQqEQ5ubmUFJSEjduLfBXV1dobW1FKBSCrus2eItIMBhER0cHDMNIbRJb7q6oqEBFRQUAYGho6NmYF0LA6XTi/Pwc7e3tWF9fh67rEELY4KWUmJycRHd3NwzDeDG5kxpCFoibm5tnZ18IAZfLhdPTU7S0tGBnZ+cBeE3TIITA2NgY+vv7Pwz+w3WOBeI5OVVKweVyYW9vD42NjXHBDw8PY3BwEIZhvCjLKSHwkmc459jc3ERTUxOOjo5swFYOCSEwMDCA0dFRmKZpS+tHTU8mgby8PKytraGlpQWRSASapiFW0dpe6Onpwfj4uC2/idaKehL3rdjZ2YHX68XV1ZWdpADgcDhgmiY6OzsRCARsTyWj0E0qgbOzM/u3ldzWYufz+TA9PW2TSlaVzpN8emBL7f2waWxsxNzcnL2OvFfr00bgfpVqga+vr8fCwgLcbrddUiTTUrJdtNSmtrYWKysrKCgogJQy6eBTQsBSnsrKSoTDYRQXF9uKkwrjqQBfVlaGcDiM8vJyW+tTZUkjYMlmUVERwuEwqqurE15l00aAMQYpJXJzc7G8vIy6urqE6pu0ErA2Ki6XC/Pz82hoaEgb+IQJWFtBAJidnUVzc3NawSdMQEqJaDSKQCCA1tbWtINPuJSIRqOYmpqCz+eDaZppB5/QfkAphcLCQvh8PgghUq42KfEAEaVshU2rCmXSMn10nnwCmT5Of6VUYXEJjIyMEAAcHBx8YYwZAGQ2dGaUUnSn2NLY3t6+vo81XluV7e/vz2Zbi2ljY+NvAPxxt1J/lJDk9/t5W1vbcCAQyKmpqfmZc+6OdUMy0aVkSqmvu7u7//T29v7u9/vBOae3tFmdAH70eDw/VVZWfjIMg9K9SMVO9tjh4eH17u7uvwD+A2C8eaHy+/1OADmxy52hKwdAjt/vd8bTFvYaEWRHfwzfLVvtG6tx+tPyp0uYAAAAAElFTkSuQmCC",
+  "karing": "data:image/png;base64,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",
+  "nekobox": "data:image/png;base64,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",
+  "mihomo": "data:image/png;base64,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",};
+
+// Drawn protocol glyphs (one stroke family; spec 13). Neutral inline SVG,
+// not fake brand logos.
+const PROTO_ICONS = {
+  VLESS: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="8" cy="12" r="3.2" stroke="var(--accent)" stroke-width="1.7"/><path d="M11 12h9m-3 0v3" stroke="var(--accent)" stroke-width="1.7" stroke-linecap="round"/></svg>',
+  Trojan: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z" stroke="var(--accent)" stroke-width="1.7" stroke-linejoin="round"/></svg>',
+  VMess: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2" stroke="var(--accent)" stroke-width="1.7"/><path d="M8 10V7a4 4 0 0 1 8 0v3" stroke="var(--accent)" stroke-width="1.7"/></svg>',
+};
+
+function renderClients() {
+  const box = $("clients");
+  box.textContent = "";
+
+  // CORE-FIRST (V24.5.10 spec 7-9): one card per core, clients as secondary
+  // metadata. Grouping uses the backend's own compatibility data (c.core) —
+  // nothing invented client-side. Hiddify is a sing-box-core app and shows
+  // under its real core card; its official icon stays on its client row.
+  const order = ["Xray", "sing-box", "mihomo"];
+  const byCore = new Map();
+  for (const c of STATE.clients) {
+    const core = order.includes(c.core) ? c.core : "sing-box";
+    if (!byCore.has(core)) byCore.set(core, []);
+    byCore.get(core).push(c);
+  }
+
+  const CORE_META = {
+    "Xray":     { icon: `<span class="core-ic">${XRAY_LOGO_SVG}</span>`,
+                  blurb: "Core configs & subscription" },
+    "sing-box": { icon: `<span class="core-ic"><img src="${APP_ICONS["sing-box"]}" alt=""></span>`,
+                  blurb: "Core configs & subscription" },
+    "mihomo":   { icon: `<span class="core-ic"><img src="${APP_ICONS["mihomo"]}" alt=""></span>`,
+                  blurb: "Core configs & subscription" },
+  };
+
+  for (const core of order) {
+    const clients = byCore.get(core) || [];
+    if (!clients.length) continue;
+    const meta = CORE_META[core];
+
+    const card = el("div", { className: "card core-card" });
+    const head = el("div", { className: "core-head" });
+    head.innerHTML = meta.icon;
+    const hwrap = el("div", { style: "min-width:0" });
+    hwrap.append(el("h3", { className: "core-title", textContent: core }));
+    hwrap.append(el("p", { className: "core-sub", textContent: meta.blurb }));
+    head.append(hwrap);
+    card.append(head);
+
+    // Supported clients (official client icons where sourced).
+    const cl = el("div", { className: "core-clients" });
+    for (const c of clients) {
+      const chip = el("span", { className: "core-client", title: c.name });
+      const ic = APP_ICONS[(c.name || "").trim().toLowerCase()];
+      if (ic) chip.append(el("img", { src: ic, alt: "" }));
+      chip.append(el("span", { textContent: c.name }));
+      cl.append(chip);
+    }
+    card.append(cl);
+
+    // One subscription per core: the first client of the core that has a link
+    // (all clients of a core get the same emitted document shape; slugs differ
+    // only in the URL path). Actions: Copy, QR, Download.
+    const primary = clients.find((c) => c.subscription) || clients[0];
+    if (primary && primary.subscription) {
+      const urlRow = el("div", { className: "cand-row", style: "margin:.1rem 0" });
+      urlRow.append(el("code", {
+        className: "cand-host", title: primary.subscription, textContent: primary.subscription,
+      }));
+      urlRow.append(...(() => { const b = el("button", {
+        type: "button", className: "cand-copy", textContent: "Copy",
+        "aria-label": `Copy ${core} subscription link` });
+        b.onclick = () => copy(primary.subscription, "Subscription link"); return [b]; })());
+      card.append(urlRow);
+
+      const qr = qrToggle(
+        `kind=sub&client=${encodeURIComponent(primary.slug)}`,
+        `QR code for the ${core} subscription link`,
+      );
+      const row = el("div", { className: "row" }, [
+        copyButton(primary.subscription, "Subscription link", "Copy link"),
+        qr.btn,
+      ]);
+      if (primary.config) {
+        row.append(el("a", {
+          href: primary.config, textContent: "Download",
+          className: "chip", style: "padding:.45rem .8rem",
+        }));
+      }
+      card.append(row);
+      card.append(qr.box);
+    } else {
+      card.append(el("p", {
+        className: "muted", style: "margin:.3rem 0 0",
+        textContent: "No compatible connections for this core. Details in Advanced → Export diagnostics.",
+      }));
+    }
+    box.append(card);
+  }
+}
+
+
+
+$("link-client").onchange = renderLinks;
+
+function renderLinks() {
+  const slug = $("link-client").value;
+  const box = $("links");
+  box.textContent = "";
+
+  for (const view of STATE.views) {
+    const link = view.links.find((l) => l.client === slug);
+    const card = el("div", { className: "card" });
+    card.append(el("div", { className: "spread" }, [
+      el("span", { className: "row", style: "gap:.55rem" }, [
+        el("span", { className: "proto-ic", "aria-hidden": "true",
+          innerHTML: PROTO_ICONS[(view.tag || "").split(" ")[0]] || PROTO_ICONS.VLESS }),
+        el("strong", { textContent: view.tag }),
+      ]),
+      el("span", { className: "chip", textContent: `${view.protocol} over ${view.transport}` }),
+    ]));
+
+    if (!link) {
+      card.append(el("p", {
+        className: "sev-broken", style: "margin:.5rem 0 0",
+        textContent: "This app cannot import this connection.",
+      }));
+      box.append(card);
+      continue;
+    }
+
+    card.append(el("p", { className: "mono", style: "margin:.5rem 0", textContent: link.uri }));
+    const qr = qrToggle(
+      `kind=node&client=${encodeURIComponent(slug)}&tag=${encodeURIComponent(view.tag)}`,
+      `QR code for ${view.tag}`,
+    );
+    card.append(el("div", { className: "row" }, [copyButton(link.uri, "Link"), qr.btn]));
+    card.append(qr.box);
+    box.append(card);
+  }
+}
+
+// ---- tabs ------------------------------------------------------------------
+
+function showSection(which) {
+  // V24.5.3 single-page accordions.
+  const sec = $(`sec-${which}`);
+  if (!sec) return;
+  sec.open = true;
+  sec.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (which === "connection") renderLinks();
+}
+
+// ---- editor ----------------------------------------------------------------
+
+function renderNodeList() {
+  const box = $("nodelist");
+  box.textContent = "";
+  NODES.forEach((node, i) => {
+    const b = el("button", { title: node.tag || "" });
+    b.append(el("span", { textContent: `${i + 1}. ${node.tag || "(unnamed)"}` }));
+    b.setAttribute("aria-current", String(i === CURRENT));
+    b.onclick = async () => { CURRENT = i; renderNodeList(); await renderEditor(); };
+    box.append(b);
+  });
+  if (!NODES.length) {
+    box.append(el("p", { className: "muted", textContent: "No connections yet." }));
+  }
+}
+
+// Ask the server what this node looks like, optionally applying one edit first.
+// The server owns both the edit and the verdict, so what the editor disables
+// and what saving produces cannot drift apart: and this page never needs to
+// know how a connection is shaped internally.
+async function renderEditor(edit) {
+  const node = NODES[CURRENT];
+  if (!node) {
+    $("controls").textContent = "";
+    $("findings").textContent = "";
+    $("matrix").textContent = "";
+    return;
+  }
+
+  let result;
+  try {
+    result = await send("check", {
+      method: "POST",
+      body: JSON.stringify({ node, client: $("editor-client").value, edit: edit || null, enhanced_reachability: $("enh-reach").checked }),
+    });
+  } catch (err) {
+    toast(err.message);
+    return;
+  }
+
+  if (edit) {
+    NODES[CURRENT] = result.node;
+    markDirty();
+    renderNodeList();
+  }
+
+  renderFindings(result.findings);
+  renderControls(result.controls);
+  renderMatrix(result.matrix);
+}
+
+/// One save-status surface (spec 9): state ∈ saved | saving | error | warning.
+/// Wording + severity live here, never scattered through handlers.
+const SPINNER = '<svg class="spinner" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-opacity=".25" stroke-width="3"/><path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>';
+
+// Error UX (V24.5.5 spec 4): users get a short reason; WASM/JS stacks and
+// technical detail go under a collapsible "View details".
+function shortReason(raw) {
+  const text = String(raw || "");
+  const kv = text.match(/KV put\(\) limit exceeded[^.\n]*/i);
+  if (kv) return "Daily storage limit reached. Try again after 00:00 UTC.";
+  if (/reached the free usage limit/i.test(text)) return "Daily usage limit reached. Try again after 00:00 UTC.";
+  if (/revision/i.test(text)) return "Someone else saved first. Reload and retry.";
+  if (/expected_rev|conflict/i.test(text)) return "Configuration changed elsewhere. Reload to continue.";
+  if (/network|failed to fetch|timeout/i.test(text)) return "Network problem. Check the connection and retry.";
+  return "Something did not work. Check details.";
+}
+function errorWithDetails(raw) {
+  const wrap = el("span", { className: "err-wrap" });
+  wrap.append(el("span", { textContent: shortReason(raw) + " " }));
+  const d = el("details", { className: "err-details" });
+  d.append(el("summary", { textContent: "View details" }));
+  d.append(el("code", { textContent: String(raw || "") }));
+  wrap.append(d);
+  return wrap;
+}
+function setBusy(btn, on, label) {
+  btn.classList.toggle("busy", on);
+  btn.innerHTML = on ? SPINNER + label : label;
+  btn.disabled = on || undefined;
+}
+function setSaveState(kind, message) {
+  const note = $("save-note");
+  note.textContent = message;
+  note.className = kind === "error" ? "sev-broken" : kind === "warning" ? "sev-degraded" : "muted";
+  setBusy($("save"), kind === "saving", kind === "saving" ? "Saving…" : "Save");
+  // Detail "Screen Shaking Feedback": a dead end gets an inline shake, not a page move.
+  if (kind === "error" && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    note.classList.remove("shake-x");
+    void note.offsetWidth;
+    note.classList.add("shake-x");
+  }
+}
+
+/// E: light value transition — swap text with a short fade, event-driven only.
+function setVal(id, text) {
+  const n = $(id);
+  if (!n || n.textContent === text) return;
+  n.textContent = text;
+  n.classList.remove("val-swap");
+  void n.offsetWidth; // restart the animation
+  n.classList.add("val-swap");
+}
+
+function markDirty() {
+  DIRTY = true;
+  $("save").disabled = false;
+  setSaveState("warning", "Unsaved changes");
+}
+
+function renderFindings(findings) {
+  const box = $("findings");
+  box.textContent = "";
+  if (!findings.length) {
+    box.append(el("p", { className: "ok", textContent: "No problems for this app." }));
+    return;
+  }
+  for (const f of findings) {
+    const d = el("details", { className: `finding sev-${f.severity}` });
+    d.append(el("summary", {}, [
+      el("strong", { textContent: f.summary }),
+      el("span", { className: "chip", style: "margin-left:.4rem", textContent: f.severity }),
+    ]));
+    d.append(el("div", { className: "muted", textContent: f.detail }));
+    box.append(d);
+  }
+}
+
+function renderControls(controls) {
+  const box = $("controls");
+  box.textContent = "";
+
+  for (const c of controls) {
+    const field = el("div", { className: "field" });
+    const id = `f-${c.field}`;
+    field.append(el("label", { htmlFor: id, textContent: c.label }));
+    field.append(el("div", { className: "help", textContent: c.help }));
+
+    let input;
+    if (c.kind === "select") {
+      input = el("select", { id });
+      for (const ch of c.choices) {
+        const opt = el("option", {
+          value: ch.value,
+          // The reason travels in the label as well as the tooltip. A disabled
+          // option a user cannot hover — on a phone — would otherwise be a dead
+          // end with no explanation.
+          textContent: ch.blocked ? `${ch.label} — ${ch.reason}` : ch.label,
+          disabled: ch.blocked,
+          title: ch.detail || "",
+        });
+        opt.selected = ch.value === c.current;
+        input.append(opt);
+      }
+      input.onchange = () => renderEditor({ field: c.field, value: input.value });
+    } else if (c.kind === "toggle") {
+      input = el("input", { id, type: "checkbox", checked: c.current === "true" });
+      input.onchange = () => renderEditor({ field: c.field, value: String(input.checked) });
+    } else {
+      input = el("input", {
+        id,
+        type: c.kind === "number" ? "number" : "text",
+        value: c.current,
+      });
+      // On change rather than on input: every edit is a round trip, and
+      // re-checking on each keystroke would be one request per character.
+      input.onchange = () => renderEditor({ field: c.field, value: input.value });
+    }
+    field.append(input);
+
+    // A caveat that does not block still belongs beside the control it is
+    // about, not only in the list above.
+    const note = c.choices.find((ch) => ch.value === c.current && ch.reason && !ch.blocked);
+    if (note) {
+      field.append(el("div", { className: "muted sev-degraded", textContent: note.reason }));
+    }
+    box.append(field);
+  }
+}
+
+function renderMatrix(matrix) {
+  const table = $("matrix");
+  table.textContent = "";
+  const head = el("tr");
+  for (const h of ["App", "Core", "Receives it", "Why not / caveats"]) {
+    head.append(el("th", { textContent: h }));
+  }
+  table.append(head);
+
+  for (const v of matrix) {
+    const tr = el("tr");
+    tr.append(el("td", { textContent: v.client }));
+    tr.append(el("td", { className: "muted", textContent: v.core }));
+    tr.append(el("td", {
+      className: v.exportable ? "ok" : "sev-broken",
+      textContent: v.exportable ? "yes" : "no",
+    }));
+    const why = el("td");
+    if (!v.findings.length) {
+      why.append(el("span", { className: "muted", textContent: "—" }));
+    }
+    for (const f of v.findings) {
+      why.append(el("div", { className: `sev-${f.severity}`, textContent: f.summary }));
+    }
+    tr.append(why);
+    table.append(tr);
+  }
+}
+
+$("editor-client").onchange = () => renderEditor();
+
+$("add-node").onclick = async () => {
+  const fresh = structuredClone(STATE.blank);
+  // Names identify a connection in every export, so a duplicate has to be
+  // avoided here rather than reported after the fact.
+  const base = fresh.tag;
+  let n = 1;
+  while (NODES.some((x) => x.tag === fresh.tag)) fresh.tag = `${base} ${++n}`;
+  NODES.push(fresh);
+  CURRENT = NODES.length - 1;
+  markDirty();
+  renderNodeList();
+  await renderEditor();
+};
+
+$("delete-node").onclick = async () => {
+  const node = NODES[CURRENT];
+  if (!node) return;
+  if (!confirm(`Delete "${node.tag}"? Anyone using it will lose that connection.`)) return;
+  NODES.splice(CURRENT, 1);
+  CURRENT = Math.max(0, CURRENT - 1);
+  markDirty();
+  renderNodeList();
+  await renderEditor();
+};
+
+$("save").onclick = async () => {
+  $("save").disabled = true;
+  setSaveState("saving", "Saving…");
+  const keep = CURRENT;
+  try {
+    // Collect outbound routing config from the UI. The server defaults to Off
+    // when the field is absent, so an unchanged panel never wipes a stored
+    // config that was set by another session or a direct KV edit.
+    OUTBOUND = collectOutbound();
+    // Send the revision we loaded so a save racing another tab is refused
+    // instead of silently overwriting it. An old backend ignores the field;
+    // a state without rev (older session) omits it via undefined.
+    const expectedRev = typeof STATE?.rev === "number" ? STATE.rev : undefined;
+    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES, outbound: OUTBOUND, enhanced_reachability: $("enh-reach").checked, expected_rev: expectedRev }) });
+    if (body && body.ok && body.state) {
+      STATE = body.state;
+      NODES = structuredClone(STATE.nodes);
+      OUTBOUND = structuredClone(STATE.outbound ?? OUTBOUND);
+      HEALTH = structuredClone(STATE.proxyHealth ?? HEALTH);
+      $("enh-reach").checked = !!STATE.enhancedReachability;
+      CURRENT = Math.min(keep, Math.max(0, NODES.length - 1));
+      renderNodeList();
+      renderOutbound();
+      renderCatalog();
+      await renderEditor();
+      renderClients();
+      showSection("advanced");
+      const loc = (OUTBOUND.catalogCountry || "AUTO").toUpperCase();
+      const modeLabel = OUTBOUND.mode === "pool" ? "Proxy-IP Pool"
+        : OUTBOUND.mode === "proxyIp" ? "Proxy IP — Custom"
+        : OUTBOUND.mode === "nat64" ? "NAT64" : "Off";
+      setSaveState("saved", `Saved — ${modeLabel} · ${loc}. Apps pick this up the next time they refresh.`);
+      toast(`Saved — ${modeLabel} · ${loc}`);
+    } else {
+      DIRTY = false;
+      await boot();
+      CURRENT = Math.min(keep, Math.max(0, NODES.length - 1));
+      renderNodeList();
+      await renderEditor();
+      showSection("advanced");
+      setSaveState("saved", "Saved. Apps pick this up the next time they refresh.");
+      toast("Saved");
+    }
+  } catch (err) {
+    // Real reason, surfaced (spec 7): quota, revision conflict, validation —
+    // whatever the backend reported. Never a fake success, never a raw
+    // wasm/KV trace (errorWithDetails → shortReason + hidden details).
+    // UI reverts to the last persisted config (V24.5.8 spec 6): the panel
+    // re-renders from STATE, which still holds the server-confirmed values.
+    setSaveState("error", `Couldn't save. ${shortReason(err.message)} Previous settings kept.`);
+    // Re-render from persisted state so selectors cannot silently keep the
+    // unsaved selection (e.g. UI=US while server=DE).
+    try {
+      OUTBOUND = structuredClone(STATE.outbound ?? {});
+      renderOutbound();
+      renderCatalog();
+    } catch { /* STATE unavailable — leave UI, error is already shown */ }
+    toast(`Couldn't save — ${shortReason(err.message)}`);
+    setBusy($("save"), false, "Retry");
+  }
+};
+
+// ---- export preview --------------------------------------------------------
+
+$("export-run").onclick = async () => {
+  const client = encodeURIComponent($("export-client").value);
+  const shape = encodeURIComponent($("export-shape").value);
+  $("export-note").textContent = "";
+  try {
+    const out = await send(`export?client=${client}&shape=${shape}`);
+    $("export-body").value = out.body;
+    const skipped = out.skipped.map((s) => `${s.tag}: ${s.reason}`).join(" · ");
+    $("export-note").textContent =
+      `${out.filename} — ${out.included} connection(s) included` +
+      (skipped ? `. Left out — ${skipped}` : ".");
+  } catch (err) {
+    $("export-body").value = "";
+    $("export-note").textContent = err.message;
+  }
+};
+
+$("export-copy").onclick = () => {
+  const text = $("export-body").value;
+  if (text) copy(text, "Export"); else toast("Nothing to copy yet");
+};
+
+boot();
+</script>
+
+<script>
+
+// ---- Enhanced selects (V24.5.5 spec 6): one accessible popover listbox per
+// important select. APG select-only combobox: button[aria-expanded] +
+// role=listbox + role=option + aria-activedescendant; keyboard Up/Down/Home/
+// End/Enter/Escape; the native <select> stays hidden and is the single
+// source of truth, so collectOutbound/save keep working unchanged.
+function enhancedSelect(sel) {
+  if (!sel || sel.dataset.enhanced) return;
+  sel.dataset.enhanced = "1";
+  const id = sel.id || `sel-${Math.random().toString(36).slice(2, 8)}`;
+  const wrap = el("div", { className: "esel" });
+  sel.parentNode.insertBefore(wrap, sel);
+  const btn = el("button", {
+    type: "button", className: "esel-btn", id: `${id}-btn`,
+    "aria-labelledby": `${id}-btn`,
+  });
+  btn.setAttribute("aria-haspopup", "listbox");
+  btn.setAttribute("aria-expanded", "false");
+  // The menu lives on document.body with position:fixed (V24.5.7 spec 2):
+  // immune to accordion overflow:hidden, card clipping and stacking-context
+  // bugs; coordinates derive from the trigger rect each time it opens.
+  const menu = el("div", {
+    className: "esel-menu", id: `${id}-list`, tabindex: "-1",
+    "aria-labelledby": `${id}-btn`,
+  });
+  menu.setAttribute("role", "listbox");
+  wrap.append(btn, sel);
+  document.body.append(menu);
+  sel.classList.add("esel-native");
+
+  const options = () => [...sel.options].map((o, i) => ({ o, i }));
+  function label() {
+    const o = sel.options[sel.selectedIndex];
+    return o ? o.textContent : "";
+  }
+  // ONE shared moving highlight (V24.5.13 §3, Magnet-Tabs principle): a single
+  // .esel-glider per menu that transforms to the selected row — the highlight
+  // "moves into place" instead of popping between rows. Reduced motion: instant.
+  const glider = el("div", { className: "esel-glider", "aria-hidden": "true" });
+  function moveGlider(row, instant = false) {
+    if (!row || !menu.contains(row)) return;
+    glider.style.height = `${row.offsetHeight}px`;
+    glider.style.width = `${row.offsetWidth}px`;
+    glider.style.transform = `translateY(${row.offsetTop}px)`;
+    if (instant) glider.style.transition = "none";
+    else glider.style.transition = "";
+    void glider.offsetWidth;
+    glider.style.transition = "";
+  }
+  function renderMenu() {
+    menu.textContent = "";
+    menu.prepend(glider);
+    for (const { o, i } of options()) {
+      const row = el("div", {
+        className: "esel-opt", id: `${id}-opt-${i}`,
+      });
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", String(o.selected));
+      // Real app icon when this option is a known app (V24.5.6 spec 13).
+      const icon = APP_ICONS[(o.textContent || "").trim().toLowerCase()];
+      if (icon) {
+        row.append(el("img", { className: "esel-ic", src: icon, alt: "" }));
+      }
+      // Option value may carry a structured sub-label (country rows: "DE · 64 verified").
+      const main = el("span", { className: "esel-main", textContent: o.textContent });
+      const col = el("span", { className: "esel-col" });
+      col.append(main);
+      if (o.dataset && o.dataset.sub) {
+        col.append(el("span", { className: "esel-sub", textContent: o.dataset.sub }));
+      }
+      row.append(col);
+      // Selection indicator = the CSS accent rail on [aria-selected=true]
+      // (V24.5.12: ONE indicator, no check icon — the JS check span is gone).
+      // V24.6.12: the fn is closeMenu — a bare close() resolves to window.close()
+      // and the panel tries to close itself on every option click.
+      row.onclick = () => { pick(i); closeMenu(); };
+      menu.append(row);
+    }
+  }
+  function syncBtn() {
+    const o = sel.options[sel.selectedIndex];
+    btn.textContent = "";
+    const icon = o && APP_ICONS[(o.textContent || "").trim().toLowerCase()];
+    if (icon) btn.append(el("img", { className: "esel-ic", src: icon, alt: "" }));
+    btn.append(el("span", { textContent: label() }));
+  }
+  function pick(i) {
+    sel.selectedIndex = i;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    syncBtn();
+    [...menu.querySelectorAll(".esel-opt")].forEach((r, k) =>
+      r.setAttribute("aria-selected", String(k === i)));
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) moveGlider(menu.querySelectorAll(".esel-opt")[i], true);
+    else moveGlider(menu.querySelectorAll(".esel-opt")[i]);
+  }
+  let open = false, active = -1;
+  function position() {
+    const r = btn.getBoundingClientRect();
+    menu.style.minWidth = `${r.width}px`;
+    menu.style.left = `${r.left}px`;
+    const mh = Math.min(280, menu.scrollHeight || 280);
+    const below = window.innerHeight - r.bottom;
+    if (below < mh + 12 && r.top > mh + 12) {
+      menu.style.top = `${Math.max(8, r.top - Math.min(mh, menu.scrollHeight) - 6)}px`;
+    } else {
+      menu.style.top = `${r.bottom + 4}px`;
+    }
+    const mw = menu.getBoundingClientRect();
+    if (mw.right > window.innerWidth - 8) {
+      menu.style.left = `${window.innerWidth - mw.width - 8}px`;
+    }
+  }
+  function setActive(i, scroll = true) {
+    const rows = [...menu.querySelectorAll(".esel-opt")];
+    active = Math.max(0, Math.min(rows.length - 1, i));
+    rows.forEach((r, k) => r.classList.toggle("esel-active", k === active));
+    btn.setAttribute("aria-activedescendant", rows[active]?.id || "");
+    if (scroll) rows[active]?.scrollIntoView({ block: "nearest" });
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) moveGlider(rows[active], true);
+    else moveGlider(rows[active]);
+  }
+  function openMenu() {
+    renderMenu(); open = true;
+    wrap.classList.add("esel-open");
+    btn.setAttribute("aria-expanded", "true");
+    menu.classList.add("esel-shown");
+    position();
+    setActive(sel.selectedIndex, false);
+    // On open the highlight must already sit on the selected row (no fly-in).
+    moveGlider(menu.querySelectorAll(".esel-opt")[sel.selectedIndex], true);
+    window.addEventListener("scroll", position, true);
+    window.addEventListener("resize", position);
+  }
+  function closeMenu() {
+    open = false;
+    wrap.classList.remove("esel-open");
+    btn.setAttribute("aria-expanded", "false");
+    btn.removeAttribute("aria-activedescendant");
+    menu.classList.remove("esel-shown");
+    void menu.offsetWidth;
+    window.removeEventListener("scroll", position, true);
+    window.removeEventListener("resize", position);
+  }
+  btn.onclick = () => (open ? closeMenu() : openMenu());
+  btn.onkeydown = (e) => {
+    if (!open && ["ArrowDown", "ArrowUp", "Enter", " "].includes(e.key)) {
+      e.preventDefault(); openMenu(); return;
+    }
+    if (!open) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); setActive(active + 1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setActive(active - 1); }
+    else if (e.key === "Home") { e.preventDefault(); setActive(0); }
+    else if (e.key === "End") { e.preventDefault(); setActive(menu.querySelectorAll(".esel-opt").length - 1); }
+    else if (e.key === "Enter") { e.preventDefault(); pick(active); closeMenu(); }
+    else if (e.key === "Escape") { e.preventDefault(); closeMenu(); btn.focus(); }
+  };
+  document.addEventListener("click", (e) => {
+    if (open && !wrap.contains(e.target) && !menu.contains(e.target)) closeMenu();
+  });
+  // Keep the hidden select in sync when code changes options (renderCatalog).
+  new MutationObserver(() => { syncBtn(); if (open) renderMenu(); })
+    .observe(sel, { childList: true });
+  sel.addEventListener("change", syncBtn);
+  // Programmatic .value changes (renderOutbound/renderCatalog) fire no events;
+  // callers invoke this to re-sync the trigger label + menu selection.
+  sel._syncEsel = syncBtn;
+  syncBtn();
+}
+
+// ---- theme toggle (V24.5.3) ----
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem("trinity-theme", theme); } catch { /* private mode */ }
+  const b = $("theme-toggle");
+  if (b) {
+    b.textContent = theme === "dark" ? "\u2600" : "\u25d0";
+    b.setAttribute("aria-label", theme === "dark" ? "Switch to light theme" : "Switch to dark theme");
+  }
+}
+// ONE dropdown system, no exceptions: every <select> in the panel goes
+// through enhancedSelect (V24.5.8 spec 1). Query live so dynamically
+// rendered selects (cat-country) are covered too.
+for (const sel of document.querySelectorAll("select")) enhancedSelect(sel);
+{
+  const b = $("theme-toggle");
+  if (b) {
+    b.textContent = document.documentElement.dataset.theme === "dark" ? "\u2600" : "\u25d0";
+    b.onclick = () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+  }
+}
+</script>
+</body>
+</html>
