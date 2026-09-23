@@ -78,10 +78,10 @@ const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// Seconds of complete inactivity (no bytes in either direction) before the
-/// session is torn down. The threshold now lives in [`super::supervise`], as
-/// part of the transition table that enforces it; the value (60s) and its
-/// semantics — reset by any successful transfer either direction — are
-/// unchanged.
+/// session is torn down. The threshold lives in [`super::supervise`], as
+/// part of the transition table that enforces it (`IDLE_TIMEOUT_SECS`);
+/// the semantics — reset by any successful transfer either direction — are
+/// unchanged from the original idle-select.
 
 /// Size of one downlink read from the destination socket.
 ///
@@ -445,6 +445,13 @@ async fn own_session(ctx: OwnerContext) {
     let env: &Env = &env;
     let shared_down: &Mutex<Option<DownSender>> = &shared_down;
 
+    // Captured before anything else so `life_ms` at teardown covers the whole
+    // task, including establishment and any wait the idle timer ends.
+    let owner_started_ms = now_ms();
+    // Clone of LKG as loaded (geo included). The owner block owns `known_state`;
+    // teardown needs the geo map so a session write cannot wipe a panel probe.
+    let mut lkg_for_teardown = OutboundState::default();
+
     let outcome: OwnerOutcome = 'owner: {
     // The settings read and the arrival of the first header bytes are
     // independent waits, so they run concurrently. Loading the config before
@@ -455,13 +462,28 @@ async fn own_session(ctx: OwnerContext) {
     // A clone for the settings read; the original stays here for the
     // SESSION_DIAG-gated publication at teardown.
     let settings_env = env.clone();
+    // Catalog candidates come straight from the VERIFIED snapshot (every
+    // entry was verified by the GitHub scanner; Trinity adds no health step).
+    // The operator's location selects the pool; runtime caps it.
     let settings_load = async move {
         match settings_env.kv("SETTINGS") {
             Ok(kv) => match kv.get(crate::panel::store::KEY).text().await {
-                Ok(Some(raw)) => crate::relay::outbound::from_settings_json(&raw),
-                _ => OutboundConfig::default(),
+                Ok(Some(raw)) => {
+                    let cfg = crate::relay::outbound::from_settings_json(&raw);
+                    let mut generated = cfg.verified_catalog_candidates.clone();
+                    if generated.is_empty() && (cfg.catalog_pool || cfg.mode == crate::relay::outbound::ProxyMode::Pool) {
+                        if let Some(pool) = catalog_pool_from_snapshot(&cfg, &kv).await {
+                            generated = pool
+                                .into_iter()
+                                .map(|e| format!("{}:{}", e.host, e.port))
+                                .collect();
+                        }
+                    }
+                    (cfg, generated)
+                }
+                _ => (OutboundConfig::default(), Vec::new()),
             },
-            Err(_) => OutboundConfig::default(),
+            Err(_) => (OutboundConfig::default(), Vec::new()),
         }
     };
 
@@ -479,6 +501,18 @@ async fn own_session(ctx: OwnerContext) {
             Err(_) => OutboundState::default(),
         }
     };
+
+/// Verified snapshot pool for the operator's location (KV read, bounded).
+async fn catalog_pool_from_snapshot(
+    cfg: &OutboundConfig,
+    kv: &worker::kv::KvStore,
+) -> Option<Vec<crate::catalog::Endpoint>> {
+    let raw = kv.get(crate::catalog::KV_KEY).text().await.ok().flatten()?;
+    let document: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let snapshot: crate::catalog::Snapshot =
+        serde_json::from_value(document.get("snapshot")?.clone()).ok()?;
+    crate::catalog::pool_for(cfg, Some(&snapshot))
+}
 
     // Accumulate until a complete header parses. A header CAN arrive split
     // across chunks -- transport framing does not align with protocol framing,
@@ -538,11 +572,12 @@ async fn own_session(ctx: OwnerContext) {
         }
     };
 
-    let (Some(header), outbound_cfg, known_state) =
+    let (Some(header), (outbound_cfg, generated), known_state) =
         futures_util::future::join3(header_phase, settings_load, state_load).await
     else {
         break 'owner OwnerOutcome::Refused;
     };
+    lkg_for_teardown = known_state.clone();
     let Ok(req) = detect::detect(&header, &creds, now_secs()) else {
         break 'owner OwnerOutcome::Refused;
     };
@@ -573,19 +608,65 @@ async fn own_session(ctx: OwnerContext) {
     // A fresh last-known-good preference (see `outbound_state`) moves its
     // candidate to the front before anything dials. Pure reorder: every
     // candidate stays in the plan, so a stale preference costs nothing.
-    let plan = outbound_state::order_plan(
-        outbound_cfg.resolve(&target),
+    let resolved = outbound_cfg.resolve_with_catalog(&target, &generated);
+    let plan = outbound_state::order_plan_ranked(
+        resolved,
         &known_state,
         now_ms(),
+        "",
+        &outbound_cfg.pinned_proxy,
     );
     let started_ms = now_ms();
-    let Ok((sock, winner_idx, failed_first)) =
-        connect::open_with_plan_tracked(&plan).await
-    else {
-        break 'owner OwnerOutcome::DialFailed {
-            preferred: known_state.preferred.clone(),
-            updated_at: known_state.updated_at_ms,
-        };
+    let dial = connect::open_with_plan_tracked(&plan).await;
+    let (mut sock, winner_idx, failed_first) = match dial {
+        Ok(triple) => triple,
+        Err(_) => {
+            // V24.4.4 geographic failover: Pool mode only, and only after the
+            // whole primary pool was attempted (open_with_plan_tracked already
+            // tried every candidate — that IS the exhaustion definition). The
+            // configured location is never rewritten; the fallback country's
+            // candidates ride the same resolve/plan/dial engine.
+            let fb = if outbound_cfg.mode == crate::relay::outbound::ProxyMode::Pool {
+                crate::catalog::try_pool_fallback(
+                    env,
+                    &outbound_cfg,
+                    &known_state,
+                    now_ms(),
+                )
+                .await
+            } else {
+                None
+            };
+            let Some((_fb_cc, fb_pool, fb_state)) = fb else {
+                break 'owner OwnerOutcome::DialFailed {
+                    preferred: known_state.preferred.clone(),
+                    updated_at: known_state.updated_at_ms,
+                };
+            };
+            // Record the fallback (cooldown-aware) — best effort, never blocks.
+            crate::catalog::write_fallback_state(env, &fb_state).await;
+            let fb_generated: Vec<String> = fb_pool
+                .into_iter()
+                .map(|e| format!("{}:{}", e.host, e.port))
+                .collect();
+            let resolved = outbound_cfg.resolve_with_catalog(&target, &fb_generated);
+            let plan = outbound_state::order_plan_ranked(
+                resolved,
+                &known_state,
+                now_ms(),
+                "",
+                &outbound_cfg.pinned_proxy,
+            );
+            match connect::open_with_plan_tracked(&plan).await {
+                Ok(triple) => triple,
+                Err(_) => {
+                    break 'owner OwnerOutcome::DialFailed {
+                        preferred: known_state.preferred.clone(),
+                        updated_at: known_state.updated_at_ms,
+                    };
+                }
+            }
+        }
     };
 
     // Session diagnostics: counted always (a few adds per chunk), published
@@ -596,7 +677,7 @@ async fn own_session(ctx: OwnerContext) {
     let down_diag = diag.clone();
 
     let leading = Bytes::copy_from_slice(req.payload);
-    let (mut read_half, mut writer) = tokio::io::split(sock);
+    let (mut read_half, mut writer) = tokio::io::split(&mut sock);
 
     // One buffer for the session's whole uplink. Reused across chunks so a
     // steady stream costs no allocations once its capacity has settled.
@@ -604,6 +685,7 @@ async fn own_session(ctx: OwnerContext) {
 
     // Forward whatever payload arrived alongside the header -- through the
     // codec, because for an encrypted protocol these bytes are ciphertext.
+
     // Dropping them is the classic bug whose symptom is a destination TLS
     // handshake that hangs forever: the ClientHello was parsed off and
     // discarded.
@@ -617,6 +699,11 @@ async fn own_session(ctx: OwnerContext) {
     // request that was already delivered to us, the client waits for a
     // response, and the session hangs with nothing logged anywhere.
     if decoder.decode(leading, &mut ready).is_err() {
+        // End the session's billable lifetime here too: a socket left open
+        // pins the object for the full 15-minute cap.
+        drop(writer);
+        drop(read_half);
+        let _ = sock.close().await;
         break 'owner OwnerOutcome::Relays {
             plan,
             winner_idx,
@@ -861,6 +948,13 @@ async fn own_session(ctx: OwnerContext) {
         }
     }
     diag.session_end.set(Some(end_reason));
+    // The session is over. Dropping the relays ends the borrow that
+    // `tokio::io::split` took on the socket, so the connection can now be
+    // closed outright. Leaving it open is what pins this object for the full
+    // 15-minute cap Cloudflare applies per live outbound connection — measured
+    // as sustained full-minute residency at zero incoming requests.
+    drop(relays);
+    let _ = sock.close().await;
     break 'owner OwnerOutcome::Relays {
         plan,
         winner_idx,
@@ -878,6 +972,7 @@ async fn own_session(ctx: OwnerContext) {
     // bookkeeping — including demoting a preference that just steered this
     // session wrong.
     ended.set(true);
+    diag.life_ms.set(now_ms().saturating_sub(owner_started_ms));
     if let Ok(mut slot) = shared_down.lock() {
         *slot = None;
     }
@@ -914,21 +1009,25 @@ async fn own_session(ctx: OwnerContext) {
                     first_failed: failed_key.as_deref(),
                 },
                 now_ms(),
+                // A session that moved almost no downlink bytes through a
+                // connected egress is the dirty-IP signature (destination TLS
+                // never completes). Small non-zero allowance for protocol
+                // headers/refusals so a legitimate tiny response is not
+                // mistaken for one.
+                diag.downstream_sent.get() < 1024,
             ) {
                 outbound_state::LkgAction::Record(key) => {
-                    write_lkg(OutboundState {
-                        preferred: Some(key),
-                        updated_at_ms: now_ms(),
-                    })
-                    .await;
+                    write_lkg(lkg_for_teardown.clone().with_preference(Some(key), now_ms())).await;
                 }
-                outbound_state::LkgAction::Clear => write_lkg(OutboundState::default()).await,
+                outbound_state::LkgAction::Clear => {
+                    write_lkg(lkg_for_teardown.clone().cleared_preference()).await
+                }
                 outbound_state::LkgAction::Keep => {}
             }
         }
         OwnerOutcome::DialFailed { preferred, .. } => {
             if preferred.is_some() {
-                write_lkg(OutboundState::default()).await;
+                write_lkg(lkg_for_teardown.clone().cleared_preference()).await;
             }
         }
         OwnerOutcome::Refused => {}

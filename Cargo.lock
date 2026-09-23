@@ -810,12 +810,16 @@ dependencies = [
  "futures-util",
  "gloo-timers",
  "hmac",
+ "js-sys",
  "md-5",
  "serde",
  "serde_json",
  "sha2",
  "sha3",
  "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "worker",
 ]
 

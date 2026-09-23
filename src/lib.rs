@@ -45,6 +45,7 @@
 // generate input. That is the point of them, not an oversight.
 #![cfg_attr(test, allow(clippy::cast_possible_truncation))]
 
+pub mod catalog;
 pub mod config;
 pub mod crypto;
 pub mod panel;

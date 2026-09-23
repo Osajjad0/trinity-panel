@@ -55,6 +55,11 @@ pub enum ProxyMode {
     Off,
     /// Try configured proxy candidates before falling back.
     ProxyIp,
+    /// Dial the verified catalog pool for the operator's location. The pool
+    /// (healthy, scanner-verified endpoints) is supplied per session as the
+    /// `generated` list of [`OutboundConfig::resolve_with_catalog`]; with an
+    /// empty list Pool degrades to the same plan as ProxyIp/Off.
+    Pool,
     /// Synthesise NAT64 addresses for IPv4 destinations.
     Nat64,
 }
@@ -96,6 +101,22 @@ pub struct OutboundConfig {
     /// Maximum proxy candidates to try before giving up.
     /// Clamped to `[1, MAX_PROXY_ATTEMPTS]`.
     pub max_proxy_attempts: u32,
+    /// Whether verified catalog endpoints participate in the dial plan
+    /// (appended behind the manual candidates). Legacy flag from the
+    /// pre-Pool releases; Pool mode implies it.
+    #[serde(default)]
+    pub catalog_pool: bool,
+    /// Operator's catalog location: empty, "AUTO", or a two-letter country
+    /// code. Selects the pool; never rewritten at runtime.
+    #[serde(default)]
+    pub catalog_country: String,
+    /// EXACT host:port candidates generated from the verified catalog
+    /// (healthy-only). The only catalog input the dial path sees.
+    #[serde(default)]
+    pub verified_catalog_candidates: Vec<String>,
+    /// Manual proxy candidate that always dials first among proxies.
+    #[serde(default)]
+    pub pinned_proxy: String,
 }
 
 impl Default for OutboundConfig {
@@ -105,6 +126,10 @@ impl Default for OutboundConfig {
             proxy_candidates: Vec::new(),
             nat64_prefixes: Vec::new(),
             max_proxy_attempts: 3,
+            catalog_pool: false,
+            catalog_country: String::new(),
+            verified_catalog_candidates: Vec::new(),
+            pinned_proxy: String::new(),
         }
     }
 }
@@ -126,8 +151,60 @@ impl OutboundConfig {
         match self.mode {
             ProxyMode::Off => DialPlan::direct(target.clone()),
             ProxyMode::ProxyIp => self.resolve_proxy_ip(target),
+            ProxyMode::Pool => self.resolve_proxy_ip(target),
             ProxyMode::Nat64 => self.resolve_nat64(target),
         }
+    }
+
+    /// Resolve with the catalog candidates the caller generated from the
+    /// verified snapshot (healthy-only; the ONLY catalog input here).
+    ///
+    /// Order is fixed: direct first, then the manual candidates (with the
+    /// manual pin first among them), then verified catalog entries — each
+    /// keeping its own host:port, deduped by host+effective port against
+    /// everything already in the plan, capped so the manual list can never
+    /// be crowded out. An empty `generated` list degrades to plain
+    /// `resolve`, for every mode.
+    #[must_use]
+    pub fn resolve_with_catalog(&self, target: &Target, generated: &[String]) -> DialPlan {
+        if generated.is_empty() {
+            return self.resolve(target);
+        }
+        let mut plan = self.resolve(target);
+        // Manual pin first among the proxies (its own entry stays; dedupe
+        // below keeps the pin from reappearing as a catalog candidate).
+        let pin = self.pinned_proxy.trim();
+        if !pin.is_empty() {
+            if let Some(pos) = plan.candidates[1..].iter().position(|c| {
+                candidate_host(c).eq_ignore_ascii_case(pin)
+            }) {
+                let picked = plan.candidates.remove(1 + pos);
+                plan.candidates.insert(1, picked);
+            }
+        }
+        // Catalog entries keep their own source port; the pool itself is
+        // capped at MAX_POOL_CANDIDATES (manual candidates are bounded
+        // separately by max_proxy_attempts in resolve_proxy_ip).
+        let mut appended = 0usize;
+        for entry in generated {
+            // Catalog entries keep their own source port.
+            let Some(candidate) = parse_candidate(entry) else {
+                continue;
+            };
+            // Dedupe by host + effective port against the whole plan: the
+            // same host already dialable at this port adds nothing.
+            if plan.candidates.iter().any(|c| {
+                candidate_host(c) == candidate_host(&candidate) && c.port == candidate.port
+            }) {
+                continue;
+            }
+            plan.candidates.push(candidate);
+            appended += 1;
+            if appended >= crate::catalog::MAX_POOL_CANDIDATES {
+                break;
+            }
+        }
+        plan
     }
 
     fn resolve_proxy_ip(&self, target: &Target) -> DialPlan {
@@ -187,6 +264,48 @@ impl OutboundConfig {
         }
         // Fallback: well-known prefix. Valid by construction.
         DEFAULT_NAT64_PREFIX
+    }
+}
+
+/// Parse a generated catalog candidate `host:port` into a dial target.
+///
+/// Accepts IPv4/IPv6 literals and hostnames; IPv6 must be bracketed
+/// (`[2001:db8::1]:2053`). A bare host with no port is REJECTED — the caller
+/// (panel save validation) turns that into a visible save error rather than
+/// a silently ignored candidate.
+#[must_use]
+pub fn parse_candidate(s: &str) -> Option<Target> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Bracketed IPv6: [h]:p
+    if let Some(rest) = s.strip_prefix('[') {
+        let (h, p) = rest.split_once("]:")?;
+        let ip: IpAddr = h.parse().ok()?;
+        let port: u16 = p.parse().ok()?;
+        return Some(Target { host: Host::Ip(ip), port });
+    }
+    // Bare IPv6 literal has no port separator it could own.
+    if s.matches(':').count() > 1 {
+        return None;
+    }
+    let (h, p) = s.rsplit_once(':')?;
+    let port: u16 = p.parse().ok()?;
+    let host = if let Ok(ip) = h.parse::<IpAddr>() {
+        Host::Ip(ip)
+    } else {
+        Host::Domain(h.trim().into())
+    };
+    Some(Target { host, port })
+}
+
+/// Host string of a candidate, canonically cased for comparisons.
+#[must_use]
+fn candidate_host(t: &Target) -> String {
+    match &t.host {
+        Host::Ip(ip) => ip.to_string(),
+        Host::Domain(d) => d.trim().to_ascii_lowercase(),
     }
 }
 
@@ -374,6 +493,190 @@ mod tests {
         assert_eq!(plan.candidates, vec![t]);
     }
 
+    // --- Pool mode (verified catalog pool) ---
+
+    fn gen(s: &str) -> Vec<String> {
+        s.split(',').map(|x| x.trim().to_owned()).collect()
+    }
+
+    #[test]
+    fn pool_mode_verified_candidates_flow_to_runtime() {
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Pool,
+            proxy_candidates: vec!["di.nscl.ir".into()],
+            catalog_pool: true,
+            verified_catalog_candidates: gen("91.187.93.166:443, 193.108.112.248:443"),
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        let plan = cfg.resolve_with_catalog(&t, &cfg.verified_catalog_candidates);
+        let hosts: Vec<String> = plan.candidates[1..].iter().map(|c| match &c.host {
+            Host::Ip(ip) => format!("{ip}:{}", c.port),
+            Host::Domain(d) => format!("{d}:{}", c.port),
+        }).collect();
+        assert_eq!(hosts, vec!["di.nscl.ir:443", "91.187.93.166:443", "193.108.112.248:443"]);
+    }
+
+    #[test]
+    fn pool_mode_candidates_parse_host_port_and_dedupe() {
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Pool,
+            catalog_pool: true,
+            verified_catalog_candidates: gen(
+                "91.187.93.166:443, 91.187.93.166:8443, proxy.example.com:2053",
+            ),
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        let plan = cfg.resolve_with_catalog(&t, &cfg.verified_catalog_candidates);
+        // Same host on two ports = two candidates (port preserved); no dup of host+port.
+        let keys: Vec<String> = plan.candidates[1..].iter().map(|c| match &c.host {
+            Host::Ip(ip) => format!("{ip}:{}", c.port),
+            Host::Domain(d) => format!("{d}:{}", c.port),
+        }).collect();
+        assert_eq!(keys, vec!["91.187.93.166:443", "91.187.93.166:8443", "proxy.example.com:2053"]);
+    }
+
+    #[test]
+    fn pool_mode_dedupes_against_configured_and_caps_at_eight() {
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Pool,
+            proxy_candidates: vec!["198.51.100.9".into()], // same host as pool[0]
+            catalog_pool: true,
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        let gen: Vec<_> = (0..12).map(|i| format!("198.51.100.{i}:443")).collect();
+        let plan = cfg.resolve_with_catalog(&t, &gen);
+        let hosts: Vec<_> = plan.candidates[1..].iter().map(|c| match &c.host {
+            Host::Ip(ip) => ip.to_string(),
+            Host::Domain(d) => d.to_string(),
+        }).collect();
+        assert_eq!(hosts.len(), 9); // 1 configured + 8 catalog max
+        assert_eq!(hosts.iter().filter(|h| **h == "198.51.100.9").count(), 1); // deduped
+    }
+
+    #[test]
+    fn catalog_pool_true_appends_behind_configured_and_direct() {
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Pool,
+            proxy_candidates: vec!["203.0.113.10".into()],
+            catalog_pool: true,
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        let gen = vec![
+            "198.51.100.9:443".to_owned(),
+            "proxy.example.com:8443".to_owned(),
+        ];
+        let plan = cfg.resolve_with_catalog(&t, &gen);
+        assert_eq!(plan.candidates[0], t); // direct first, always
+        assert_eq!(plan.candidates[1].host, Host::Ip("203.0.113.10".parse().unwrap()));
+        // Catalog candidates keep their own source port.
+        assert_eq!(plan.candidates[2].host, Host::Ip("198.51.100.9".parse().unwrap()));
+        assert_eq!(plan.candidates[2].port, 443);
+        assert_eq!(plan.candidates[3].host, Host::Domain("proxy.example.com".into()));
+        assert_eq!(plan.candidates[3].port, 8443);
+    }
+
+    #[test]
+    fn catalog_endpoints_keep_their_own_port() {
+        // AZ fixture: one endpoint on 8443. It must NOT be rewritten to 443.
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Pool,
+            proxy_candidates: vec!["203.0.113.10".into()],
+            catalog_pool: true,
+            catalog_country: "AZ".into(),
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        let gen = vec!["180.149.44.124:8443".to_owned(), "85.185.86.111:2053".to_owned()];
+        let plan = cfg.resolve_with_catalog(&t, &gen);
+        assert_eq!(plan.candidates[2].port, 8443);
+        assert_eq!(plan.candidates[3].port, 2053);
+        // And the destination port is untouched for the direct candidate.
+        assert_eq!(plan.candidates[0].port, 443);
+    }
+
+    #[test]
+    fn failed_or_unknown_catalog_entries_never_enter_runtime() {
+        // resolve_with_catalog takes only the generated healthy list; an
+        // empty list means no extra candidates, whatever the snapshot holds.
+        let cfg = OutboundConfig {
+            mode: ProxyMode::ProxyIp,
+            proxy_candidates: vec!["203.0.113.10".into()],
+            catalog_pool: true,
+            catalog_country: "AZ".into(),
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        assert_eq!(cfg.resolve_with_catalog(&t, &[]).candidates.len(), 2);
+        // Malformed entries are skipped, not dialled.
+        let plan = cfg.resolve_with_catalog(&t, &["not-a-candidate".to_owned()]);
+        assert_eq!(plan.candidates.len(), 2);
+    }
+
+    #[test]
+    fn changing_location_field_does_not_leak_generated_entries_across_tests() {
+        // The generated list is data, not logic: switching catalogCountry alone
+        // must not invent candidates. Empty generated list stays empty.
+        let cfg = OutboundConfig {
+            mode: ProxyMode::ProxyIp,
+            proxy_candidates: vec!["di.nscl.ir".into()],
+            catalog_pool: true,
+            catalog_country: "AZ".into(),
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        assert_eq!(cfg.resolve_with_catalog(&t, &[]).candidates.len(), 2);
+    }
+
+    #[test]
+    fn catalog_pool_with_empty_pool_matches_resolve() {
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Pool,
+            proxy_candidates: vec!["203.0.113.10".into()],
+            catalog_pool: true,
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        assert_eq!(cfg.resolve_with_catalog(&t, &[]).candidates, cfg.resolve(&t).candidates);
+    }
+
+    #[test]
+    fn pool_mode_manual_pin_dials_first_among_proxies() {
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Pool,
+            proxy_candidates: vec!["203.0.113.10".into(), "slow.example.com".into()],
+            catalog_pool: true,
+            pinned_proxy: "slow.example.com".into(),
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        let gen = vec!["198.51.100.9:443".to_owned()];
+        let plan = cfg.resolve_with_catalog(&t, &gen);
+        assert_eq!(plan.candidates[0], t); // direct first, always
+        assert_eq!(plan.candidates[1].host, Host::Domain("slow.example.com".into()));
+        assert_eq!(plan.candidates[2].host, Host::Ip("203.0.113.10".parse().unwrap()));
+        assert_eq!(plan.candidates[3].host, Host::Ip("198.51.100.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn generated_candidates_parse_with_bracketed_ipv6_and_reject_bare_hosts() {
+        assert!(parse_candidate("91.187.93.166:443").is_some());
+        assert!(parse_candidate("[2001:db8::1]:2053").is_some());
+        assert!(parse_candidate("proxy.example.com:8443").is_some());
+        // Bare host / bare IPv6: no port, never dialable.
+        assert!(parse_candidate("91.187.93.166").is_none());
+        assert!(parse_candidate("2001:db8::1").is_none());
+        assert!(parse_candidate("proxy.example.com").is_none());
+        assert!(parse_candidate("").is_none());
+        // Out-of-range port.
+        assert!(parse_candidate("91.187.93.166:99999").is_none());
+    }
+
+    // --- Generated (healthy-only) catalog candidates (V24.3.4) end ---
+
     // --- NAT64 mode ---
 
     #[test]
@@ -523,6 +826,10 @@ mod tests {
             proxy_candidates: vec!["203.0.113.10".into(), "proxy.example.com".into()],
             nat64_prefixes: vec!["64:ff9b::/96".into()],
             max_proxy_attempts: 5,
+            catalog_pool: true,
+            catalog_country: "DE".into(),
+            verified_catalog_candidates: vec!["198.51.100.9:443".into()],
+            pinned_proxy: "203.0.113.10".into(),
         };
         let json = serde_json::to_string(&cfg).expect("serialises");
         let back: OutboundConfig = serde_json::from_str(&json).expect("deserialises");

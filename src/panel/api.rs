@@ -49,6 +49,19 @@ pub enum Api {
     Export,
     /// A QR image for a subscription or a node.
     Qr,
+    /// Measure each Proxy-IP candidate's exit country (operator-initiated).
+    ProbeProxy,
+    /// Sync the public Proxy-IP catalog snapshot (operator-initiated).
+    CatalogSync,
+    /// Sync from the GitHub Actions scheduled scanner, authenticated by its
+    /// OIDC identity (machine-to-machine; separate auth path — V24.7).
+    CatalogSyncGithub,
+    /// Dial-test the verified pool for a location WITHOUT persisting anything
+    /// (KV-quota-independent validation path; operator-initiated).
+    PoolDialTest,
+    /// The stored catalog metadata (revision/counts) — lets the scanner's
+    /// automation skip a sync when the feed revision is unchanged (V24.6.1 §13).
+    CatalogMeta,
     /// Anything else. Renders the decoy.
     Unknown,
 }
@@ -74,6 +87,11 @@ pub fn route(method: &str, rest: &str) -> Api {
         ("POST", "api/check") => Api::Check,
         ("GET", "api/export") => Api::Export,
         ("GET", "api/qr") => Api::Qr,
+        ("POST", "api/probe-proxy") => Api::ProbeProxy,
+        ("POST", "api/catalog-sync") => Api::CatalogSync,
+        ("POST", "api/catalog-sync-github") => Api::CatalogSyncGithub,
+        ("POST", "api/pool-dial-test") => Api::PoolDialTest,
+        ("GET", "api/catalog-meta") => Api::CatalogMeta,
         _ => Api::Unknown,
     }
 }
@@ -188,7 +206,8 @@ pub struct NodeLink {
 }
 
 /// Everything the panel needs on load.
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+// No `Eq`: candidate scores are floats.
+#[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
     pub host: String,
@@ -208,13 +227,134 @@ pub struct State {
     pub blank: Node,
     /// Outbound routing configuration (Proxy IP / NAT64).
     pub outbound: OutboundConfig,
+    /// Last measured health per proxy candidate, best first. Empty until the
+    /// operator runs a probe; the panel renders "not measured" from that.
+    pub proxy_health: Vec<CandidateHealth>,
     /// The Enhanced Reachability toggle's current value. Shown so the panel
     /// renders the same on/off state the subscriptions are being served with.
     pub enhanced_reachability: bool,
+    /// Public catalog sync metadata (tiny). `None` = never synced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<crate::catalog::Meta>,
     /// Optimistic-concurrency revision of the settings document. Sent back as
     /// `expectedRev` on save; a stale value is refused with an explanation
     /// rather than silently overwriting whoever saved in between.
     pub rev: u32,
+    /// EXACT host:port list the dial path hands to resolve_with_catalog()
+    /// for the current mode/location (verified snapshot derived). Empty when
+    /// the mode contributes no catalog candidates.
+    pub runtime_candidates: Vec<String>,
+    /// V24.4.4 runtime-only geographic failover (Pool mode). Empty strings =
+    /// no fallback active. The configured location is never rewritten.
+    pub fallback: Option<crate::panel::api::FallbackView>,
+}
+
+/// Compact fallback view for the panel.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FallbackView {
+    /// Configured (authoritative) location.
+    pub primary: String,
+    /// Temporarily active runtime location.
+    pub active: String,
+}
+
+/// One proxy candidate as the panel should render it: what the operator
+/// configured, joined with what the last probe measured.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateHealth {
+    pub host: String,
+    /// False when this candidate has never been probed.
+    pub measured: bool,
+    pub ok: bool,
+    pub healthy: bool,
+    pub country: String,
+    pub colo: String,
+    pub exit_ip: String,
+    pub latency_ms: u32,
+    pub rotating: bool,
+    pub success_rate: f64,
+    pub score: f64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+/// Join configured candidates with their measured health, best score first.
+///
+/// Built from the settings' own candidate list, so a candidate the operator
+/// removed disappears from the panel even while its stale record lingers in
+/// the state document.
+#[must_use]
+pub fn candidate_health(
+    cfg: &OutboundConfig,
+    geo: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
+    extra_hosts: &[String],
+) -> Vec<CandidateHealth> {
+    let wanted = "";
+    let mut hosts: Vec<String> = cfg.proxy_candidates.clone();
+    // Catalog candidates render after the configured ones, deduped by host,
+    // so a measured catalog candidate shows its local evidence too.
+    for host in extra_hosts {
+        if !hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            hosts.push(host.clone());
+        }
+    }
+    let mut rows: Vec<CandidateHealth> = hosts
+        .iter()
+        .map(|host| {
+            let key = host.trim().to_ascii_lowercase();
+            match geo.get(&key) {
+                Some(h) => CandidateHealth {
+                    host: host.clone(),
+                    measured: true,
+                    ok: h.ok,
+                    healthy: h.healthy(),
+                    country: h.country.clone(),
+                    colo: h.colo.clone(),
+                    exit_ip: h.exit_ip.clone(),
+                    latency_ms: h.latency_ms,
+                    rotating: h.rotating,
+                    success_rate: h.success_rate(),
+                    score: h.score(wanted),
+                    error: h.error.clone(),
+                },
+                None => CandidateHealth {
+                    host: host.clone(),
+                    measured: false,
+                    ok: false,
+                    healthy: false,
+                    country: String::new(),
+                    colo: String::new(),
+                    exit_ip: String::new(),
+                    latency_ms: 0,
+                    rotating: false,
+                    success_rate: 0.0,
+                    score: 0.0,
+                    error: String::new(),
+                },
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    rows
+}
+
+/// Whether a country preference currently has any healthy candidate.
+///
+/// The panel warns and offers Auto from this: a preference nothing can satisfy
+/// is the one case where the operator's selection is silently not in effect.
+#[must_use]
+pub fn country_is_satisfiable(country: &str, rows: &[CandidateHealth]) -> bool {
+    let want = country.trim();
+    want.is_empty()
+        || rows
+            .iter()
+            .any(|r| r.healthy && r.country.eq_ignore_ascii_case(want))
 }
 
 /// Where the settings a request is serving came from.
@@ -236,10 +376,22 @@ pub fn state(
     xhttp_path: &str,
     source: Source,
     warning: Option<String>,
+    geo: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
+    catalog: Option<crate::catalog::Meta>,
+    catalog_hosts: &[String],
+    runtime_candidates: &[String],
+    fallback: Option<FallbackView>,
 ) -> State {
     let clients = bundle::all_clients()
         .into_iter()
-        .map(|client| client_view(&settings.nodes, client, sub_base, settings.enhanced_reachability))
+        .map(|client| {
+            client_view(
+                &settings.nodes,
+                client,
+                sub_base,
+                settings.enhanced_reachability,
+            )
+        })
         .collect();
 
     let views = settings
@@ -259,8 +411,12 @@ pub fn state(
         views,
         clients,
         blank: super::advisor::blank(host, xhttp_path),
+        proxy_health: candidate_health(&settings.outbound, geo, catalog_hosts),
         outbound: settings.outbound.clone(),
         enhanced_reachability: settings.enhanced_reachability,
+        catalog,
+        runtime_candidates: runtime_candidates.to_vec(),
+        fallback,
         rev: settings.rev,
     }
 }
@@ -307,7 +463,10 @@ fn node_view(node: &Node, enhanced: bool) -> NodeView {
         .filter_map(|client| {
             crate::subscription::to_uri(node, client, enhanced)
                 .ok()
-                .map(|uri| NodeLink { client: bundle::client_slug(client), uri })
+                .map(|uri| NodeLink {
+                    client: bundle::client_slug(client),
+                    uri,
+                })
         })
         .collect();
 
@@ -390,7 +549,9 @@ pub fn validate_outbound(cfg: &OutboundConfig) -> Result<(), String> {
     if cfg.proxy_candidates.len() > MAX_OUTBOUND_ENTRIES
         || cfg.nat64_prefixes.len() > MAX_OUTBOUND_ENTRIES
     {
-        return Err(format!("{MAX_OUTBOUND_ENTRIES} outbound entries is the limit"));
+        return Err(format!(
+            "{MAX_OUTBOUND_ENTRIES} outbound entries is the limit"
+        ));
     }
     for candidate in &cfg.proxy_candidates {
         if !validate_proxy_candidate(candidate) {
@@ -412,6 +573,33 @@ pub fn validate_outbound(cfg: &OutboundConfig) -> Result<(), String> {
     // behave as Off, which looks like the feature is broken rather than unset.
     if cfg.mode == ProxyMode::ProxyIp && cfg.proxy_candidates.is_empty() {
         return Err("Proxy IP mode needs at least one proxy address.".to_owned());
+    }
+    for entry in &cfg.verified_catalog_candidates {
+        if crate::relay::outbound::parse_candidate(entry).is_none() {
+            return Err(format!(
+                "\"{entry}\" is not a usable generated candidate. Expected host:port, like 203.0.113.10:8443."
+            ));
+        }
+    }
+    let location = cfg.catalog_country.trim();
+    if !location.is_empty()
+        && !location.eq_ignore_ascii_case("AUTO")
+        && !crate::relay::outbound_state::valid_country(location)
+    {
+        return Err(
+            "Catalog location must be empty, AUTO, or a two-letter country code.".to_owned(),
+        );
+    }
+    // A pin naming something that is not a candidate would look configured and
+    // do nothing, so it is refused at save rather than silently ignored.
+    let pin = cfg.pinned_proxy.trim();
+    if !pin.is_empty()
+        && !cfg
+            .proxy_candidates
+            .iter()
+            .any(|c| c.trim().eq_ignore_ascii_case(pin))
+    {
+        return Err(format!("\"{pin}\" is not one of the proxy candidates."));
     }
     Ok(())
 }
@@ -482,11 +670,11 @@ mod tests {
 
     #[test]
     fn a_stale_expected_revision_is_refused_with_guidance() {
+        assert_eq!(resolve_save_rev(Some(3), 5), Err(REV_CONFLICT_MESSAGE));
         assert_eq!(
-            resolve_save_rev(Some(3), 5),
-            Err(REV_CONFLICT_MESSAGE)
+            REV_CONFLICT_MESSAGE,
+            "Settings changed elsewhere. Reload and try again."
         );
-        assert_eq!(REV_CONFLICT_MESSAGE, "Settings changed elsewhere. Reload and try again.");
     }
 
     #[test]
@@ -510,7 +698,10 @@ mod tests {
     fn node(tag: &str) -> Node {
         Node {
             tag: tag.to_owned(),
-            server: Endpoint { address: "example.com".into(), port: 443 },
+            server: Endpoint {
+                address: "example.com".into(),
+                port: 443,
+            },
             protocol: Protocol::Vless {
                 uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
                 flow: Flow::None,
@@ -549,6 +740,7 @@ mod tests {
         assert_eq!(route("PUT", "api/nodes"), Api::Save);
         assert_eq!(route("POST", "api/check"), Api::Check);
         assert_eq!(route("GET", "api/qr"), Api::Qr);
+        assert_eq!(route("POST", "api/probe-proxy"), Api::ProbeProxy);
 
         for (m, p) in [
             ("GET", "api/login"),
@@ -567,7 +759,21 @@ mod tests {
     fn only_the_page_and_the_login_are_reachable_without_a_session() {
         // The panel can read every credential the deployment serves, so this
         // list is the whole security boundary and is pinned deliberately.
-        for api in [Api::State, Api::Save, Api::Check, Api::Export, Api::Qr, Api::Logout] {
+        for api in [
+            Api::State,
+            Api::Save,
+            Api::Check,
+            Api::Export,
+            Api::Qr,
+            Api::Logout,
+            Api::ProbeProxy,
+            // The GitHub OIDC sync route is NOT session-gated (a machine has no
+            // browser session) but is NOT public either: `serve` short-circuits
+            // it to the OIDC verifier before the session check. Listed here to
+            // pin that it can never quietly become session-free without the
+            // verifier in front.
+            Api::CatalogSyncGithub,
+        ] {
             assert!(!api.is_public(), "{api:?} must require a session");
         }
         assert!(Api::Page.is_public());
@@ -576,19 +782,42 @@ mod tests {
 
     #[test]
     fn the_state_names_every_client_and_what_it_will_actually_receive() {
-        let s = state(&settings(), "example.com", "https://example.com/sub", "/x", Source::Derived, None);
+        let s = state(
+            &settings(),
+            "example.com",
+            "https://example.com/sub",
+            "/x",
+            Source::Derived,
+            None,
+            &Default::default(),
+            None,
+            &[],
+            &[],
+            None,
+        );
         assert_eq!(s.clients.len(), bundle::all_clients().len());
         assert_eq!(s.source, "derived");
 
-        let v2rayn = s.clients.iter().find(|c| c.slug == "v2rayn").expect("listed");
+        let v2rayn = s
+            .clients
+            .iter()
+            .find(|c| c.slug == "v2rayn")
+            .expect("listed");
         assert_eq!(v2rayn.subscription, "https://example.com/sub/v2rayn");
         assert_eq!(v2rayn.included, 2);
         assert!(v2rayn.skipped.is_empty());
-        assert_eq!(v2rayn.config.as_deref(), Some("https://example.com/sub/v2rayn.json"));
+        assert_eq!(
+            v2rayn.config.as_deref(),
+            Some("https://example.com/sub/v2rayn.json")
+        );
 
         // Upstream sing-box cannot take an XHTTP node, and must say so rather
         // than be offered a subscription that would arrive empty.
-        let upstream = s.clients.iter().find(|c| c.slug == "sing-box").expect("listed");
+        let upstream = s
+            .clients
+            .iter()
+            .find(|c| c.slug == "sing-box")
+            .expect("listed");
         assert_eq!(upstream.included, 0);
         assert!(upstream.subscription.is_empty());
         assert_eq!(upstream.skipped.len(), 2);
@@ -597,19 +826,53 @@ mod tests {
 
     #[test]
     fn a_mihomo_config_is_offered_with_its_own_extension() {
-        let s = state(&settings(), "example.com", "https://example.com/sub", "/x", Source::Stored, None);
-        let mihomo = s.clients.iter().find(|c| c.slug == "mihomo").expect("listed");
-        assert_eq!(mihomo.config.as_deref(), Some("https://example.com/sub/mihomo.yaml"));
+        let s = state(
+            &settings(),
+            "example.com",
+            "https://example.com/sub",
+            "/x",
+            Source::Stored,
+            None,
+            &Default::default(),
+            None,
+            &[],
+            &[],
+            None,
+        );
+        let mihomo = s
+            .clients
+            .iter()
+            .find(|c| c.slug == "mihomo")
+            .expect("listed");
+        assert_eq!(
+            mihomo.config.as_deref(),
+            Some("https://example.com/sub/mihomo.yaml")
+        );
     }
 
     #[test]
     fn each_node_carries_its_links_and_its_verdicts() {
-        let s = state(&settings(), "example.com", "https://example.com/sub", "/x", Source::Stored, None);
+        let s = state(
+            &settings(),
+            "example.com",
+            "https://example.com/sub",
+            "/x",
+            Source::Stored,
+            None,
+            &Default::default(),
+            None,
+            &[],
+            &[],
+            None,
+        );
         let first = &s.views[0];
         assert_eq!(first.tag, "a");
         assert_eq!(first.protocol, "VLESS");
         assert_eq!(first.transport, "XHTTP");
-        assert!(first.links.iter().any(|l| l.client == "v2rayn" && l.uri.starts_with("vless://")));
+        assert!(first
+            .links
+            .iter()
+            .any(|l| l.client == "v2rayn" && l.uri.starts_with("vless://")));
         assert!(!first.links.iter().any(|l| l.client == "sing-box"));
         assert_eq!(first.matrix.len(), bundle::all_clients().len());
     }
@@ -618,7 +881,10 @@ mod tests {
     fn validation_refuses_what_would_make_a_node_unaddressable() {
         assert!(validate(&[node("a"), node("b")]).is_ok());
 
-        assert!(validate(&[node("a"), node("a")]).is_err(), "duplicate names");
+        assert!(
+            validate(&[node("a"), node("a")]).is_err(),
+            "duplicate names"
+        );
 
         let mut blank = node("");
         blank.tag = "  ".into();
@@ -634,7 +900,10 @@ mod tests {
 
         let mut dangling = node("a");
         dangling.chain_via = Some("nowhere".into());
-        assert!(validate(&[dangling]).is_err(), "chain to a node that does not exist");
+        assert!(
+            validate(&[dangling]).is_err(),
+            "chain to a node that does not exist"
+        );
 
         let mut chain = vec![node("a"), node("b")];
         chain[1].chain_via = Some("a".into());
@@ -655,7 +924,10 @@ mod tests {
         );
         assert_eq!(
             qr_subject([("kind", "node"), ("client", "hiddify"), ("tag", "a")].into_iter()),
-            Some(QrSubject::Node { tag: "a".into(), client: ClientTarget::Hiddify })
+            Some(QrSubject::Node {
+                tag: "a".into(),
+                client: ClientTarget::Hiddify
+            })
         );
         for bad in [
             vec![("kind", "sub")],
@@ -758,14 +1030,99 @@ mod tests {
     fn nat64_mode_with_no_prefix_is_allowed_because_a_default_exists() {
         // Unlike Proxy IP, NAT64 has a well-known prefix to fall back on, so an
         // empty list is a complete config rather than an unset one.
-        let cfg = OutboundConfig { mode: ProxyMode::Nat64, ..Default::default() };
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Nat64,
+            ..Default::default()
+        };
         assert!(validate_outbound(&cfg).is_ok());
     }
 
     #[test]
     fn proxy_ip_mode_without_candidates_is_refused_rather_than_saved_as_a_no_op() {
-        let cfg = OutboundConfig { mode: ProxyMode::ProxyIp, ..Default::default() };
+        let cfg = OutboundConfig {
+            mode: ProxyMode::ProxyIp,
+            ..Default::default()
+        };
         assert!(validate_outbound(&cfg).is_err());
+    }
+
+    #[test]
+    fn generated_candidates_must_parse_as_host_port() {
+        let ok = OutboundConfig {
+            mode: ProxyMode::ProxyIp,
+            proxy_candidates: vec!["1.2.3.4".into()],
+            catalog_pool: true,
+            verified_catalog_candidates: vec![
+                "91.187.93.166:443".into(),
+                "[2001:db8::1]:2053".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(validate_outbound(&ok).is_ok());
+        let bad = OutboundConfig {
+            verified_catalog_candidates: vec!["91.187.93.166".into()],
+            ..ok.clone()
+        };
+        assert!(validate_outbound(&bad).is_err());
+        let bad = OutboundConfig {
+            verified_catalog_candidates: vec!["2001:db8::1".into()],
+            ..ok
+        };
+        assert!(validate_outbound(&bad).is_err());
+    }
+
+    #[test]
+    fn catalog_country_must_be_empty_or_two_letters() {
+        let ok = OutboundConfig {
+            mode: ProxyMode::ProxyIp,
+            proxy_candidates: vec!["1.2.3.4".into()],
+            catalog_pool: true,
+            catalog_country: "DE".into(),
+            ..Default::default()
+        };
+        assert!(validate_outbound(&ok).is_ok());
+        let auto = OutboundConfig {
+            catalog_country: "auto".into(),
+            ..ok.clone()
+        };
+        assert!(validate_outbound(&auto).is_ok());
+        let empty_ok = OutboundConfig {
+            catalog_country: String::new(),
+            ..ok.clone()
+        };
+        assert!(validate_outbound(&empty_ok).is_ok());
+        let ok = OutboundConfig {
+            catalog_country: String::new(),
+            ..ok.clone()
+        };
+        assert!(validate_outbound(&ok).is_ok());
+        for bad_country in ["DEU", "d3", "12"] {
+            let bad = OutboundConfig {
+                catalog_country: bad_country.into(),
+                ..ok.clone()
+            };
+            assert!(validate_outbound(&bad).is_err(), "accepted {bad_country:?}");
+        }
+    }
+
+    #[test]
+    fn state_without_catalog_renders_as_never_synced() {
+        let s = state(
+            &settings(),
+            "example.com",
+            "https://example.com/sub",
+            "/x",
+            Source::Stored,
+            None,
+            &Default::default(),
+            None,
+            &[],
+            &[],
+            None,
+        );
+        assert!(s.catalog.is_none());
+        let meta = crate::catalog::Meta::default();
+        assert!(meta.is_empty());
     }
 
     #[test]

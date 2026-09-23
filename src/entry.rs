@@ -23,11 +23,11 @@ use crate::transport::xhttp::wire::Class;
 const UPGRADE: &str = "Upgrade";
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // A panic in a WASM isolate takes every connection on it down, so the
     // handler is written to have no panicking path at all. This is belt and
     // braces for anything the compiler cannot prove.
-    match dispatch(req, &env).await {
+    match dispatch(req, &env, &ctx).await {
         Ok(resp) => Ok(resp),
         // Never surface an internal error to the peer: an error page is a
         // signal that something is here. Fall back to the decoy.
@@ -35,7 +35,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 }
 
-async fn dispatch(req: Request, env: &Env) -> Result<Response> {
+async fn dispatch(req: Request, env: &Env, ctx: &Context) -> Result<Response> {
     let routes = load_routes(env);
     let method = req.method().to_string();
     let path = req.path();
@@ -59,7 +59,7 @@ async fn dispatch(req: Request, env: &Env) -> Result<Response> {
                 decoy(env).await
             }
         }
-        Route::WebSocket => crate::transport::websocket::handle(&req, env),
+        Route::WebSocket => crate::transport::websocket::handle(&req, env, ctx),
         Route::Subscription { rest } => crate::panel::serve::subscription(&req, env, rest).await,
         Route::Panel { rest } => crate::panel::serve::panel(req, env, rest).await,
         Route::Decoy => decoy(env).await,

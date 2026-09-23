@@ -100,6 +100,9 @@ pub struct SessionDiag {
     pub setup_ms: Cell<u64>,
     /// Wall-clock ms from socket connected to pump exit.
     pub pump_ms: Cell<u64>,
+    /// Wall-clock ms from owner-task start to teardown. Covers establishment,
+    /// any wait the idle timer ends, and the relay itself.
+    pub life_ms: Cell<u64>,
     /// I/O error text when [`DownExit::ReadError`] (short, no destination echo).
     /// `RefCell` because `Cell` needs `Copy` and error text is an owned string.
     pub read_error: RefCell<Option<String>>,

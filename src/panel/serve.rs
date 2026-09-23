@@ -42,10 +42,11 @@ const PANEL_BETA_HTML: &str = include_str!("../../public/panel-beta.html");
 /// else counts as no preference, so a typo can never strand the operator on a
 /// variant they did not choose.
 fn ui_preference(req: &Request) -> Option<bool> {
-    let from_query = req
-        .url()
-        .ok()
-        .and_then(|u| u.query_pairs().find(|(k, _)| k == "ui").map(|(_, v)| v.into_owned()));
+    let from_query = req.url().ok().and_then(|u| {
+        u.query_pairs()
+            .find(|(k, _)| k == "ui")
+            .map(|(_, v)| v.into_owned())
+    });
     match from_query.as_deref() {
         Some("beta") => return Some(true),
         Some("legacy") => return Some(false),
@@ -110,7 +111,7 @@ async fn load(env: &Env, host: &str) -> (Settings, Source, Option<String>) {
     let derived = Settings::derive_from_env(&Deployment {
         host,
         xhttp_path: &var(env, "XHTTP_PATH"),
-    ws_path: &var(env, "WS_PATH"),
+        ws_path: &var(env, "WS_PATH"),
         vless_users: &var(env, "VLESS_USERS"),
         trojan_users: &var(env, "TROJAN_USERS"),
         vmess_users: &var(env, "VMESS_USERS"),
@@ -146,7 +147,12 @@ pub async fn subscription(req: &Request, env: &Env, rest: &str) -> Result<Respon
     let host = host_of(req);
     let settings = load_settings(env, &host).await;
 
-    let Ok(rendered) = bundle::render(&settings.nodes, target, shape, settings.enhanced_reachability) else {
+    let Ok(rendered) = bundle::render(
+        &settings.nodes,
+        target,
+        shape,
+        settings.enhanced_reachability,
+    ) else {
         // Nothing this client can use. Rendering the decoy keeps the endpoint
         // uninformative; the panel is where a user is told why.
         return crate::entry::decoy(env).await;
@@ -166,7 +172,10 @@ pub async fn subscription(req: &Request, env: &Env, rest: &str) -> Result<Respon
 /// Offer a filename for the shapes a browser would otherwise render inline.
 fn set_download_name(headers: &mut Headers, filename: &str, shape: Shape) -> Result<()> {
     if matches!(shape, Shape::FullConfig) {
-        headers.set("Content-Disposition", &format!("attachment; filename=\"{filename}\""))?;
+        headers.set(
+            "Content-Disposition",
+            &format!("attachment; filename=\"{filename}\""),
+        )?;
     }
     Ok(())
 }
@@ -186,6 +195,14 @@ pub async fn panel(mut req: Request, env: &Env, rest: &str) -> Result<Response> 
         return crate::entry::decoy(env).await;
     }
 
+    // The GitHub scanner is a machine: it has no browser session and no
+    // cookie. Its POST authenticates with its OIDC identity instead — a
+    // separate path from the panel password, decided in `github_oidc`. This
+    // must sit before the session gate or the workflow would 401.
+    if action == Api::CatalogSyncGithub {
+        return github_oidc_sync(&req, env).await;
+    }
+
     if !action.is_public() && !has_session(&req, &password) {
         return refuse("Your session has expired. Sign in again.");
     }
@@ -194,7 +211,12 @@ pub async fn panel(mut req: Request, env: &Env, rest: &str) -> Result<Response> 
         Api::Page => {
             // The panel ships its own API client; a cached stale document
             // posts payloads the current backend may misread. Always fresh.
-            let mut page = Response::from_html(if ui_preference(&req).unwrap_or(DEFAULT_UI_BETA) { PANEL_BETA_HTML } else { PANEL_HTML })?;
+            let mut page =
+                Response::from_html(if ui_preference(&req).unwrap_or(DEFAULT_UI_BETA) {
+                    PANEL_BETA_HTML
+                } else {
+                    PANEL_HTML
+                })?;
             page.headers_mut().set("Cache-Control", "no-store")?;
             Ok(page)
         }
@@ -207,6 +229,7 @@ pub async fn panel(mut req: Request, env: &Env, rest: &str) -> Result<Response> 
         Api::Qr => qr(&req, env).await,
         Api::ProbeProxy => probe_proxy(env).await,
         Api::CatalogSync => catalog_sync(env).await,
+        Api::CatalogSyncGithub => unreachable!("handled before the session gate"),
         Api::PoolDialTest => pool_dial_test(&req, env).await,
         Api::CatalogMeta => {
             let meta = load_catalog_meta(env).await;
@@ -237,13 +260,15 @@ async fn login(req: &mut Request, password: &str) -> Result<Response> {
 
     let token = super::auth::issue(password, now_secs());
     let mut out = json(&Ok2 { ok: true })?;
-    out.headers_mut().set("Set-Cookie", &super::auth::set_cookie(&token))?;
+    out.headers_mut()
+        .set("Set-Cookie", &super::auth::set_cookie(&token))?;
     Ok(out)
 }
 
 fn logout() -> Result<Response> {
     let mut out = json(&Ok2 { ok: true })?;
-    out.headers_mut().set("Set-Cookie", &super::auth::clear_cookie())?;
+    out.headers_mut()
+        .set("Set-Cookie", &super::auth::clear_cookie())?;
     Ok(out)
 }
 
@@ -280,7 +305,19 @@ async fn state(req: &Request, env: &Env) -> Result<Response> {
             primary: settings.outbound.catalog_country.clone(),
             active: outbound_state.fallback_active.clone(),
         });
-    json(&api::state(&settings, &host, &sub_base, &xhttp_path, source, warning, &geo, catalog, &catalog_hosts, &runtime_candidates, fallback))
+    json(&api::state(
+        &settings,
+        &host,
+        &sub_base,
+        &xhttp_path,
+        source,
+        warning,
+        &geo,
+        catalog,
+        &catalog_hosts,
+        &runtime_candidates,
+        fallback,
+    ))
 }
 
 /// The EXACT catalog candidates the dial path will use for the current
@@ -291,14 +328,16 @@ async fn runtime_candidates_for_state(
     env: &Env,
     cfg: &crate::relay::outbound::OutboundConfig,
 ) -> Vec<String> {
-    if !matches!(cfg.mode,
-        crate::relay::outbound::ProxyMode::ProxyIp | crate::relay::outbound::ProxyMode::Pool)
-    {
+    if !matches!(
+        cfg.mode,
+        crate::relay::outbound::ProxyMode::ProxyIp | crate::relay::outbound::ProxyMode::Pool
+    ) {
         return Vec::new();
     }
     // Explicit override wins.
     if !cfg.verified_catalog_candidates.is_empty() {
-        return cfg.verified_catalog_candidates
+        return cfg
+            .verified_catalog_candidates
             .iter()
             .take(crate::catalog::MAX_POOL_CANDIDATES)
             .cloned()
@@ -309,7 +348,9 @@ async fn runtime_candidates_for_state(
     if cfg.mode != crate::relay::outbound::ProxyMode::Pool {
         return Vec::new();
     }
-    let Ok(kv) = env.kv(KV_BINDING) else { return Vec::new() };
+    let Ok(kv) = env.kv(KV_BINDING) else {
+        return Vec::new();
+    };
     let Ok(Some(raw)) = kv.get(crate::catalog::KV_KEY).text().await else {
         return Vec::new();
     };
@@ -340,14 +381,16 @@ async fn catalog_hosts_for_state(
     cfg.verified_catalog_candidates.clone()
 }
 
-
 /// The stored catalog sync metadata, or `None` when never synced. Tiny read:
 /// the 865 KB snapshot itself is deliberately not loaded for panel renders.
-async fn load_catalog_meta(
-    env: &Env,
-) -> Option<crate::catalog::Meta> {
+async fn load_catalog_meta(env: &Env) -> Option<crate::catalog::Meta> {
     let kv = env.kv(KV_BINDING).ok()?;
-    let raw = kv.get(crate::catalog::KV_META_KEY).text().await.ok().flatten()?;
+    let raw = kv
+        .get(crate::catalog::KV_META_KEY)
+        .text()
+        .await
+        .ok()
+        .flatten()?;
     crate::catalog::Meta::from_json(&raw)
 }
 
@@ -391,7 +434,13 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         return refuse(api::REV_CONFLICT_MESSAGE);
     };
 
-    let settings = Settings { version: super::store::VERSION, nodes: body.nodes, outbound: body.outbound, enhanced_reachability: body.enhanced_reachability, rev: new_rev };
+    let settings = Settings {
+        version: super::store::VERSION,
+        nodes: body.nodes,
+        outbound: body.outbound,
+        enhanced_reachability: body.enhanced_reachability,
+        rev: new_rev,
+    };
     let Ok(document) = settings.to_json() else {
         return refuse("Those settings could not be stored.");
     };
@@ -415,7 +464,19 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
     let catalog = load_catalog_meta(env).await;
     let catalog_hosts = catalog_hosts_for_state(env, &settings.outbound).await;
     let runtime_candidates = runtime_candidates_for_state(env, &settings.outbound).await;
-    let state = api::state(&settings, &host, &sub_base, &xhttp_path, Source::Stored, None, &geo, catalog, &catalog_hosts, &runtime_candidates, None);
+    let state = api::state(
+        &settings,
+        &host,
+        &sub_base,
+        &xhttp_path,
+        Source::Stored,
+        None,
+        &geo,
+        catalog,
+        &catalog_hosts,
+        &runtime_candidates,
+        None,
+    );
     Ok(json(&SavedResponse { ok: true, state })?)
 }
 
@@ -465,7 +526,12 @@ async fn export(req: &Request, env: &Env) -> Result<Response> {
     };
 
     let settings = load_settings(env, &host_of(req)).await;
-    match bundle::render(&settings.nodes, target, shape, settings.enhanced_reachability) {
+    match bundle::render(
+        &settings.nodes,
+        target,
+        shape,
+        settings.enhanced_reachability,
+    ) {
         Ok(b) => json(&Export {
             body: b.body,
             content_type: b.content_type,
@@ -479,15 +545,18 @@ async fn export(req: &Request, env: &Env) -> Result<Response> {
 
 async fn qr(req: &Request, env: &Env) -> Result<Response> {
     let pairs = query(req);
-    let Some(subject) = api::qr_subject(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-    else {
+    let Some(subject) = api::qr_subject(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))) else {
         return refuse("That QR code could not be read.");
     };
 
     let host = host_of(req);
     let text = match subject {
         api::QrSubject::Subscription(client) => {
-            format!("https://{host}{}/{}", var(env, "SUB_PATH"), bundle::client_slug(client))
+            format!(
+                "https://{host}{}/{}",
+                var(env, "SUB_PATH"),
+                bundle::client_slug(client)
+            )
         }
         api::QrSubject::Node { tag, client } => {
             let settings = load_settings(env, &host).await;
@@ -597,17 +666,18 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         // record keeps the total (candidate_key format) as before.
         let (health, dial_ip, tcp_ms, probe_ms) = match probe_one(&host, port).await {
             Ok(trace) => (
-                prior.observed_ok(trace.country, trace.colo, trace.exit_ip, trace.latency_ms, now),
+                prior.observed_ok(
+                    trace.country,
+                    trace.colo,
+                    trace.exit_ip,
+                    trace.latency_ms,
+                    now,
+                ),
                 trace.dial_ip,
                 Some(trace.tcp_ms),
                 Some(trace.probe_ms),
             ),
-            Err((e, dial_ip, tcp_ms)) => (
-                prior.observed_fail(e, now),
-                dial_ip,
-                tcp_ms,
-                None,
-            ),
+            Err((e, dial_ip, tcp_ms)) => (prior.observed_fail(e, now), dial_ip, tcp_ms, None),
         };
         results.push(Row {
             host,
@@ -629,7 +699,11 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         state.geo.insert(key, health);
     }
     // Best score first: the panel shows the same order the dial path will use.
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(core::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
     if let Ok(document) = serde_json::to_string(&state) {
         if let Ok(pending) = kv.put(outbound_state::KV_KEY, document) {
             let _ = pending.execute().await;
@@ -693,11 +767,16 @@ async fn probe_one(host: &str, port: u16) -> core::result::Result<Trace, ProbeEr
         // candidate address itself so the panel never shows another IP.
         Ok(info) => {
             let remote = info.remote_address.unwrap_or_default();
-            if remote.is_empty() { host.to_owned() } else { remote }
+            if remote.is_empty() {
+                host.to_owned()
+            } else {
+                remote
+            }
         }
         Err(e) => return Err((format!("tcp connect: {e}"), format!("{host}:{port}"), None)),
     };
-    let tcp_ms = u32::try_from(worker::Date::now().as_millis().saturating_sub(t0)).unwrap_or(u32::MAX);
+    let tcp_ms =
+        u32::try_from(worker::Date::now().as_millis().saturating_sub(t0)).unwrap_or(u32::MAX);
     // SNI = the dial host (the runtime derives it from `connect`). Host header
     // = the dial host too: the trace endpoint on the candidate's edge expects
     // its own name. Both are the candidate's identity, never the Worker's.
@@ -716,7 +795,8 @@ async fn probe_one(host: &str, port: u16) -> core::result::Result<Trace, ProbeEr
         Ok(n) => n,
         Err(e) => return Err((format!("tls/read: {e}"), dial_ip, Some(tcp_ms))),
     };
-    let probe_ms = u32::try_from(worker::Date::now().as_millis().saturating_sub(t1)).unwrap_or(u32::MAX);
+    let probe_ms =
+        u32::try_from(worker::Date::now().as_millis().saturating_sub(t1)).unwrap_or(u32::MAX);
     let _ = sock.close().await;
     let text = String::from_utf8_lossy(&buf[..n]);
     let field = |name: &str| -> String {
@@ -728,7 +808,11 @@ async fn probe_one(host: &str, port: u16) -> core::result::Result<Trace, ProbeEr
     if loc.len() != 2 || !loc.bytes().all(|b| b.is_ascii_alphabetic()) {
         // No usable country: report it as a failure so the record's success
         // rate reflects that this candidate cannot satisfy a preference.
-        let reason = if loc.is_empty() { "no loc= in trace".to_owned() } else { format!("bad loc={loc}") };
+        let reason = if loc.is_empty() {
+            "no loc= in trace".to_owned()
+        } else {
+            format!("bad loc={loc}")
+        };
         return Err((reason, dial_ip, Some(tcp_ms)));
     }
     Ok(Trace {
@@ -771,6 +855,41 @@ async fn catalog_sync(env: &Env) -> Result<Response> {
     }
 }
 
+/// The GitHub Actions scanner's machine-to-machine sync (V24.7).
+///
+/// Authentication is the OIDC identity token in the Authorization header —
+/// never a shared password, never a session cookie. The token is verified
+/// against GitHub's published JWKS keys, and every identity claim must equal
+/// the one trusted value (repo, ref, workflow path, event). Anything less
+/// than a full pass is a 401; the previous snapshot in KV is untouched.
+#[cfg(target_arch = "wasm32")]
+async fn github_oidc_sync(req: &Request, env: &Env) -> Result<Response> {
+    use super::github_oidc as oidc;
+
+    let bearer = req
+        .headers()
+        .get("Authorization")
+        .ok()
+        .flatten()
+        .and_then(|v| v.strip_prefix("Bearer ").map(str::to_owned));
+    let Some(token) = bearer else {
+        return refuse("GitHub OIDC token required.");
+    };
+
+    let verified = oidc::verify_wasm(&token).await;
+    let Ok(identity) = verified else {
+        return refuse("GitHub identity not accepted.");
+    };
+
+    // Same shared, fail-closed validate+no-op+persist path the operator
+    // route uses — there is exactly one sync implementation.
+    let report = crate::catalog::sync(env).await;
+    if report.ok && report.changed {
+        refresh_catalog_meta(env).await;
+    }
+    let _ = identity; // subject kept for logs if reporting ever needs it
+    json(&report)
+}
 
 /// The session-written outbound state (LKG + V24.4.4 fallback), for the panel.
 #[cfg(target_arch = "wasm32")]
@@ -840,7 +959,11 @@ async fn probe_tcp_one(host: &str, port: u16) -> core::result::Result<Trace, Pro
     let dial_ip = match sock.opened().await {
         Ok(info) => {
             let remote = info.remote_address.unwrap_or_default();
-            if remote.is_empty() { host.to_owned() } else { remote }
+            if remote.is_empty() {
+                host.to_owned()
+            } else {
+                remote
+            }
         }
         Err(e) => return Err((format!("tcp connect: {e}"), format!("{host}:{port}"), None)),
     };
@@ -877,7 +1000,10 @@ async fn refresh_catalog_meta(env: &Env) {
     };
     let parsed: Option<serde_json::Value> = serde_json::from_str(&document).ok();
     let Some(document) = parsed else { return };
-    let fetched_at = document.get("fetchedAt").and_then(|v| v.as_str()).unwrap_or_default();
+    let fetched_at = document
+        .get("fetchedAt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let Ok(snapshot) =
         serde_json::from_value::<crate::catalog::Snapshot>(document["snapshot"].clone())
     else {
@@ -903,7 +1029,6 @@ fn query(req: &Request) -> Vec<(String, String)> {
     )
 }
 
-
 #[derive(Serialize)]
 struct Refusal<'a> {
     ok: bool,
@@ -916,7 +1041,10 @@ struct Refusal<'a> {
 /// reaction is to show the message and, if there is no session, the login form.
 /// Distinguishing them would add an oracle for no benefit to the operator.
 fn refuse(message: &str) -> Result<Response> {
-    let out = json(&Refusal { ok: false, error: message })?;
+    let out = json(&Refusal {
+        ok: false,
+        error: message,
+    })?;
     Ok(out.with_status(401))
 }
 
@@ -1016,7 +1144,11 @@ async fn pool_dial_test(req: &Request, env: &Env) -> Result<Response> {
                     error: String::new(),
                 }),
                 Err((reason, attempted, tcp_ms)) => rows.push(Row {
-                    candidate: if attempted.is_empty() { candidate } else { attempted },
+                    candidate: if attempted.is_empty() {
+                        candidate
+                    } else {
+                        attempted
+                    },
                     dial_ip: String::new(),
                     tcp_ms,
                     probe_ms: None,
@@ -1042,7 +1174,11 @@ async fn pool_dial_test(req: &Request, env: &Env) -> Result<Response> {
                 error: String::new(),
             }),
             Err((reason, attempted, tcp_ms)) => rows.push(Row {
-                candidate: if attempted.is_empty() { candidate } else { attempted },
+                candidate: if attempted.is_empty() {
+                    candidate
+                } else {
+                    attempted
+                },
                 dial_ip: String::new(),
                 tcp_ms,
                 probe_ms: None,

@@ -50,6 +50,187 @@ pub struct OutboundState {
     pub preferred: Option<String>,
     /// When the preference was written (session teardown time).
     pub updated_at_ms: u64,
+    /// Last measured health per candidate host, keyed by [`host_key`].
+    /// Written only by the operator-initiated panel probe, never the hot path.
+    /// Session teardown must preserve this map (see [`with_preference`]).
+    ///
+    /// Deserialised leniently: an earlier deployment stored this as
+    /// `{host: "DE"}`, and a whole-document parse failure would drop
+    /// `preferred` with it and cost every session its known-good route.
+    #[serde(default, deserialize_with = "de_geo")]
+    pub geo: std::collections::BTreeMap<String, Health>,
+    /// Country of the pool the current fallback was activated FOR (the
+    /// configured primary at activation time). Empty when no fallback ran.
+    #[serde(default)]
+    pub fallback_primary: String,
+    /// Country whose pool is currently dialed on top of the primary.
+    /// Empty when no fallback is active.
+    #[serde(default)]
+    pub fallback_active: String,
+    /// When the fallback was (re)activated. Drives the 5-minute hold in
+    /// [`fallback_fresh`].
+    #[serde(default)]
+    pub fallback_at_ms: u64,
+}
+
+/// Accept both the current record shape and the older country-string shape.
+///
+/// A bare country carries no measurement, so it loads as country-only with no
+/// success count: it can satisfy a preference filter but never ranks as
+/// measured-healthy until a probe confirms it.
+fn de_geo<'de, D>(d: D) -> core::result::Result<std::collections::BTreeMap<String, Health>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Record(Health),
+        Country(String),
+    }
+
+    let raw = std::collections::BTreeMap::<String, Entry>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|(host, entry)| {
+            let health = match entry {
+                Entry::Record(h) => h,
+                Entry::Country(country) => Health { country, ..Default::default() },
+            };
+            (host, health)
+        })
+        .collect())
+}
+
+/// What the panel probe last measured for one candidate.
+///
+/// One record per candidate host, stored on this document because it is read
+/// on the dial path and a second KV key would be a second read per session.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Health {
+    /// Exit country (ISO 3166-1 alpha-2), empty when the probe could not read
+    /// one. Only a non-empty value can satisfy a country preference.
+    pub country: String,
+    /// Cloudflare colo the egress landed in, for the operator's eyes.
+    pub colo: String,
+    /// Exit IP as the trace reported it. A candidate whose exit IP changes
+    /// between probes is not a stable identity, which is what
+    /// [`Health::stable`] reports.
+    pub exit_ip: String,
+    /// Round trip of the last successful probe, milliseconds.
+    pub latency_ms: u32,
+    /// Whether the last probe succeeded.
+    pub ok: bool,
+    /// Successful probes since this record was created.
+    pub ok_count: u32,
+    /// Failed probes since this record was created.
+    pub fail_count: u32,
+    /// Set when a probe saw a different exit IP than the one already stored:
+    /// the egress is rotating, so it cannot offer a consistent identity.
+    pub rotating: bool,
+    /// When this record was last written (probe time).
+    pub updated_at_ms: u64,
+    /// Last probe error, when the last probe failed.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+impl Health {
+    /// Success rate over observed probes, 0.0 when nothing is known.
+    #[must_use]
+    pub fn success_rate(&self) -> f64 {
+        let total = self.ok_count.saturating_add(self.fail_count);
+        if total == 0 {
+            return 0.0;
+        }
+        f64::from(self.ok_count) / f64::from(total)
+    }
+
+    /// Whether this candidate is currently usable as a preferred exit.
+    #[must_use]
+    pub fn healthy(&self) -> bool {
+        self.ok && !self.country.is_empty()
+    }
+
+    /// Whether the exit identity has held still across probes.
+    #[must_use]
+    pub fn stable(&self) -> bool {
+        !self.rotating
+    }
+
+    /// Ranking score, higher is better. Ordering only — the absolute value
+    /// carries no meaning outside a comparison between candidates.
+    ///
+    /// Success rate dominates (a candidate that fails is worthless however
+    /// fast it is), then a stable exit identity, then latency. `wanted` adds
+    /// a country match bonus so a matching candidate outranks a marginally
+    /// faster one in the wrong country.
+    #[must_use]
+    pub fn score(&self, wanted: &str) -> f64 {
+        if !self.ok {
+            return f64::from(self.success_rate() as f32) * 10.0;
+        }
+        let mut score = self.success_rate() * 100.0;
+        if self.stable() {
+            score += 25.0;
+        }
+        let wanted = wanted.trim();
+        if !wanted.is_empty() && self.country.eq_ignore_ascii_case(wanted) {
+            score += 40.0;
+        }
+        // Latency: a full 20 points at 0 ms decaying to 0 at 400 ms, so it
+        // breaks ties without ever outweighing reliability.
+        let latency_penalty = f64::from(self.latency_ms.min(400)) / 400.0;
+        score += 20.0 * (1.0 - latency_penalty);
+        score
+    }
+
+    /// Fold a fresh successful probe into this record.
+    #[must_use]
+    pub fn observed_ok(
+        mut self,
+        country: String,
+        colo: String,
+        exit_ip: String,
+        latency_ms: u32,
+        now_ms: u64,
+    ) -> Self {
+        // A changed exit IP is the rotation signal. First observation is not
+        // rotation: there is nothing to have changed from.
+        if !self.exit_ip.is_empty() && !exit_ip.is_empty() && self.exit_ip != exit_ip {
+            self.rotating = true;
+        }
+        // Same for country: an exit that moves between countries cannot serve
+        // a country preference consistently, even if the IP is unchanged.
+        if !self.country.is_empty() && !country.is_empty() && !self.country.eq_ignore_ascii_case(&country) {
+            self.rotating = true;
+        }
+        Self {
+            country,
+            colo,
+            exit_ip,
+            latency_ms,
+            ok: true,
+            ok_count: self.ok_count.saturating_add(1),
+            updated_at_ms: now_ms,
+            error: String::new(),
+            ..self
+        }
+    }
+
+    /// Fold a fresh failed probe into this record, keeping what was learned
+    /// before: a candidate that fails one probe has not lost its country.
+    #[must_use]
+    pub fn observed_fail(mut self, error: String, now_ms: u64) -> Self {
+        self.ok = false;
+        self.fail_count = self.fail_count.saturating_add(1);
+        self.updated_at_ms = now_ms;
+        self.error = error;
+        self
+    }
 }
 
 impl OutboundState {
@@ -74,6 +255,74 @@ impl OutboundState {
     }
 }
 
+/// Empty or a two-letter ISO 3166-1 alpha-2 code. Anything else is refused
+/// at save rather than silently ignored.
+#[must_use]
+pub fn valid_country(s: &str) -> bool {
+    let s = s.trim();
+    s.is_empty()
+        || (s.len() == 2 && s.bytes().all(|b| b.is_ascii_alphabetic()))
+}
+
+impl OutboundState {
+    /// Same document with a new LKG preference, geo map kept as-is.
+    #[must_use]
+    pub fn with_preference(self, preferred: Option<String>, updated_at_ms: u64) -> Self {
+        Self {
+            preferred,
+            updated_at_ms,
+            geo: self.geo,
+            fallback_primary: self.fallback_primary,
+            fallback_active: self.fallback_active,
+            fallback_at_ms: self.fallback_at_ms,
+        }
+    }
+
+    /// Empty preference, geo map kept. Used when a session demotes LKG.
+    #[must_use]
+    pub fn cleared_preference(self) -> Self {
+        Self {
+            preferred: None,
+            updated_at_ms: 0,
+            geo: self.geo,
+            fallback_primary: self.fallback_primary,
+            fallback_active: self.fallback_active,
+            fallback_at_ms: self.fallback_at_ms,
+        }
+    }
+}
+
+/// Is a recorded fallback still inside its hold window?
+///
+/// A fallback stays "fresh" for [`FALLBACK_HOLD_SECS`] from activation, and
+/// only while it is actually active AND for the same primary it was activated
+/// for — an operator who changes the configured location invalidates the
+/// hold immediately, so the next failure re-derives a fallback for the NEW
+/// primary instead of layering onto a stale one.
+#[must_use]
+pub fn fallback_fresh(state: &OutboundState, now_ms: u64) -> bool {
+    if state.fallback_active.is_empty() || state.fallback_at_ms == 0 {
+        return false;
+    }
+    now_ms.saturating_sub(state.fallback_at_ms) < FALLBACK_HOLD_SECS.saturating_mul(1000)
+}
+
+/// Rotation epoch for fallback selection: the index of the 10-minute
+/// `now_ms` bucket. Stable within a bucket, different across buckets, so
+/// consecutive failures in the same bucket rotate deterministically through
+/// [`crate::catalog::choose_fallback_country`]'s ranked candidates instead
+/// of always picking the first.
+#[must_use]
+pub fn fallback_epoch(now_ms: u64) -> u64 {
+    now_ms / FALLBACK_EPOCH_BUCKET_MS
+}
+
+/// How long an activated geographic fallback is honoured before expiring.
+pub const FALLBACK_HOLD_SECS: u64 = 300;
+
+/// Width of the fallback rotation bucket (10 minutes).
+pub const FALLBACK_EPOCH_BUCKET_MS: u64 = 600_000;
+
 /// The canonical comparison key for a candidate: host and PORT.
 ///
 /// Domains compare case-insensitively (KV stores what the panel saved, xray
@@ -91,25 +340,125 @@ pub fn candidate_key(target: &Target) -> String {
     format!("{host}:{}", target.port)
 }
 
-/// Move the fresh preferred candidate to the front of the plan, if it is one
-/// of the candidates at all.
+/// Move the fresh preferred candidate forward in the plan — behind the direct
+/// candidate, ahead of every other proxy — if it is one of the candidates at all.
+///
+/// # Why the logical destination keeps index 0
+///
+/// In Proxy IP mode the first candidate is the destination itself, dialled
+/// over the runtime's own network — the only candidate that never leaves
+/// Cloudflare's edge. Measured live: reordering the preferred proxy ahead of
+/// it sent Google-family, Netflix and Spotify SNIs through the third-party
+/// proxy pool, whose nodes answered those SNIs with TLS handshake alerts and,
+/// on one node, a forged certificate, while the same destinations over
+/// Cloudflare's own egress completed with the real certificate byte for byte.
+/// The preference therefore goes immediately *behind* the direct candidate:
+/// it still skips every other proxy, and it can never take traffic off the
+/// clean path.
 ///
 /// Pure: returns a new plan rather than mutating the input's `logical`, and
 /// preserves the candidate list exactly (same members, same length).
 #[must_use]
-pub fn order_plan(mut plan: DialPlan, state: &OutboundState, now_ms: u64) -> DialPlan {
-    let Some(pref) = state.preferred_fresh(now_ms) else {
-        return plan;
-    };
-    // Already first: leave the vector untouched rather than remove-and-insert
-    // an identical element, so callers comparing plans see no spurious change.
-    if let Some(idx) = plan.candidates.iter().position(|c| candidate_key(c) == pref) {
-        if idx > 0 {
-            let candidate = plan.candidates.remove(idx);
-            plan.candidates.insert(0, candidate);
+pub fn order_plan(plan: DialPlan, state: &OutboundState, now_ms: u64) -> DialPlan {
+    order_plan_pref(plan, state, now_ms, "")
+}
+
+/// [`order_plan`], plus an operator country preference (ISO 3166-1 alpha-2).
+///
+/// Equivalent to [`order_plan_ranked`] with no manual pin.
+#[must_use]
+pub fn order_plan_pref(
+    plan: DialPlan,
+    state: &OutboundState,
+    now_ms: u64,
+    country: &str,
+) -> DialPlan {
+    order_plan_ranked(plan, state, now_ms, country, "")
+}
+
+/// Order the proxy candidates: manual pin, then LKG, then measured quality.
+///
+/// Precedence is deliberate and narrow-to-broad. An explicit pin is the
+/// operator overriding the system, so it wins. LKG is next: it is the only
+/// signal produced by a real session rather than a probe. Quality ranking
+/// orders whatever is left.
+///
+/// Every rule here only *reorders*. No candidate is ever dropped, so a stale
+/// measurement, an unreachable pin or an unmet country preference costs
+/// attempt order and never connectivity — a bad selection cannot strand the
+/// operator. Slot 0 (the direct destination in Proxy IP mode) is never moved,
+/// so direct-first survives all of it.
+#[must_use]
+pub fn order_plan_ranked(
+    mut plan: DialPlan,
+    state: &OutboundState,
+    now_ms: u64,
+    country: &str,
+    pin: &str,
+) -> DialPlan {
+    let at = usize::from(plan.candidates.first() == Some(&plan.logical));
+    rank_by_quality(&mut plan, state, at, country);
+    if let Some(pref) = state.preferred_fresh(now_ms) {
+        if let Some(idx) = plan.candidates.iter().position(|c| candidate_key(c) == pref) {
+            if idx > at {
+                let candidate = plan.candidates.remove(idx);
+                plan.candidates.insert(at, candidate);
+            }
         }
     }
+    apply_pin(&mut plan, at, pin);
     plan
+}
+
+/// Sort proxy candidates by measured quality, best first.
+///
+/// Ordering only: every candidate stays in the plan, so a wrong or stale
+/// measurement costs attempt order and never reachability. Unmeasured
+/// candidates keep their configured order behind measured healthy ones —
+/// "unknown" must not outrank "known good", and must not be dropped either.
+fn rank_by_quality(plan: &mut DialPlan, state: &OutboundState, at: usize, country: &str) {
+    if plan.candidates.len().saturating_sub(at) < 2 {
+        return;
+    }
+    let mut tail: Vec<Target> = plan.candidates.split_off(at);
+    // Stable sort on the negated score: equal-scoring candidates (including
+    // every unmeasured one, all scoring 0) keep the operator's own order.
+    tail.sort_by(|a, b| {
+        let sa = state.geo.get(&host_key(a)).map_or(0.0, |h| h.score(country));
+        let sb = state.geo.get(&host_key(b)).map_or(0.0, |h| h.score(country));
+        sb.partial_cmp(&sa).unwrap_or(core::cmp::Ordering::Equal)
+    });
+    plan.candidates.extend(tail);
+}
+
+/// Move a manually pinned candidate to the front of the proxy candidates.
+///
+/// A pin the plan does not contain is ignored rather than enforced: the
+/// operator pinning a candidate they then removed must not cost the session
+/// its route.
+fn apply_pin(plan: &mut DialPlan, at: usize, pin: &str) {
+    let pin = pin.trim().to_ascii_lowercase();
+    if pin.is_empty() {
+        return;
+    }
+    if let Some(idx) = plan
+        .candidates
+        .iter()
+        .skip(at)
+        .position(|c| host_key(c) == pin || candidate_key(c) == pin)
+    {
+        let candidate = plan.candidates.remove(at + idx);
+        plan.candidates.insert(at, candidate);
+    }
+}
+
+/// The host part of a candidate key, without the port: geo is a property of
+/// the egress address, not of the port dialled.
+fn host_key(target: &Target) -> String {
+    match &target.host {
+        Host::Domain(d) => d.trim().to_ascii_lowercase(),
+        Host::Ip(ip) => ip.to_string(),
+    }
 }
 
 /// Whether a session that ended on `winner` should update the stored state.
@@ -175,13 +524,19 @@ pub enum DialVerdict<'a> {
 ///   preference is exactly the candidate that failed first this session —
 ///   then it is demoted immediately rather than steering sessions onto a
 ///   degraded proxy until its TTL expires (measured live: a stale cross-port
-///   preference cost every dial a full handshake timeout).
+///   preference cost every dial a full handshake timeout);
+/// - a proxy win by the preferred candidate itself demotes it when
+///   `bytes_dropped` is set: the egress connected but the session relayed
+///   almost nothing, the signature of a destination TLS that never completes
+///   behind a dirty IP. Reachable is not usable, so the preference is cleared
+///   and the next session falls through to the remaining candidates.
 #[must_use]
 pub fn lkg_on_session_result(
     preferred: Option<&str>,
     updated_at_ms: u64,
     verdict: DialVerdict<'_>,
     now_ms: u64,
+    bytes_dropped: bool,
 ) -> LkgAction {
     let pref_failed = |first_failed: Option<&str>| -> bool {
         preferred.is_some_and(|p| {
@@ -203,6 +558,14 @@ pub fn lkg_on_session_result(
                 return LkgAction::Record(winner.to_owned());
             }
             if pref_failed(first_failed) {
+                LkgAction::Clear
+            } else if preferred.is_some_and(|p| p.eq_ignore_ascii_case(winner)) && bytes_dropped {
+                // The preferred egress carried this session but the relay died
+                // with almost nothing exchanged: a destination TLS that never
+                // completes (blocked/dirty egress) looks exactly like this —
+                // connect succeeds, few or zero useful bytes flow, teardown.
+                // Demote so the next session tries the next candidate instead
+                // of re-pinning a connected-but-unusable IP for the TTL.
                 LkgAction::Clear
             } else {
                 LkgAction::Keep
@@ -234,18 +597,41 @@ mod tests {
     }
 
     fn state(pref: Option<&str>, at_ms: u64) -> OutboundState {
-        OutboundState { preferred: pref.map(str::to_owned), updated_at_ms: at_ms }
+        OutboundState {
+            preferred: pref.map(str::to_owned),
+            updated_at_ms: at_ms,
+            ..Default::default()
+        }
     }
 
     const NOW: u64 = 1_800_000_000_000;
 
     #[test]
-    fn fresh_preferred_moves_to_the_front() {
+    fn fresh_preferred_moves_behind_the_direct_candidate() {
         let p = plan(&["dest.example", "di.nscl.ir", "nima.nscl.ir"], 443);
         let ordered = order_plan(p, &state(Some("di.nscl.ir:443"), NOW - 1_000), NOW);
-        assert_eq!(ordered.candidates[0], t("di.nscl.ir", 443));
+        // The preference jumps the other proxies; direct keeps slot 0.
+        assert_eq!(ordered.candidates[0], t("dest.example", 443));
+        assert_eq!(ordered.candidates[1], t("di.nscl.ir", 443));
         assert_eq!(ordered.candidates.len(), 3);
         assert_eq!(ordered.logical, t("dest.example", 443));
+    }
+
+    #[test]
+    fn a_preferred_proxy_never_displaces_the_direct_candidate() {
+        // Measured live (2026-09-09): with a fresh `di.nscl.ir:443` preference
+        // the plan became [di, dest, nima], so Google-family, Netflix and
+        // Spotify SNIs were served by the third-party proxy pool — which
+        // answers some of them with a TLS handshake alert and, on one node, a
+        // forged certificate — instead of Cloudflare's own egress, which
+        // completes those same handshakes with the real certificate.
+        for pref in ["di.nscl.ir:443", "nima.nscl.ir:443"] {
+            let p = plan(&["dest.example", "di.nscl.ir", "nima.nscl.ir"], 443);
+            let out = order_plan(p, &state(Some(pref), NOW), NOW);
+            let host = pref.split(':').next().unwrap();
+            assert_eq!(out.candidates[0], t("dest.example", 443), "{pref}");
+            assert_eq!(out.candidates[1], t(host, 443), "{pref}");
+        }
     }
 
     #[test]
@@ -276,7 +662,8 @@ mod tests {
     fn matching_is_case_insensitive_and_trimmed() {
         let p = plan(&["dest.example", "DI.NSCL.IR"], 443);
         let ordered = order_plan(p, &state(Some("  di.nscl.ir:443 "), NOW - 1_000), NOW);
-        assert_eq!(ordered.candidates[0], t("DI.NSCL.IR", 443));
+        assert_eq!(ordered.candidates[0], t("dest.example", 443));
+        assert_eq!(ordered.candidates[1], t("DI.NSCL.IR", 443));
     }
 
     #[test]
@@ -288,7 +675,8 @@ mod tests {
             &state(Some("di.nscl.ir:443"), NOW - ttl_ms),
             NOW,
         );
-        assert_eq!(at_boundary.candidates[0], t("di.nscl.ir", 443));
+        assert_eq!(at_boundary.candidates[0], t("dest.example", 443));
+        assert_eq!(at_boundary.candidates[1], t("di.nscl.ir", 443));
         // One millisecond past it is stale and reorders nothing.
         let past_ttl =
             order_plan(plan(&["dest.example", "di.nscl.ir"], 443), &state(Some("di.nscl.ir:443"), NOW - ttl_ms - 1), NOW);
@@ -383,6 +771,43 @@ mod tests {
         assert!(!should_record(&t("DI.NSCL.IR", 443), &s, NOW));
     }
 
+
+    #[test]
+    fn preferred_winner_with_dropped_bytes_is_demoted() {
+        let stale = NOW - (WRITE_DEBOUNCE_SECS * 1000 * 100);
+        // Preferred egress carried the session but relayed almost nothing:
+        // connected-but-dirty signature -> clear instead of keep.
+        assert_eq!(
+            lkg_on_session_result(
+                Some("di.nscl.ir:443"),
+                stale,
+                DialVerdict::Won {
+                    winner: "di.nscl.ir:443",
+                    is_direct: false,
+                    first_failed: None,
+                },
+                NOW,
+                true,
+            ),
+            LkgAction::Clear
+        );
+        // Same session shape with real bytes exchanged keeps the preference.
+        assert_eq!(
+            lkg_on_session_result(
+                Some("di.nscl.ir:443"),
+                stale,
+                DialVerdict::Won {
+                    winner: "di.nscl.ir:443",
+                    is_direct: false,
+                    first_failed: None,
+                },
+                NOW,
+                false,
+            ),
+            LkgAction::Keep
+        );
+    }
+
     #[test]
     fn first_observation_records_immediately() {
         let s = OutboundState::default();
@@ -418,12 +843,14 @@ mod tests {
             ],
             nat64_prefixes: vec![],
             max_proxy_attempts: 8,
+            ..Default::default()
         };
         let target = t("www.gstatic.com", 443);
         let resolved = cfg.resolve(&target);
         let ordered = order_plan(resolved.clone(), &state(Some("nima.nscl.ir:443"), NOW - 1), NOW);
         assert_eq!(ordered.candidates.len(), resolved.candidates.len());
-        assert_eq!(candidate_key(&ordered.candidates[0]), "nima.nscl.ir:443");
+        assert_eq!(candidate_key(&ordered.candidates[0]), "www.gstatic.com:443");
+        assert_eq!(candidate_key(&ordered.candidates[1]), "nima.nscl.ir:443");
         assert_eq!(ordered.logical, target);
     }
 
@@ -436,7 +863,7 @@ mod tests {
         #[test]
         fn total_failure_clears_an_existing_preference() {
             assert_eq!(
-                lkg_on_session_result(PREF, AT, DialVerdict::Failed, NOW),
+                lkg_on_session_result(PREF, AT, DialVerdict::Failed, NOW, false),
                 LkgAction::Clear
             );
         }
@@ -444,7 +871,7 @@ mod tests {
         #[test]
         fn total_failure_without_preference_keeps() {
             assert_eq!(
-                lkg_on_session_result(None, 0, DialVerdict::Failed, NOW),
+                lkg_on_session_result(None, 0, DialVerdict::Failed, NOW, false),
                 LkgAction::Keep
             );
         }
@@ -461,7 +888,8 @@ mod tests {
                         is_direct: false,
                         first_failed: None
                     },
-                    NOW
+                    NOW,
+                    false,
                 ),
                 LkgAction::Record("nima.nscl.ir:443".into())
             );
@@ -475,7 +903,8 @@ mod tests {
                         is_direct: false,
                         first_failed: None
                     },
-                    NOW
+                    NOW,
+                    false,
                 ),
                 LkgAction::Keep
             );
@@ -492,7 +921,8 @@ mod tests {
                         is_direct: true,
                         first_failed: Some("di.nscl.ir:443")
                     },
-                    NOW
+                    NOW,
+                    false,
                 ),
                 LkgAction::Clear
             );
@@ -509,7 +939,8 @@ mod tests {
                         is_direct: true,
                         first_failed: Some("nima.nscl.ir:443")
                     },
-                    NOW
+                    NOW,
+                    false,
                 ),
                 LkgAction::Keep
             );
@@ -529,7 +960,8 @@ mod tests {
                         is_direct: false,
                         first_failed: Some("di.nscl.ir:443")
                     },
-                    NOW
+                    NOW,
+                    false,
                 ),
                 LkgAction::Record("nima.nscl.ir:443".into())
             );
@@ -549,10 +981,166 @@ mod tests {
                         is_direct: false,
                         first_failed: Some("di.nscl.ir:443")
                     },
-                    NOW
+                    NOW,
+                    false,
                 ),
                 LkgAction::Clear
             );
         }
+    }
+
+    /// A healthy measured candidate in `country`.
+    fn healthy(country: &str, latency_ms: u32) -> Health {
+        Health {
+            country: country.into(),
+            latency_ms,
+            ok: true,
+            ok_count: 4,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn country_preference_puts_matching_proxies_first_without_dropping_any() {
+        let p = plan(&["dest.example", "nima.nscl.ir", "di.nscl.ir"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("di.nscl.ir".into(), healthy("DE", 40));
+        s.geo.insert("nima.nscl.ir".into(), healthy("NL", 40));
+        let out = order_plan_pref(p, &s, NOW, "DE");
+        // Matching candidate leads; the non-matching one is still reachable.
+        assert_eq!(
+            out.candidates,
+            vec![t("dest.example", 443), t("di.nscl.ir", 443), t("nima.nscl.ir", 443)]
+        );
+        assert_eq!(out.logical, t("dest.example", 443));
+    }
+
+    #[test]
+    fn an_unsatisfiable_country_never_drops_the_working_route() {
+        let p = plan(&["dest.example", "di.nscl.ir", "nima.nscl.ir"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("di.nscl.ir".into(), healthy("DE", 40));
+        // Nothing is in US: every candidate must survive, direct still first.
+        let out = order_plan_pref(p.clone(), &s, NOW, "US");
+        assert_eq!(out.candidates.len(), p.candidates.len());
+        assert_eq!(out.candidates[0], t("dest.example", 443));
+        for c in &p.candidates {
+            assert!(out.candidates.contains(c), "{c:?} was dropped");
+        }
+    }
+
+    #[test]
+    fn a_measured_healthy_candidate_outranks_an_unmeasured_one() {
+        let p = plan(&["dest.example", "unknown.example", "di.nscl.ir"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("di.nscl.ir".into(), healthy("DE", 30));
+        let out = order_plan_pref(p, &s, NOW, "");
+        assert_eq!(
+            out.candidates,
+            vec![t("dest.example", 443), t("di.nscl.ir", 443), t("unknown.example", 443)]
+        );
+    }
+
+    #[test]
+    fn a_rotating_candidate_ranks_below_a_stable_one() {
+        let p = plan(&["dest.example", "rotating.example", "stable.example"], 443);
+        let mut s = state(None, NOW);
+        let mut churn = healthy("DE", 30);
+        churn.rotating = true;
+        s.geo.insert("rotating.example".into(), churn);
+        s.geo.insert("stable.example".into(), healthy("DE", 30));
+        let out = order_plan_pref(p, &s, NOW, "DE");
+        assert_eq!(out.candidates[1], t("stable.example", 443));
+    }
+
+    #[test]
+    fn a_failing_candidate_ranks_below_everything_but_stays_in_the_plan() {
+        let p = plan(&["dest.example", "dead.example", "live.example"], 443);
+        let mut s = state(None, NOW);
+        let dead = Health { fail_count: 3, ..Default::default() };
+        s.geo.insert("dead.example".into(), dead);
+        s.geo.insert("live.example".into(), healthy("DE", 50));
+        let out = order_plan_pref(p, &s, NOW, "");
+        assert_eq!(out.candidates[1], t("live.example", 443));
+        assert!(out.candidates.contains(&t("dead.example", 443)));
+    }
+
+    #[test]
+    fn a_pin_beats_the_ranking_and_an_unknown_pin_is_ignored() {
+        let p = plan(&["dest.example", "fast.example", "slow.example"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("fast.example".into(), healthy("DE", 10));
+        s.geo.insert("slow.example".into(), healthy("DE", 300));
+        // Pin loses nothing: the better-scoring candidate is still behind it.
+        let pinned = order_plan_ranked(p.clone(), &s, NOW, "", "slow.example");
+        assert_eq!(pinned.candidates[0], t("dest.example", 443));
+        assert_eq!(pinned.candidates[1], t("slow.example", 443));
+        assert_eq!(pinned.candidates.len(), 3);
+        // A pin that is not a candidate cannot cost the session its route.
+        let bogus = order_plan_ranked(p.clone(), &s, NOW, "", "gone.example");
+        assert_eq!(bogus.candidates, order_plan_pref(p, &s, NOW, "").candidates);
+    }
+
+    #[test]
+    fn lkg_still_wins_over_the_score_and_an_empty_country_is_a_noop() {
+        let p = plan(&["dest.example", "fast.example", "lkg.example"], 443);
+        let mut s = state(Some("lkg.example:443"), NOW);
+        s.geo.insert("fast.example".into(), healthy("DE", 10));
+        s.geo.insert("lkg.example".into(), healthy("DE", 200));
+        let out = order_plan_pref(p, &s, NOW, "");
+        assert_eq!(out.candidates[1], t("lkg.example", 443));
+    }
+
+    #[test]
+    fn a_changed_exit_ip_or_country_marks_the_candidate_rotating() {
+        let first = Health::default().observed_ok("DE".into(), "FRA".into(), "1.1.1.1".into(), 40, 1);
+        assert!(first.stable(), "first observation cannot be rotation");
+        assert!(first.healthy());
+        let same = first.clone().observed_ok("DE".into(), "FRA".into(), "1.1.1.1".into(), 42, 2);
+        assert!(same.stable());
+        let moved = same.clone().observed_ok("DE".into(), "FRA".into(), "2.2.2.2".into(), 40, 3);
+        assert!(moved.rotating, "changed exit IP is rotation");
+        let country_moved =
+            same.observed_ok("NL".into(), "AMS".into(), "1.1.1.1".into(), 40, 4);
+        assert!(country_moved.rotating, "changed country is rotation");
+    }
+
+    #[test]
+    fn a_failed_probe_keeps_what_was_measured_before() {
+        let ok = Health::default().observed_ok("DE".into(), "FRA".into(), "1.1.1.1".into(), 40, 1);
+        let failed = ok.observed_fail("tls reset".into(), 2);
+        assert!(!failed.ok);
+        assert!(!failed.healthy());
+        assert_eq!(failed.country, "DE", "a failed probe must not erase the country");
+        assert_eq!(failed.error, "tls reset");
+        assert!((failed.success_rate() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_stored_document_from_the_previous_geo_format_still_loads_its_lkg() {
+        // V24 wrote `geo` as {host: "DE"}; this shape upgraded it to a record.
+        // A whole-document parse failure would silently drop `preferred` too
+        // and cost every session its last-known-good route, so the old shape
+        // must degrade to "country only" rather than to "nothing".
+        let old = r#"{"preferred":"di.nscl.ir:443","updatedAtMs":1789555828007,
+                     "geo":{"di.nscl.ir":"DE","nima.nscl.ir":"NL"}}"#;
+        let s = OutboundState::from_json(old);
+        assert_eq!(s.preferred.as_deref(), Some("di.nscl.ir:443"), "LKG must survive the format change");
+        assert_eq!(s.updated_at_ms, 1_789_555_828_007);
+        assert_eq!(s.geo.get("di.nscl.ir").map(|h| h.country.as_str()), Some("DE"));
+        assert_eq!(s.geo.get("nima.nscl.ir").map(|h| h.country.as_str()), Some("NL"));
+        // Carried-over countries are not treated as measured health: nothing
+        // was measured about reachability, so they must not rank as healthy.
+        assert!(!s.geo["di.nscl.ir"].healthy());
+    }
+
+    #[test]
+    fn valid_country_accepts_empty_and_alpha2() {
+        assert!(valid_country(""));
+        assert!(valid_country("DE"));
+        assert!(valid_country("nl"));
+        assert!(!valid_country("DEU"));
+        assert!(!valid_country("D"));
+        assert!(!valid_country("12"));
     }
 }
