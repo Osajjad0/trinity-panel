@@ -290,7 +290,11 @@ fn now_iso(ms: u64) -> String {
 
 #[cfg(target_arch = "wasm32")]
 async fn fetch_feed() -> Result<Vec<u8>, String> {
-    let request = worker::Request::new(FEED_URL, worker::Method::Get).map_err(|e| e.to_string())?;
+    // Cache-bust: raw.githubusercontent.com serves stale copies for minutes
+    // after a push, and a sync that runs right after publishing must see the
+    // revision it was invoked for (the idempotency check compares hashes).
+    let url = format!("{FEED_URL}?t={}", worker::Date::now().as_millis());
+    let request = worker::Request::new(&url, worker::Method::Get).map_err(|e| e.to_string())?;
     // Bounded fetch: race the send against a deadline so a hung edge never
     // blocks the operator route. Both futures are pinned in place.
     let fetch = worker::Fetch::Request(request);

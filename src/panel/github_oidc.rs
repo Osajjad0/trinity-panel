@@ -298,7 +298,8 @@ async fn verify_signature(
     let subtle = crypto.subtle();
 
     let algorithm =
-        JSON::parse(r#"{"name":"RSASSA-PKCS1-v1_5"}"#).map_err(|_| Rejection::BadSignature)?;
+        JSON::parse(r#"{"name":"RSASSA-PKCS1-v1_5","hash":"SHA-256"}"#)
+            .map_err(|_| Rejection::BadSignature)?;
     let usages = js_sys::Array::of1(&JsValue::from_str("verify"));
 
     let imported: JsValue = JsFuture::from(
