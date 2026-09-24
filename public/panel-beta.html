@@ -722,10 +722,12 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 "use strict";
 
 // Trinity Panel release version (shown only as the Advanced badge).
-const APP_VERSION = "1.9.3";
+const APP_VERSION = "1.9.5";
+const APP_RELEASE_NAME = "Mega Huge Update";
 {
   const badge = document.getElementById("app-version-badge");
   if (badge) badge.textContent = `v${APP_VERSION}`;
+  if (badge) badge.title = APP_RELEASE_NAME;
 }
 
 // The panel lives under a secret prefix, so every request is built from the
@@ -1368,6 +1370,19 @@ function renderCatalog() {
     listBox.append(row);
   });
   $("cat-runtime-loc").textContent = (OUTBOUND.catalogCountry || "AUTO").toUpperCase();
+  // v1.9.5 enforced-location semantics: Pool + concrete country = the runtime
+  // dials ONLY that country's verified candidates (no direct-first, no
+  // cross-country fallback). Say so where the operator is looking.
+  const fbEnforcedEl = $("cat-fallback");
+  if (fbEnforcedEl && !STATE.fallback?.active) {
+    const enforced = (OUTBOUND.mode === "pool" || OUTBOUND.catalogPool)
+      && OUTBOUND.catalogCountry
+      && OUTBOUND.catalogCountry !== "AUTO";
+    fbEnforcedEl.textContent = enforced
+      ? `Enforced location: traffic dials ONLY ${OUTBOUND.catalogCountry} candidates (no direct, no cross-country fallback).`
+      : "";
+    fbEnforcedEl.className = enforced ? "st st-ready" : "";
+  }
   // V24.4.4 runtime fallback (spec 5): warning chip, no blinking. The
   // configured location is never rewritten.
   const fb = STATE.fallback;

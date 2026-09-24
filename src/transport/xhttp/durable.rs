@@ -613,7 +613,7 @@ async fn catalog_pool_from_snapshot(
         resolved,
         &known_state,
         now_ms(),
-        "",
+        &outbound_cfg.catalog_country,
         &outbound_cfg.pinned_proxy,
     );
     let started_ms = now_ms();
@@ -628,7 +628,13 @@ async fn catalog_pool_from_snapshot(
             // tried every candidate — that IS the exhaustion definition). The
             // configured location is never rewritten; the fallback country's
             // candidates ride the same resolve/plan/dial engine.
-            let fb = if outbound_cfg.mode == crate::relay::outbound::ProxyMode::Pool {
+            // Enforced location never falls back to another country: the
+            // session fails instead (the operator selected this egress;
+            // silently leaving it would present one location and deliver
+            // another).
+            let fb = if outbound_cfg.mode == crate::relay::outbound::ProxyMode::Pool
+                && !outbound_cfg.enforces_location()
+            {
                 crate::catalog::try_pool_fallback(
                     env,
                     &outbound_cfg,
@@ -656,7 +662,7 @@ async fn catalog_pool_from_snapshot(
                 resolved,
                 &known_state,
                 now_ms(),
-                "",
+                &outbound_cfg.catalog_country,
                 &outbound_cfg.pinned_proxy,
             );
             match connect::open_with_plan_tracked(&plan).await {

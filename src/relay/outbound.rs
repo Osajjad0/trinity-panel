@@ -165,10 +165,19 @@ impl OutboundConfig {
     /// everything already in the plan, capped so the manual list can never
     /// be crowded out. An empty `generated` list degrades to plain
     /// `resolve`, for every mode.
+    ///
+    /// EXCEPTION — enforced location: Pool mode with a concrete country is
+    /// the operator's explicit egress selection. The plan is the selected
+    /// country's candidates ONLY (pin still first); the direct destination
+    /// never enters the plan, so a working direct route cannot win over the
+    /// chosen country. `AUTO`/empty country keep legacy direct-first.
     #[must_use]
     pub fn resolve_with_catalog(&self, target: &Target, generated: &[String]) -> DialPlan {
         if generated.is_empty() {
             return self.resolve(target);
+        }
+        if self.enforces_location() {
+            return self.resolve_enforced(target, generated);
         }
         let mut plan = self.resolve(target);
         // Manual pin first among the proxies (its own entry stays; dedupe
@@ -205,6 +214,58 @@ impl OutboundConfig {
             }
         }
         plan
+    }
+
+    /// Pool mode with a concrete (non-AUTO, non-empty) catalog country =
+    /// the operator explicitly selected that egress location. Enforced.
+    #[must_use]
+    pub fn enforces_location(&self) -> bool {
+        self.mode == ProxyMode::Pool && {
+            let cc = self.catalog_country.trim();
+            !cc.is_empty() && !cc.eq_ignore_ascii_case("AUTO") && cc.len() == 2
+        }
+    }
+
+    /// The enforced-location plan: pinned proxy (if still present in the
+    /// pool), then the selected country's verified candidates. No direct
+    /// candidate — the session fails rather than silently leaving the
+    /// selected country. Candidates keep catalog order (health ranking may
+    /// reorder them, [`crate::relay::outbound_state::order_plan_ranked`]);
+    /// nothing outside `generated` can appear.
+    fn resolve_enforced(&self, target: &Target, generated: &[String]) -> DialPlan {
+        let pin = self.pinned_proxy.trim();
+        let mut candidates: Vec<Target> = Vec::with_capacity(generated.len() + 1);
+        let mut appended = 0usize;
+        for entry in generated {
+            let Some(candidate) = parse_candidate(entry) else {
+                continue;
+            };
+            // Dedupe by host+port: a pool listing the pin twice must not
+            // dial it twice after promotion.
+            let host = candidate_host(&candidate);
+            if candidates
+                .iter()
+                .any(|c| candidate_host(c) == host && c.port == candidate.port)
+            {
+                continue;
+            }
+            candidates.push(candidate);
+            appended += 1;
+            if appended >= crate::catalog::MAX_POOL_CANDIDATES {
+                break;
+            }
+        }
+        if !pin.is_empty() {
+            if let Some(idx) = candidates.iter().position(|c| {
+                let host = candidate_host(c);
+                host.eq_ignore_ascii_case(pin)
+                    || format!("{host}:{}", c.port).eq_ignore_ascii_case(pin)
+            }) {
+                let pinned = candidates.remove(idx);
+                candidates.insert(0, pinned);
+            }
+        }
+        DialPlan { logical: target.clone(), candidates }
     }
 
     fn resolve_proxy_ip(&self, target: &Target) -> DialPlan {
@@ -582,6 +643,9 @@ mod tests {
     #[test]
     fn catalog_endpoints_keep_their_own_port() {
         // AZ fixture: one endpoint on 8443. It must NOT be rewritten to 443.
+        // This fixture is an ENFORCED location (Pool + concrete country): the
+        // direct candidate is not in the plan at all — candidates are only
+        // the selected country's verified endpoints, in order.
         let cfg = OutboundConfig {
             mode: ProxyMode::Pool,
             proxy_candidates: vec!["203.0.113.10".into()],
@@ -592,10 +656,68 @@ mod tests {
         let t = target("example.com", 443);
         let gen = vec!["180.149.44.124:8443".to_owned(), "85.185.86.111:2053".to_owned()];
         let plan = cfg.resolve_with_catalog(&t, &gen);
-        assert_eq!(plan.candidates[2].port, 8443);
-        assert_eq!(plan.candidates[3].port, 2053);
-        // And the destination port is untouched for the direct candidate.
-        assert_eq!(plan.candidates[0].port, 443);
+        assert_eq!(plan.candidates[0].port, 8443);
+        assert_eq!(plan.candidates[1].port, 2053);
+        // Enforcement keeps out the direct candidate AND the manual
+        // candidate from another country (203.0.113.10 is a manual proxy,
+        // not part of the AZ pool).
+        assert!(!plan.candidates.iter().any(|c| candidate_host(c) == "203.0.113.10"));
+        assert!(!plan.candidates.iter().any(|c| c.host == t.host && c.port == t.port));
+        assert_eq!(plan.logical, t);
+    }
+
+    #[test]
+    fn enforced_location_plan_is_pool_only_and_pin_leads() {
+        // Pool + concrete country = enforced: no direct, pin first, pool order kept.
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Pool,
+            proxy_candidates: vec!["203.0.113.10".into()],
+            catalog_pool: true,
+            catalog_country: "DE".into(),
+            pinned_proxy: "de-two.example:443".into(),
+            ..Default::default()
+        };
+        let t = target("gemini.example", 443);
+        let gen = vec![
+            "de-one.example:443".to_owned(),
+            "de-two.example:443".to_owned(),
+            "198.51.100.9:443".to_owned(), // NOT the pin; stays behind
+        ];
+        let plan = cfg.resolve_with_catalog(&t, &gen);
+        assert_eq!(plan.candidates.len(), 3);
+        assert_eq!(plan.candidates[0].host, Host::Domain("de-two.example".into()));
+        assert_eq!(plan.candidates[1].host, Host::Domain("de-one.example".into()));
+        assert_eq!(plan.candidates[2].host, Host::Ip("198.51.100.9".parse().unwrap()));
+        assert!(plan.candidates.iter().all(|c| c.host != t.host || c.port != t.port),
+            "no direct candidate in an enforced plan");
+    }
+
+    #[test]
+    fn empty_or_auto_country_keeps_direct_first() {
+        for cc in ["", "AUTO", "auto"] {
+            let cfg = OutboundConfig {
+                mode: ProxyMode::Pool,
+                catalog_pool: true,
+                catalog_country: cc.into(),
+                ..Default::default()
+            };
+            let t = target("example.com", 443);
+            let plan = cfg.resolve_with_catalog(&t, &["198.51.100.9:443".to_owned()]);
+            assert_eq!(plan.candidates[0], t, "cc={cc:?} keeps direct-first");
+        }
+    }
+
+    #[test]
+    fn empty_generated_degrades_to_plain_resolve_even_enforced() {
+        let cfg = OutboundConfig {
+            mode: ProxyMode::Pool,
+            catalog_pool: true,
+            catalog_country: "DE".into(),
+            ..Default::default()
+        };
+        let t = target("example.com", 443);
+        let plan = cfg.resolve_with_catalog(&t, &[]);
+        assert_eq!(plan.candidates, vec![t.clone()]);
     }
 
     #[test]

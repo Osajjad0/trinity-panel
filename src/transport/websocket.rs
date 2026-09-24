@@ -223,7 +223,7 @@ async fn serve(
                     resolved,
                     &known_state,
                     worker::Date::now().as_millis(),
-                    "",
+                    &outbound_cfg.catalog_country,
                     &outbound_cfg.pinned_proxy,
                 );
                 let (sock, winner_idx, failed_first) = match
@@ -235,7 +235,13 @@ async fn serve(
                         // the whole primary pool was attempted (that is the
                         // exhaustion definition). Same resolve/plan/dial
                         // engine — only the candidate source changes.
-                        let fb = if outbound_cfg.mode == crate::relay::outbound::ProxyMode::Pool {
+                        // Enforced location never falls back to another
+                        // country: the session fails instead (the operator
+                        // selected this egress; silently leaving it would
+                        // present one location and deliver another).
+                        let fb = if outbound_cfg.mode == crate::relay::outbound::ProxyMode::Pool
+                            && !outbound_cfg.enforces_location()
+                        {
                             crate::catalog::try_pool_fallback(
                                 env,
                                 &outbound_cfg,
@@ -257,7 +263,7 @@ async fn serve(
                                 resolved,
                                 &known_state,
                                 worker::Date::now().as_millis(),
-                                "",
+                                &outbound_cfg.catalog_country,
                                 &outbound_cfg.pinned_proxy,
                             );
                             if let Ok(triple) = connect::open_with_plan_tracked(&plan).await {
