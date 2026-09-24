@@ -13,7 +13,7 @@
 use crate::config::model::{
     ClientTarget, Flow, Node, Protocol, Security, Transport, VmessCipher, XhttpMode,
 };
-use crate::translate::util::{normalise_path, ALPN};
+use crate::translate::util::{default_alpn, normalise_path};
 use crate::translate::{gate, EmitError};
 
 use super::encode::{base64, base64_url_nopad, fragment, percent};
@@ -83,8 +83,15 @@ fn common_params(node: &Node, enhanced: bool) -> Vec<(&'static str, String)> {
             if let Some(sni) = &t.sni {
                 p.push(("sni", sni.clone()));
             }
-            let alpn = if t.alpn.is_empty() { ALPN.join(",") } else { t.alpn.join(",") };
-            p.push(("alpn", alpn));
+            // WebSocket/HTTPUpgrade complete an HTTP/1.1 upgrade: advertising h2
+            // makes TLS negotiate HTTP/2 and the upgrade has no connection to run
+            // on — the client sees EOF right after the dial. Only transports that
+            // actually ride h2 advertise an ALPN (see util::default_alpn).
+            if let Some(alpn) = if t.alpn.is_empty() { default_alpn(&node.transport) } else { None } {
+                p.push(("alpn", alpn.join(",")));
+            } else if !t.alpn.is_empty() {
+                p.push(("alpn", t.alpn.join(",")));
+            }
             if let Some(fp) = &t.fingerprint {
                 p.push(("fp", fp.clone()));
             } else if enhanced {
@@ -352,6 +359,28 @@ mod tests {
 
     fn xhttp() -> Transport {
         Transport::Xhttp { mode: XhttpMode::PacketUp, path: "/p".into(), host: None }
+    }
+
+    fn ws() -> Transport {
+        Transport::WebSocket { path: "/ws".into(), host: None, heartbeat_secs: 30 }
+    }
+
+    #[test]
+    fn ws_link_never_advertises_h2_alpn() {
+        // An h2 ALPN makes TLS negotiate HTTP/2, and the HTTP/1.1 WS upgrade has
+        // no connection to run on: the client dials fine, then gets EOF. This is
+        // the regression that killed every WS link in the 2026-09-24 sub.
+        let xh = node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, xhttp());
+        assert!(to_uri(&xh, ClientTarget::V2rayN, false).expect("emits").contains("alpn=h2"),
+            "xhttp rides h2 and keeps its ALPN");
+
+        let w = node(Protocol::Vless { uuid: "u".into(), flow: Flow::None }, ws());
+        let uri = to_uri(&w, ClientTarget::V2rayN, false).expect("emits");
+        assert!(uri.contains("type=ws"), "{uri}");
+        assert!(!uri.contains("alpn="), "WS must let the dialer pick http/1.1: {uri}");
+
+        let tr = node(Protocol::Trojan { password: "p".into() }, ws());
+        assert!(!to_uri(&tr, ClientTarget::V2rayN, false).expect("emits").contains("alpn="));
     }
 
     #[test]
