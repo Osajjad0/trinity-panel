@@ -969,9 +969,22 @@ fn probe_dial_address(host: &str) -> String {
 /// subrequest budget (free plan 50) with headroom for KV ops, and bounds the
 /// worst-case wall time (sequential probes; Cloudflare connect refusals fail
 /// fast in practice — `ponytail:` no per-probe timer race, add one if
-/// blackhole candidates ever make a pass exceed the workflow's patience).
+/// ever make a pass exceed the workflow's patience).
 #[cfg(target_arch = "wasm32")]
 const VERIFY_MAX_PER_CALL: usize = 40;
+
+/// Wall-clock ceiling for ONE verification pass. The workflow re-invokes with
+/// the returned cursor until `done`, so an unfinished pass is a pause, not a
+/// failure. Measured: blackhole candidates hang `opened()` until the runtime's
+/// own connect timeout, and 40 of those killed the whole request with a 503
+/// (run 36056854232) — the pass budget, not more retries, is the fix.
+#[cfg(target_arch = "wasm32")]
+const VERIFY_PASS_BUDGET_MS: u64 = 80_000;
+
+/// Per-probe connect ceiling for [`probe_tcp_one`]. Under the pass budget:
+/// even 40 consecutive worst-case probes fit inside one pass.
+#[cfg(target_arch = "wasm32")]
+const VERIFY_PROBE_TIMEOUT_MS: u64 = 8_000;
 
 /// One bounded worker-vantage verification pass over the catalog.
 ///
@@ -1085,7 +1098,17 @@ async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<R
         .collect();
     let mut probed = 0u32;
     let mut reachable = 0u32;
+    let pass_started = worker::Date::now().as_millis();
+    let mut paused = false;
     for e in &order[start..end] {
+        // Pass wall-clock guard: stop cleanly and report a resume cursor
+        // instead of blowing the request limit with a 503. The workflow loops.
+        if worker::Date::now().as_millis().saturating_sub(pass_started)
+            > VERIFY_PASS_BUDGET_MS
+        {
+            paused = true;
+            break;
+        }
         let target = crate::protocol::Target {
             host: e.host.parse::<std::net::IpAddr>().map_or_else(
                 |_| crate::protocol::Host::Domain(e.host.trim().to_owned().into_boxed_str()),
@@ -1128,10 +1151,13 @@ async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<R
             }
         }
     }
-    let done = end >= total;
+    // Resume cursor: the natural slice boundary, or wherever the wall-clock
+    // guard paused us. Both are "continue from here" for the workflow loop.
+    let resumed_at = if paused { start + probed as usize } else { end };
+    let done = !paused && end >= total;
     json(&serde_json::json!({
         "ok": true,
-        "cursor": if done { 0 } else { end },
+        "cursor": if done { 0 } else { resumed_at },
         "done": done,
         "probed": probed,
         "reachable": reachable,
@@ -1208,16 +1234,41 @@ async fn probe_tcp_one(host: &str, port: u16) -> core::result::Result<Trace, Pro
         .secure_transport(SecureTransport::Off)
         .connect(&dial_addr, port)
         .map_err(|e| (e.to_string(), format!("{host}:{port}"), None))?;
-    let dial_ip = match sock.opened().await {
-        Ok(info) => {
-            let remote = info.remote_address.unwrap_or_default();
-            if remote.is_empty() {
-                host.to_owned()
-            } else {
-                remote
+    // opened() has no internal deadline; a blackhole address would hang until
+    // the runtime's own connect timeout and — repeated — killed whole passes
+    // with a 503 (run 36056854232). Race it against a per-probe ceiling: the
+    // loser is a plain "tcp connect" verdict, exactly like any other refusal.
+    // Scoping the select drops the (finished) futures before `sock.close()`
+    // — the loser borrows `sock` immutably and must be gone by then.
+    enum Dial { Ok(String), Err(String), Timeout }
+    let verdict = {
+        let opened = core::pin::pin!(sock.opened());
+        let budget = core::pin::pin!(gloo_timers::future::sleep(
+            std::time::Duration::from_millis(VERIFY_PROBE_TIMEOUT_MS)
+        ));
+        match futures_util::future::select(opened, budget).await {
+            futures_util::future::Either::Left((Ok(info), _)) => {
+                let remote = info.remote_address.unwrap_or_default();
+                Dial::Ok(if remote.is_empty() { host.to_owned() } else { remote })
+            }
+            futures_util::future::Either::Left((Err(e), _)) => {
+                Dial::Err(format!("tcp connect: {e}"))
+            }
+            futures_util::future::Either::Right((_, _)) => {
+                Dial::Timeout
             }
         }
-        Err(e) => return Err((format!("tcp connect: {e}"), format!("{host}:{port}"), None)),
+    };
+    let dial_ip = match verdict {
+        Dial::Ok(ip) => ip,
+        Dial::Err(e) => return Err((e, format!("{host}:{port}"), None)),
+        Dial::Timeout => {
+            return Err((
+                "tcp connect: handshake timed out".into(),
+                format!("{host}:{port}"),
+                None,
+            ))
+        }
     };
     let tcp_ms =
         u32::try_from(worker::Date::now().as_millis().saturating_sub(t0)).unwrap_or(u32::MAX);
