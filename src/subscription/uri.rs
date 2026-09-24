@@ -203,8 +203,12 @@ fn trojan(node: &Node, password: &str, enhanced: bool) -> String {
 fn vmess(node: &Node, uuid: &str, cipher: VmessCipher, enhanced: bool) -> Result<String, EmitError> {
     let p: std::collections::HashMap<&str, String> = client_params(node, enhanced).into_iter().collect();
 
+    // Auto must name a real AEAD: sing-box-based importers (Hiddify, Karing,
+    // NekoBox) turn scy=auto into VMess security 0x05 (none) on the wire —
+    // live-proven against Trinity 2026-09-24 — while Xray maps it to AES.
+    // Naming aes-128-gcm is correct for both cores.
     let scy = match cipher {
-        VmessCipher::Auto => "auto",
+        VmessCipher::Auto => "aes-128-gcm",
         VmessCipher::Aes128Gcm => "aes-128-gcm",
         VmessCipher::Chacha20Poly1305 => "chacha20-poly1305",
         VmessCipher::Zero => "zero",

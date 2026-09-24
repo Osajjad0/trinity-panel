@@ -296,9 +296,15 @@ fn packet_encoding() -> String {
 ///
 /// Note the ChaCha name differs from Xray's `chacha20-ietf-poly1305`; sing-box
 /// wants `chacha20-poly1305` and rejects the other.
+///
+/// `Auto` must map to a real AEAD, never `"auto"`: sing-box emits `security=auto`
+/// on the wire as VMess security `0x05` (`none`, unencrypted) instead of picking
+/// a cipher the way Xray does, and every AEAD-only server (including Trinity)
+/// refuses it. Captured and live-proven 2026-09-24: `auto` → server `body_split`
+/// rejection; `aes-128-gcm`/`chacha20-poly1305` → `relay_done`.
 fn vmess_security(cipher: VmessCipher) -> &'static str {
     match cipher {
-        VmessCipher::Auto => "auto",
+        VmessCipher::Auto => "aes-128-gcm",
         VmessCipher::Aes128Gcm => "aes-128-gcm",
         VmessCipher::Chacha20Poly1305 => "chacha20-poly1305",
         // Unlike Xray — which maps this to `auto` without a word — sing-box
@@ -945,6 +951,16 @@ mod tests {
         // Xray writes chacha20-ietf-poly1305; sing-box rejects that name.
         assert_eq!(vmess_security(VmessCipher::Chacha20Poly1305), "chacha20-poly1305");
         assert_eq!(vmess_security(VmessCipher::Zero), "zero");
+    }
+
+    #[test]
+    fn vmess_auto_never_emits_sing_boxs_auto() {
+        // sing-box's own `auto` reaches the wire as VMess security 0x05 (none,
+        // unencrypted) rather than negotiating a cipher like Xray's. Trinity
+        // (and every AEAD-only server) refuses it at the body codec: live-proven
+        // 2026-09-24 — auto → split rejection, aes-128-gcm → relay_done. The
+        // emitter must therefore name a real AEAD for the panel's default.
+        assert_eq!(vmess_security(VmessCipher::Auto), "aes-128-gcm");
     }
 
     #[test]

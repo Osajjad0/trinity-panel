@@ -617,6 +617,8 @@ async fn catalog_pool_from_snapshot(
         &outbound_cfg.pinned_proxy,
     );
     let started_ms = now_ms();
+    let mut plan = plan;
+    connect::maybe_skip_direct_for_test(&mut plan, &env);
     let dial = connect::open_with_plan_tracked(&plan).await;
     let (mut sock, winner_idx, failed_first) = match dial {
         Ok(triple) => triple,

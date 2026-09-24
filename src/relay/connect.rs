@@ -47,6 +47,23 @@ pub fn is_permitted(target: &Target) -> bool {
     !target.is_locally_rejectable()
 }
 
+/// TEST-ONLY diagnostic: when the worker carries `TRINITY_TEST_NO_DIRECT=true`,
+/// remove the direct candidate from a dial plan so every session must fall
+/// through to the Proxy-IP candidates. Never set in production; exists so the
+/// forced-fallback egress experiment can run without changing routing
+/// semantics.
+#[cfg(target_arch = "wasm32")]
+pub fn maybe_skip_direct_for_test(plan: &mut crate::relay::outbound::DialPlan, env: &worker::Env) {
+    if env
+        .var("TRINITY_TEST_NO_DIRECT")
+        .map(|v| v.to_string() == *"true")
+        .unwrap_or(false)
+        && plan.candidates.len() > 1
+    {
+        plan.candidates.remove(0);
+    }
+}
+
 /// Await one candidate's handshake, bounded by an injected timeout future.
 ///
 /// Shared by every arm of [`imp::open_with_plan`] so a blackholed destination
