@@ -1191,6 +1191,8 @@ fn health_counts(
                 None => unverified += 1,
             }
         }
+        // Stage-C census from the feed (absent on older feeds).
+        let capabilities = snapshot.capability_counts.get(country);
         out.insert(
             country.clone(),
             serde_json::json!({
@@ -1198,7 +1200,9 @@ fn health_counts(
                 "trinityReachable": reachable,
                 "quarantined": quarantined,
                 "unverified": unverified,
-                "capability": "cf-relay",
+                "passthrough": capabilities.and_then(|c| c.get("passthrough")).copied().unwrap_or(0),
+                "cfRelay": capabilities.and_then(|c| c.get("cf-relay")).copied().unwrap_or(0),
+                "sniTerminate": capabilities.and_then(|c| c.get("sni-terminate")).copied().unwrap_or(0),
             }),
         );
     }

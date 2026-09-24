@@ -51,6 +51,13 @@ pub struct Snapshot {
     /// Deterministic best-effort spread across countries for Auto mode.
     #[serde(default)]
     pub auto: Vec<Endpoint>,
+    /// Per-country Stage-C relay-capability census from the feed
+    /// (`country_metadata[cc].capability_counts`), when the feed carries it.
+    /// Older feeds without it default to empty and the panel degrades to the
+    /// feed-level `capability` note.
+    #[serde(default)]
+    pub capability_counts:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, u32>>,
 }
 
 /// What a hex string looks like.
@@ -91,6 +98,24 @@ impl Snapshot {
         }
         let snapshot: Snapshot =
             serde_json::from_slice(bytes).map_err(|e| format!("feed is not valid JSON: {e}"))?;
+        // Stage-C census rides inside `country_metadata[cc].capability_counts`
+        // (nested, optional; older feeds and the raw feed omit it). Lift it to
+        // the snapshot field the panel reads; absence stays an empty map.
+        let mut snapshot = snapshot;
+        if let Ok(document) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            if let Some(metadata) = document.get("country_metadata").and_then(|m| m.as_object()) {
+                for (cc, body) in metadata {
+                    if let Some(counts) = body.get("capability_counts").and_then(|c| c.as_object())
+                    {
+                        let mapped: std::collections::BTreeMap<String, u32> = counts
+                            .iter()
+                            .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as u32)))
+                            .collect();
+                        snapshot.capability_counts.insert(cc.clone(), mapped);
+                    }
+                }
+            }
+        }
         if snapshot.schema_version != 1 {
             return Err(format!("unsupported schema_version {}", snapshot.schema_version));
         }
@@ -689,6 +714,7 @@ mod fallback_tests {
             countries: map,
             unassigned: Vec::new(),
             auto: Vec::new(),
+            capability_counts: std::collections::BTreeMap::new(),
         }
     }
 
