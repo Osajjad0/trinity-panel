@@ -339,6 +339,7 @@ def main() -> int:
         "(diagnostics only; production deployments omit it)",
     )
     ap.add_argument("--no-do", action="store_true", help="Skip the Durable Object migration (redeploys)")
+    ap.add_argument("--ws", action="store_true", help="Enable the WebSocket transport (WS_ENABLED=true); omit for XHTTP-only")
     args = ap.parse_args()
 
     token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
@@ -408,7 +409,7 @@ def main() -> int:
             {"type": "plain_text", "name": "XHTTP_PATH", "text": xhttp_path},
             {"type": "plain_text", "name": "PANEL_PATH", "text": panel_path},
             {"type": "plain_text", "name": "SUB_PATH", "text": sub_path},
-            {"type": "plain_text", "name": "WS_ENABLED", "text": "false"},
+            {"type": "plain_text", "name": "WS_ENABLED", "text": "true" if args.ws else "false"},
             {"type": "plain_text", "name": "WS_PATH", "text": "/ws"},
             {"type": "secret_text", "name": "VLESS_USERS", "text": user_uuid},
             {"type": "secret_text", "name": "TROJAN_USERS", "text": trojan_pw},
