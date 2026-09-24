@@ -135,32 +135,20 @@ async fn serve(
     // rather than blocking or failing the session.
     let state_env = env.clone();
     let settings_env = env.clone();
-    let (outbound_cfg, generated, known_state) = futures_util::future::join3(
+    let (outbound_cfg, snapshot, known_state) = futures_util::future::join3(
         crate::relay::outbound::load(env),
         async move {
-            // Candidates come straight from the VERIFIED snapshot (scanner
-            // verified); the operator's location selects the pool.
-            let Ok(kv) = settings_env.kv("SETTINGS") else { return Vec::new() };
-            let raw = kv.get(crate::panel::store::KEY).text().await.ok().flatten();
-            let Some(raw) = raw else { return Vec::new() };
-            let cfg = crate::relay::outbound::from_settings_json(&raw);
-            let mut generated = cfg.verified_catalog_candidates.clone();
-            if generated.is_empty() && (cfg.catalog_pool || cfg.mode == crate::relay::outbound::ProxyMode::Pool) {
-                if let Some(snapshot_raw) = kv.get(crate::catalog::KV_KEY).text().await.ok().flatten() {
-                    if let Ok(document) = serde_json::from_str::<serde_json::Value>(&snapshot_raw) {
-                        if let Ok(snapshot) = serde_json::from_value::<
-                            crate::catalog::Snapshot>(document["snapshot"].clone())
-                        {
-                            if let Some(pool) = crate::catalog::pool_for(&cfg, Some(&snapshot)) {
-                                generated = pool.into_iter()
-                                    .map(|e| format!("{}:{}", e.host, e.port))
-                                    .collect();
-                            }
-                        }
-                    }
-                }
-            }
-            generated
+            // The VERIFIED snapshot is the only catalog input; the operator's
+            // location selects the pool. The pool itself is built after the
+            // join — it is pure over the two documents this join reads, so
+            // Trinity's worker-vantage health overlay can gate eligibility
+            // with zero extra KV round trips (and the old second settings
+            // read is gone).
+            let Ok(kv) = settings_env.kv("SETTINGS") else { return None };
+            let snapshot_raw = kv.get(crate::catalog::KV_KEY).text().await.ok().flatten()?;
+            let document = serde_json::from_str::<serde_json::Value>(&snapshot_raw).ok()?;
+            serde_json::from_value::<crate::catalog::Snapshot>(document.get("snapshot")?.clone())
+                .ok()
         },
         async move {
             match state_env.kv("SETTINGS") {
@@ -173,6 +161,28 @@ async fn serve(
         },
     )
     .await;
+
+    // Pool construction is pure over the documents the join already read —
+    // zero extra KV round trips. `known_state.geo` carries Trinity's own
+    // worker-vantage verdicts: a quarantined candidate never enters the pool.
+    let mut generated = outbound_cfg.verified_catalog_candidates.clone();
+    if generated.is_empty()
+        && (outbound_cfg.catalog_pool
+            || outbound_cfg.mode == crate::relay::outbound::ProxyMode::Pool)
+    {
+        if let Some(snapshot) = snapshot.as_ref() {
+            if let Some(pool) = crate::catalog::pool_for_with_health(
+                &outbound_cfg,
+                Some(snapshot),
+                &known_state.geo,
+            ) {
+                generated = pool
+                    .into_iter()
+                    .map(|e| format!("{}:{}", e.host, e.port))
+                    .collect();
+            }
+        }
+    }
 
     // The protocol header arrives in the first message, but not necessarily
     // *only* in the first message: transport framing does not align with

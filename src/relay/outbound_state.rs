@@ -155,6 +155,21 @@ impl Health {
         self.ok && !self.country.is_empty()
     }
 
+    /// Whether Trinity's own evidence says this candidate cannot carry
+    /// traffic at all — the worker-vantage verdict `trinity_reachable=false`.
+    ///
+    /// Two shapes quarantine: a hard TCP connect failure (the worker's own
+    /// egress could not reach the address at all — the exact US-pool failure
+    /// the vantage model exists to catch, and transient by nature almost
+    /// never), or two consecutive recorded failures (repeated soft failures,
+    /// e.g. TLS/relay). A single soft failure only demotes: it stays eligible
+    /// but ranks last, so one blip cannot strand the operator. A later
+    /// [`Self::observed_ok`] clears the verdict (self-healing re-verify).
+    #[must_use]
+    pub fn quarantined(&self) -> bool {
+        !self.ok && (self.fail_count >= 2 || self.error.starts_with("tcp connect"))
+    }
+
     /// Whether the exit identity has held still across probes.
     #[must_use]
     pub fn stable(&self) -> bool {
@@ -1063,6 +1078,33 @@ mod tests {
         let out = order_plan_pref(p, &s, NOW, "");
         assert_eq!(out.candidates[1], t("live.example", 443));
         assert!(out.candidates.contains(&t("dead.example", 443)));
+    }
+
+    #[test]
+    fn quarantine_lifecycle_hard_fail_single_soft_recovery() {
+        // Hard TCP unreachable from the worker's own egress quarantines on
+        // the first observation (the 44-IP US failure must leave the pool
+        // immediately, not after a second 2-hour cycle).
+        let hard = Health::default().observed_fail("tcp connect: cannot connect to the specified address".into(), NOW);
+        assert!(hard.quarantined(), "hard unreachable must quarantine");
+        // A single soft failure only demotes — one blip cannot strand the operator.
+        let soft_once = Health::default().observed_fail("tls handshake failed".into(), NOW);
+        assert!(!soft_once.quarantined(), "single soft failure demotes only");
+        // Repeated soft failures quarantine (reliability, not a one-off).
+        let soft_twice = soft_once.clone().observed_fail("tls handshake failed".into(), NOW + 1);
+        assert!(soft_twice.quarantined(), "two consecutive failures quarantine");
+        // Recovery: a later success clears the verdict (self-healing) and
+        // preserves whatever exit identity was known.
+        let mut known = hard.clone();
+        known.country = "US".into();
+        known.exit_ip = "198.51.100.7".into();
+        let recovered = known.observed_ok("US".into(), "IAD".into(), "198.51.100.7".into(), 40, NOW + 2);
+        assert!(!recovered.quarantined(), "a successful re-verify must return the candidate");
+        assert!(recovered.healthy());
+        // Country and exit identity survived the outage (the demotion was
+        // about reachability, not identity).
+        assert_eq!(recovered.country, "US");
+        assert_eq!(recovered.exit_ip, "198.51.100.7");
     }
 
     #[test]

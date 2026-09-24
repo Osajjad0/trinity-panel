@@ -202,6 +202,19 @@ pub async fn panel(mut req: Request, env: &Env, rest: &str) -> Result<Response> 
     if action == Api::CatalogSyncGithub {
         return github_oidc_sync(&req, env).await;
     }
+    // The 2-hour verification pass is also a machine caller (the workflow
+    // right after the sync), authenticating with the same GitHub OIDC
+    // identity. An operator session rides the normal gate below.
+    if action == Api::VerifyCatalog
+        && req
+            .headers()
+            .get("Authorization")
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.starts_with("Bearer "))
+    {
+        return github_oidc_verify(&req, env).await;
+    }
 
     if !action.is_public() && !has_session(&req, &password) {
         return refuse("Your session has expired. Sign in again.");
@@ -231,6 +244,8 @@ pub async fn panel(mut req: Request, env: &Env, rest: &str) -> Result<Response> 
         Api::CatalogSync => catalog_sync(env).await,
         Api::CatalogSyncGithub => unreachable!("handled before the session gate"),
         Api::PoolDialTest => pool_dial_test(&req, env).await,
+        Api::VerifyCatalog => verify_catalog(&req, env).await,
+        Api::HealthOverlay => health_overlay(env).await,
         Api::CatalogMeta => {
             let meta = load_catalog_meta(env).await;
             json(&meta)
@@ -362,7 +377,10 @@ async fn runtime_candidates_for_state(
     else {
         return Vec::new();
     };
-    crate::catalog::pool_for(cfg, Some(&snapshot))
+    // Trinity's worker-vantage verdicts gate eligibility here exactly as on
+    // the dial path: the panel never shows a pool the runtime would refuse.
+    let state = load_outbound_state(env).await;
+    crate::catalog::pool_for_with_health(cfg, Some(&snapshot), &state.geo)
         .unwrap_or_default()
         .into_iter()
         .map(|e| format!("{}:{}", e.host, e.port))
@@ -947,6 +965,212 @@ fn probe_dial_address(host: &str) -> String {
         .unwrap_or_else(|_| host.to_owned())
 }
 
+/// Upper bound on TCP probes per invocation: stays under the Workers
+/// subrequest budget (free plan 50) with headroom for KV ops, and bounds the
+/// worst-case wall time (sequential probes; Cloudflare connect refusals fail
+/// fast in practice — `ponytail:` no per-probe timer race, add one if
+/// blackhole candidates ever make a pass exceed the workflow's patience).
+#[cfg(target_arch = "wasm32")]
+const VERIFY_MAX_PER_CALL: usize = 40;
+
+/// One bounded worker-vantage verification pass over the catalog.
+///
+/// The decisive reachability verdict for a candidate is a TCP connect FROM
+/// THIS WORKER'S EGRESS — the vantage that will actually dial it at runtime.
+/// GitHub-side health is source evidence only: a candidate the scanner loves
+/// but the worker cannot reach (the 44-IP US failure) gets a `tcp connect`
+/// verdict here, which quarantines it out of every pool until a later pass
+/// proves otherwise. Verdicts fold into the outbound-state health map — the
+/// same records runtime feedback and the panel read — with ONE batched KV
+/// write per pass, only when something changed.
+///
+/// Stateless cursor: `?cursor=N&budget=M` slices the deterministic
+/// [`crate::catalog::verify_order`] list; the 2-hour workflow loops until
+/// `done: true`, so no verification queue or shared schedule state exists.
+#[cfg(target_arch = "wasm32")]
+async fn verify_catalog(req: &Request, env: &Env) -> Result<Response> {
+    let cursor = query(req)
+        .into_iter()
+        .find(|(k, _)| k == "cursor")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let budget = query(req)
+        .into_iter()
+        .find(|(k, _)| k == "budget")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(VERIFY_MAX_PER_CALL)
+        .clamp(1, VERIFY_MAX_PER_CALL);
+    verify_catalog_run(cursor, budget, env).await
+}
+
+/// [`verify_catalog`] behind the GitHub OIDC identity: the scheduled workflow
+/// is a machine, exactly like the catalog sync it follows.
+#[cfg(target_arch = "wasm32")]
+async fn github_oidc_verify(req: &Request, env: &Env) -> Result<Response> {
+    use super::github_oidc as oidc;
+
+    let bearer = req
+        .headers()
+        .get("Authorization")
+        .ok()
+        .flatten()
+        .and_then(|v| v.strip_prefix("Bearer ").map(str::to_owned));
+    let Some(token) = bearer else {
+        return refuse("GitHub OIDC token required.");
+    };
+    if oidc::verify_wasm(&token).await.is_err() {
+        return refuse("GitHub identity not accepted.");
+    }
+    verify_catalog(req, env).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<Response> {
+    let Some(snapshot) = crate::catalog::stored(env).await else {
+        return refuse("No verified catalog snapshot. Sync first.");
+    };
+    let mut state = load_outbound_state(env).await;
+    // The country in use is verified first (see `catalog::verify_order`).
+    let configured = {
+        let Ok(kv) = env.kv(KV_BINDING) else {
+            return refuse("KV unavailable.");
+        };
+        match kv.get(crate::panel::store::KEY).text().await {
+            Ok(Some(raw)) => crate::relay::outbound::from_settings_json(&raw)
+                .catalog_country
+                .trim()
+                .to_ascii_uppercase(),
+            _ => String::new(),
+        }
+    };
+    let order = crate::catalog::verify_order(&snapshot, &state.geo, &configured);
+    let total = order.len();
+    let start = cursor.min(total);
+    let end = (start + budget).min(total);
+    let now = worker::Date::now().as_millis();
+    let mut probed = 0u32;
+    let mut reachable = 0u32;
+    for e in &order[start..end] {
+        let target = crate::protocol::Target {
+            host: e.host.parse::<std::net::IpAddr>().map_or_else(
+                |_| crate::protocol::Host::Domain(e.host.trim().to_owned().into_boxed_str()),
+                crate::protocol::Host::Ip,
+            ),
+            port: e.port,
+        };
+        let key = crate::relay::outbound_state::candidate_key(&target);
+        let prior = state.geo.get(&key).cloned().unwrap_or_default();
+        // probe_tcp_one classifies for us: every failure arrives as
+        // "tcp connect: …" — the hard-unreachable verdict — while a success
+        // preserves any exit identity learned elsewhere (a TCP connect knows
+        // nothing about the exit IP or country).
+        let updated = match probe_tcp_one(&e.host, e.port).await {
+            Ok(trace) => {
+                reachable += 1;
+                prior.observed_ok(
+                    prior.country.clone(),
+                    prior.colo.clone(),
+                    prior.exit_ip.clone(),
+                    trace.latency_ms,
+                    now,
+                )
+            }
+            Err((error, _, _)) => prior.observed_fail(error, now),
+        };
+        state.geo.insert(key, updated);
+        probed += 1;
+    }
+    // One batched write per pass, and only when a verdict actually changed.
+    let changed = order[start..end].iter().any(|e| {
+        let key = crate::relay::outbound_state::candidate_key(&crate::protocol::Target {
+            host: e.host.parse::<std::net::IpAddr>().map_or_else(
+                |_| crate::protocol::Host::Domain(e.host.trim().to_owned().into_boxed_str()),
+                crate::protocol::Host::Ip,
+            ),
+            port: e.port,
+        });
+        state.geo.get(&key).map(|h| h.updated_at_ms == now).unwrap_or(false)
+    });
+    if changed {
+        if let Ok(kv) = env.kv(KV_BINDING) {
+            if let Ok(document) = serde_json::to_string(&state) {
+                if let Ok(pending) = kv.put(outbound_state::KV_KEY, document) {
+                    let _ = pending.execute().await;
+                }
+            }
+        }
+    }
+    let done = end >= total;
+    json(&serde_json::json!({
+        "ok": true,
+        "cursor": if done { 0 } else { end },
+        "done": done,
+        "probed": probed,
+        "reachable": reachable,
+        "total": total,
+        "counts": health_counts(&snapshot, &state),
+    }))
+}
+
+/// Per-country health counts for the debug view — the honest numbers:
+/// discovered (feed) vs Trinity-reachable vs quarantined. "8 healthy" is
+/// never shown when Trinity can reach 0 of them.
+#[cfg(target_arch = "wasm32")]
+fn health_counts(
+    snapshot: &crate::catalog::Snapshot,
+    state: &outbound_state::OutboundState,
+) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (country, list) in &snapshot.countries {
+        let mut discovered = 0u32;
+        let mut reachable = 0u32;
+        let mut quarantined = 0u32;
+        let mut unverified = 0u32;
+        for e in list {
+            discovered += 1;
+            let key = format!("{}:{}", e.host.to_ascii_lowercase(), e.port);
+            match state.geo.get(&key) {
+                Some(h) if h.quarantined() => quarantined += 1,
+                Some(h) if h.ok => reachable += 1,
+                Some(_) => unverified += 1,
+                None => unverified += 1,
+            }
+        }
+        out.insert(
+            country.clone(),
+            serde_json::json!({
+                "discovered": discovered,
+                "trinityReachable": reachable,
+                "quarantined": quarantined,
+                "unverified": unverified,
+                "capability": "cf-relay",
+            }),
+        );
+    }
+    serde_json::Value::Object(out.into_iter().map(|(k, v)| (k, v)).collect())
+}
+
+/// The health overlay itself, for the panel/API debug view.
+#[cfg(target_arch = "wasm32")]
+async fn health_overlay(env: &Env) -> Result<Response> {
+    let Some(snapshot) = crate::catalog::stored(env).await else {
+        return refuse("No verified catalog snapshot. Sync first.");
+    };
+    let state = load_outbound_state(env).await;
+    let quarantined: Vec<String> = state
+        .geo
+        .iter()
+        .filter(|(_, h)| h.quarantined())
+        .map(|(k, h)| format!("{k} [{}]", h.error))
+        .collect();
+    json(&serde_json::json!({
+        "ok": true,
+        "counts": health_counts(&snapshot, &state),
+        "quarantined": quarantined,
+    }))
+}
+
 async fn probe_tcp_one(host: &str, port: u16) -> core::result::Result<Trace, ProbeError> {
     use worker::SecureTransport;
     let t0 = worker::Date::now().as_millis();
@@ -1098,12 +1322,16 @@ async fn pool_dial_test(req: &Request, env: &Env) -> Result<Response> {
     };
 
     // Same shape the runtime derives in Pool mode; only the location differs
-    // for this one request. Nothing is persisted.
+    // for this one request. Nothing is persisted. The worker-vantage overlay
+    // gates eligibility exactly as on the dial path.
     let mut cfg = settings.outbound.clone();
     cfg.mode = crate::relay::outbound::ProxyMode::Pool;
     cfg.catalog_pool = true;
     cfg.catalog_country = location.to_ascii_uppercase();
-    let Some(pool) = crate::catalog::pool_for(&cfg, Some(&snapshot)) else {
+    let health_state = load_outbound_state(env).await;
+    let Some(pool) =
+        crate::catalog::pool_for_with_health(&cfg, Some(&snapshot), &health_state.geo)
+    else {
         return refuse(&format!(
             "No verified Proxy-IP candidates available for {location}."
         ));

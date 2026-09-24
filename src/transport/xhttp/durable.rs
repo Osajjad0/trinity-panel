@@ -462,28 +462,23 @@ async fn own_session(ctx: OwnerContext) {
     // A clone for the settings read; the original stays here for the
     // SESSION_DIAG-gated publication at teardown.
     let settings_env = env.clone();
-    // Catalog candidates come straight from the VERIFIED snapshot (every
-    // entry was verified by the GitHub scanner; Trinity adds no health step).
-    // The operator's location selects the pool; runtime caps it.
+    // Catalog candidates come straight from the VERIFIED snapshot (scanner
+    // source verification) with Trinity's worker-vantage health overlay on
+    // top; the operator's location selects the pool; runtime caps it.
     let settings_load = async move {
         match settings_env.kv("SETTINGS") {
             Ok(kv) => match kv.get(crate::panel::store::KEY).text().await {
                 Ok(Some(raw)) => {
                     let cfg = crate::relay::outbound::from_settings_json(&raw);
-                    let mut generated = cfg.verified_catalog_candidates.clone();
-                    if generated.is_empty() && (cfg.catalog_pool || cfg.mode == crate::relay::outbound::ProxyMode::Pool) {
-                        if let Some(pool) = catalog_pool_from_snapshot(&cfg, &kv).await {
-                            generated = pool
-                                .into_iter()
-                                .map(|e| format!("{}:{}", e.host, e.port))
-                                .collect();
-                        }
-                    }
-                    (cfg, generated)
+                    // The snapshot rides along; the pool is built after the
+                    // join (pure) so Trinity's worker-vantage health overlay
+                    // can gate eligibility with zero extra KV round trips.
+                    let snapshot = catalog_snapshot_from_kv(&kv).await;
+                    (cfg, snapshot)
                 }
-                _ => (OutboundConfig::default(), Vec::new()),
+                _ => (OutboundConfig::default(), None),
             },
-            Err(_) => (OutboundConfig::default(), Vec::new()),
+            Err(_) => (OutboundConfig::default(), None),
         }
     };
 
@@ -502,16 +497,13 @@ async fn own_session(ctx: OwnerContext) {
         }
     };
 
-/// Verified snapshot pool for the operator's location (KV read, bounded).
-async fn catalog_pool_from_snapshot(
-    cfg: &OutboundConfig,
-    kv: &worker::kv::KvStore,
-) -> Option<Vec<crate::catalog::Endpoint>> {
+/// The verified snapshot document itself (KV read) — pool construction is
+/// pure and happens after the join, where the worker-vantage health overlay
+/// is available.
+async fn catalog_snapshot_from_kv(kv: &worker::kv::KvStore) -> Option<crate::catalog::Snapshot> {
     let raw = kv.get(crate::catalog::KV_KEY).text().await.ok().flatten()?;
     let document: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let snapshot: crate::catalog::Snapshot =
-        serde_json::from_value(document.get("snapshot")?.clone()).ok()?;
-    crate::catalog::pool_for(cfg, Some(&snapshot))
+    serde_json::from_value(document.get("snapshot")?.clone()).ok()
 }
 
     // Accumulate until a complete header parses. A header CAN arrive split
@@ -572,12 +564,33 @@ async fn catalog_pool_from_snapshot(
         }
     };
 
-    let (Some(header), (outbound_cfg, generated), known_state) =
+    let (Some(header), (outbound_cfg, snapshot), known_state) =
         futures_util::future::join3(header_phase, settings_load, state_load).await
     else {
         break 'owner OwnerOutcome::Refused;
     };
     lkg_for_teardown = known_state.clone();
+    // Pool construction is pure over the joined documents — zero extra KV
+    // round trips. `known_state.geo` carries Trinity's worker-vantage
+    // verdicts: a quarantined candidate never enters the pool.
+    let mut generated = outbound_cfg.verified_catalog_candidates.clone();
+    if generated.is_empty()
+        && (outbound_cfg.catalog_pool
+            || outbound_cfg.mode == crate::relay::outbound::ProxyMode::Pool)
+    {
+        if let Some(snapshot) = snapshot.as_ref() {
+            if let Some(pool) = crate::catalog::pool_for_with_health(
+                &outbound_cfg,
+                Some(snapshot),
+                &known_state.geo,
+            ) {
+                generated = pool
+                    .into_iter()
+                    .map(|e| format!("{}:{}", e.host, e.port))
+                    .collect();
+            }
+        }
+    }
     let Ok(req) = detect::detect(&header, &creds, now_secs()) else {
         break 'owner OwnerOutcome::Refused;
     };

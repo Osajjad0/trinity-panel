@@ -59,6 +59,15 @@ pub enum Api {
     /// Dial-test the verified pool for a location WITHOUT persisting anything
     /// (KV-quota-independent validation path; operator-initiated).
     PoolDialTest,
+    /// One bounded worker-vantage verification pass (TCP reachability FROM
+    /// this Worker's egress) over catalog candidates. Session-gated for
+    /// operators; the 2-hour GitHub workflow rides the same OIDC verifier as
+    /// `CatalogSyncGithub` (vantage model: scanner health is source
+    /// evidence, this is the Trinity-usable verdict).
+    VerifyCatalog,
+    /// Per-country health counts + quarantined list — the honest debug view
+    /// (discovered vs Trinity-reachable vs quarantined).
+    HealthOverlay,
     /// The stored catalog metadata (revision/counts) — lets the scanner's
     /// automation skip a sync when the feed revision is unchanged (V24.6.1 §13).
     CatalogMeta,
@@ -91,6 +100,8 @@ pub fn route(method: &str, rest: &str) -> Api {
         ("POST", "api/catalog-sync") => Api::CatalogSync,
         ("POST", "api/catalog-sync-github") => Api::CatalogSyncGithub,
         ("POST", "api/pool-dial-test") => Api::PoolDialTest,
+        ("POST" | "GET", "api/verify-catalog") => Api::VerifyCatalog,
+        ("GET", "api/health-overlay") => Api::HealthOverlay,
         ("GET", "api/catalog-meta") => Api::CatalogMeta,
         _ => Api::Unknown,
     }
@@ -773,6 +784,11 @@ mod tests {
             // pin that it can never quietly become session-free without the
             // verifier in front.
             Api::CatalogSyncGithub,
+            // Same contract as the sync route: `serve` short-circuits a
+            // Bearer-carrying request to the same OIDC verifier; a session
+            // rides the normal gate. Never public.
+            Api::VerifyCatalog,
+            Api::HealthOverlay,
         ] {
             assert!(!api.is_public(), "{api:?} must require a session");
         }

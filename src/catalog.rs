@@ -526,9 +526,17 @@ fn bounded(
         }
     };
     let mut deduped: Vec<Endpoint> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     for e in candidates {
-        if seen.insert((e.host.to_ascii_lowercase(), e.port)) {
+        // Trinity-vantage quarantine (see `Health::quarantined`): a candidate
+        // the worker itself could not reach — or that failed repeatedly —
+        // never enters a pool. This is the eligibility half of the health
+        // model; ordering below is the ranking half. Absent record = no
+        // verdict yet, stays eligible.
+        let key = format!("{}:{}", e.host.to_ascii_lowercase(), e.port);
+        if health.get(&key).is_some_and(|h| h.quarantined()) {
+            continue;
+        }
+        if !deduped.iter().any(|d| d.host.eq_ignore_ascii_case(&e.host) && d.port == e.port) {
             deduped.push(e);
         }
     }
@@ -545,6 +553,47 @@ fn bounded(
         }
     }
     diversified.into_iter().take(MAX_POOL_CANDIDATES).collect()
+}
+
+/// Deterministic worker-vantage verification order over every catalog
+/// candidate (all countries + auto + unassigned), for the 2-hour
+/// `verify-catalog` pass. Ordering: the configured country first (the pool
+/// in use gets fresh evidence first), never-probed entries before measured
+/// ones, longest-stale measurement first, then the health key for a stable
+/// tie-break. Same inputs always produce the same list, so a stateless
+/// `cursor` can slice it across bounded invocations.
+#[must_use]
+pub fn verify_order(
+    snapshot: &Snapshot,
+    health: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
+    configured_country: &str,
+) -> Vec<Endpoint> {
+    let wanted = configured_country.trim().to_ascii_uppercase();
+    let mut all: Vec<Endpoint> = Vec::new();
+    for (country, list) in &snapshot.countries {
+        let _ = country;
+        all.extend(list.iter().cloned());
+    }
+    all.extend(snapshot.auto.iter().cloned());
+    all.extend(snapshot.unassigned.iter().cloned());
+    // Dedupe by health key, keep first occurrence.
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|e| seen.insert(format!("{}:{}", e.host.to_ascii_lowercase(), e.port)));
+    all.sort_by(|a, b| {
+        let key = |e: &Endpoint| format!("{}:{}", e.host.to_ascii_lowercase(), e.port);
+        let band = |e: &Endpoint| -> (u8, u8, u64) {
+            let in_country = snapshot
+                .countries
+                .get(&wanted)
+                .is_some_and(|list| list.iter().any(|c| c.host.eq_ignore_ascii_case(&e.host) && c.port == e.port));
+            match health.get(&key(e)) {
+                Some(h) => (u8::from(!in_country), 1, h.updated_at_ms),
+                None => (u8::from(!in_country), 0, 0),
+            }
+        };
+        band(a).cmp(&band(b)).then_with(|| key(a).cmp(&key(b)))
+    });
+    all
 }
 
 /// Panel metadata about the stored snapshot — never the 865 KB document.
@@ -780,6 +829,117 @@ mod tests {
     fn feed_rejects_wrong_schema_version() {
         let bad = VALID.replace("\"schema_version\":1", "\"schema_version\":2");
         assert!(Snapshot::parse(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn quarantined_candidates_never_enter_the_pool() {
+        // The vantage model's eligibility half: a candidate the worker
+        // itself could not TCP-connect (the 44-IP US failure) or that failed
+        // repeatedly must not enter ANY pool — while a single soft failure
+        // only demotes, and no record keeps the candidate eligible.
+        let mk = |h: &str| Endpoint { host: h.into(), port: 443 };
+        let mut health = std::collections::BTreeMap::new();
+        health.insert(
+            "hard-dead.example:443".into(),
+            crate::relay::outbound_state::Health {
+                ok: false,
+                fail_count: 1,
+                error: "tcp connect: cannot connect to the specified address".into(),
+                ..Default::default()
+            },
+        );
+        health.insert(
+            "soft-twice.example:443".into(),
+            crate::relay::outbound_state::Health {
+                ok: false,
+                fail_count: 2,
+                error: "tls handshake failed".into(),
+                ..Default::default()
+            },
+        );
+        health.insert(
+            "soft-once.example:443".into(),
+            crate::relay::outbound_state::Health {
+                ok: false,
+                fail_count: 1,
+                error: "tls handshake failed".into(),
+                ..Default::default()
+            },
+        );
+        health.insert(
+            "fine.example:443".into(),
+            crate::relay::outbound_state::Health {
+                country: "US".into(),
+                ok: true,
+                ok_count: 3,
+                ..Default::default()
+            },
+        );
+        let pool = bounded(
+            [
+                mk("hard-dead.example"),
+                mk("soft-twice.example"),
+                mk("soft-once.example"),
+                mk("fine.example"),
+                mk("unprobed.example"),
+            ]
+            .into_iter(),
+            &health,
+        );
+        let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
+        assert!(
+            !hosts.contains(&"hard-dead.example") && !hosts.contains(&"soft-twice.example"),
+            "quarantined candidate in pool: {hosts:?}"
+        );
+        assert_eq!(hosts[0], "fine.example", "healthy first: {hosts:?}");
+        assert!(hosts.contains(&"soft-once.example"), "single soft failure demotes only: {hosts:?}");
+        assert!(hosts.contains(&"unprobed.example"), "no verdict = eligible: {hosts:?}");
+        assert_eq!(
+            hosts.last(),
+            Some(&"soft-once.example"),
+            "single soft failure ranks last: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn verify_order_is_deterministic_and_country_first_stale_first() {
+        use crate::relay::outbound_state::Health;
+        let snap = snapshot();
+        let mut health = std::collections::BTreeMap::new();
+        // One DE candidate measured recently, one measured long ago, rest
+        // unmeasured.
+        health.insert(
+            "203.0.113.7:443".into(),
+            Health { country: "DE".into(), ok: true, updated_at_ms: 1_000, ..Default::default() },
+        );
+        health.insert(
+            "proxy.example.com:8443".into(),
+            Health { country: "DE".into(), ok: true, updated_at_ms: 500, ..Default::default() },
+        );
+        let order = verify_order(&snap, &health, "DE");
+        let keys: Vec<String> = order
+            .iter()
+            .map(|e| format!("{}:{}", e.host.to_ascii_lowercase(), e.port))
+            .collect();
+        // Deterministic: same inputs, same list, every time.
+        assert_eq!(keys, {
+            let again: Vec<String> = verify_order(&snap, &health, "DE")
+                .iter()
+                .map(|e| format!("{}:{}", e.host.to_ascii_lowercase(), e.port))
+                .collect();
+            again
+        });
+        // The country in use first; within it unmeasured entries before
+        // measured ones, and stale measurements before fresh ones (they need
+        // re-verification most).
+        assert_eq!(keys[0], "2001:db8::1:2053", "unmeasured DE first: {keys:?}");
+        assert_eq!(keys[1], "proxy.example.com:8443", "stale-before-fresh: {keys:?}");
+        assert_eq!(keys[2], "203.0.113.7:443", "freshest DE last: {keys:?}");
+        assert!(keys[3..].iter().all(|k| k.starts_with("198.51.100.1") || k.starts_with("bpb")),
+            "DE must finish before the rest: {keys:?}");
+        // No duplicated entries: country lists, auto and unassigned dedupe by key.
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "duplicate candidate in verify order");
     }
 
     #[test]
