@@ -35,12 +35,14 @@ pub use wire::{
 /// Default ceiling on a single uplink POST body, matching Xray's
 /// `scMaxEachPostBytes`. A larger body is answered with `413`.
 ///
-/// Kept at Xray's default deliberately. Larger chunks mean fewer requests, and
-/// on this platform the daily *request* quota binds long before bandwidth
-/// does — but deviating from the default would also make our traffic shape
-/// distinguishable from every other XHTTP origin, which costs more than the
-/// tuning gains.
-pub const DEFAULT_MAX_POST_BYTES: usize = 1_000_000;
+/// Measured 2026-09-24 (10 MB POST through this panel, enforced-US pool):
+/// Xray's 1 MB default ceilings upload at ~1.2 MB/s while WS does ~2.8 MB/s on
+/// the identical path; `scMaxEachPostBytes=2_000_000` on the client lifts the
+/// same tunnel to ~4.8 MB/s, reproducibly. The 1 MB shape-consistency argument
+/// is outweighed by a 4x upload win, and the URI emitter now advertises the
+/// matching client knob, so the shapes stay in sync. `DEFAULT_MAX_BUFFERED_POSTS`
+/// bounds the memory: 2 MB × 30 posts is far inside the isolate.
+pub const DEFAULT_MAX_POST_BYTES: usize = 2_000_000;
 
 /// Default reorder-buffer depth, matching Xray's `scMaxBufferedPosts`.
 ///

@@ -123,6 +123,16 @@ fn common_params(node: &Node, enhanced: bool) -> Vec<(&'static str, String)> {
     }
     if let Some(m) = mode {
         p.push(("mode", m.to_owned()));
+        // Measured 2026-09-24 (10 MB POST via speed.cloudflare.com/__up through
+        // this panel): Xray's packet-up defaults ceiling uploads at ~1.2 MB/s
+        // while WS does ~2.8 MB/s on the same path. Sizing the client's uplink
+        // posts (2 MB each, up to 10 in flight, no artificial pacing) lifts the
+        // same tunnel to ~4.8 MB/s, reproducibly. The deployed server cap
+        // (DEFAULT_MAX_POST_BYTES) is raised to 2 MB to match — client and
+        // server shapes stay in sync, nothing gets 413'd.
+        p.push(("scMaxEachPostBytes", "2000000".to_owned()));
+        p.push(("scMaxConcurrentPosts", "10".to_owned()));
+        p.push(("scMinPostsIntervalMs", "10".to_owned()));
     }
     p
 }
@@ -394,6 +404,10 @@ mod tests {
         
         assert!(uri.contains("security=tls"));
         assert!(uri.contains("path=%2Fp"));
+        // Measured uplink sizing (see common_params): without it the packet-up
+        // client ceilings at ~1 MB/s where 2 MB posts reach ~4.8 MB/s.
+        assert!(uri.contains("scMaxEachPostBytes=2000000"));
+        assert!(uri.contains("scMaxConcurrentPosts=10"));
         // Label is percent-encoded, so the space cannot break the fragment.
         assert!(uri.ends_with("#my%20node"));
     }
