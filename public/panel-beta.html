@@ -1379,9 +1379,11 @@ function renderCatalog() {
       && OUTBOUND.catalogCountry
       && OUTBOUND.catalogCountry !== "AUTO";
     fbEnforcedEl.textContent = enforced
-      ? `Enforced location: traffic dials ONLY ${OUTBOUND.catalogCountry} candidates (no direct, no cross-country fallback).`
+      ? (runtime.length
+        ? `Enforced location: traffic dials ONLY ${OUTBOUND.catalogCountry} candidates (no direct, no cross-country fallback).`
+        : `DEGRADED: ${OUTBOUND.catalogCountry} selected but NO compatible Trinity-verified candidate — sessions fail clearly (no direct, no other country).`)
       : "";
-    fbEnforcedEl.className = enforced ? "st st-ready" : "";
+    fbEnforcedEl.className = enforced ? (runtime.length ? "st st-ready" : "st st-warning") : "";
   }
   // V24.4.4 runtime fallback (spec 5): warning chip, no blinking. The
   // configured location is never rewritten.

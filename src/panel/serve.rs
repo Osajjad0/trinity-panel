@@ -1048,6 +1048,41 @@ async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<R
     let start = cursor.min(total);
     let end = (start + budget).min(total);
     let now = worker::Date::now().as_millis();
+    // Verdict-relevant fingerprint BEFORE the fold: the KV write below only
+    // fires when one of these changes (new record, reachability flip,
+    // quarantine flip, identity change). Steady-state passes — the common
+    // case in a 2-hour cycle — write nothing.
+    type Fingerprint = (bool, bool, bool, String, String, String, bool);
+    let fingerprint = |state: &crate::relay::outbound_state::OutboundState, key: &str| -> Option<Fingerprint> {
+        state.geo.get(key).map(|h| {
+            (
+                h.quarantined(),
+                h.ok,
+                h.rotating,
+                h.country.clone(),
+                h.colo.clone(),
+                h.exit_ip.clone(),
+                h.fail_count >= 2,
+            )
+        })
+    };
+    let key_of = |e: &crate::catalog::Endpoint| -> String {
+        crate::relay::outbound_state::candidate_key(&crate::protocol::Target {
+            host: e.host.parse::<std::net::IpAddr>().map_or_else(
+                |_| crate::protocol::Host::Domain(e.host.trim().to_owned().into_boxed_str()),
+                crate::protocol::Host::Ip,
+            ),
+            port: e.port,
+        })
+    };
+    let before: Vec<(String, Option<Fingerprint>)> = order[start..end]
+        .iter()
+        .map(|e| {
+            let key = key_of(e);
+            let fp = fingerprint(&state, &key);
+            (key, fp)
+        })
+        .collect();
     let mut probed = 0u32;
     let mut reachable = 0u32;
     for e in &order[start..end] {
@@ -1061,40 +1096,33 @@ async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<R
         let key = crate::relay::outbound_state::candidate_key(&target);
         let prior = state.geo.get(&key).cloned().unwrap_or_default();
         // probe_tcp_one classifies for us: every failure arrives as
-        // "tcp connect: …" — the hard-unreachable verdict — while a success
+        // "tcp connect: …" — the hard—unreachable verdict — while a success
         // preserves any exit identity learned elsewhere (a TCP connect knows
-        // nothing about the exit IP or country).
+        // nothing about the exit IP or country). The identity is cloned
+        // before the call: `observed_ok` takes `self`.
+        let (c, colo, ip) = (
+            prior.country.clone(),
+            prior.colo.clone(),
+            prior.exit_ip.clone(),
+        );
         let updated = match probe_tcp_one(&e.host, e.port).await {
             Ok(trace) => {
                 reachable += 1;
-                prior.observed_ok(
-                    prior.country.clone(),
-                    prior.colo.clone(),
-                    prior.exit_ip.clone(),
-                    trace.latency_ms,
-                    now,
-                )
+                prior.observed_ok(c, colo, ip, trace.latency_ms, now)
             }
             Err((error, _, _)) => prior.observed_fail(error, now),
         };
         state.geo.insert(key, updated);
         probed += 1;
     }
-    // One batched write per pass, and only when a verdict actually changed.
-    let changed = order[start..end].iter().any(|e| {
-        let key = crate::relay::outbound_state::candidate_key(&crate::protocol::Target {
-            host: e.host.parse::<std::net::IpAddr>().map_or_else(
-                |_| crate::protocol::Host::Domain(e.host.trim().to_owned().into_boxed_str()),
-                crate::protocol::Host::Ip,
-            ),
-            port: e.port,
-        });
-        state.geo.get(&key).map(|h| h.updated_at_ms == now).unwrap_or(false)
-    });
+    // One batched write per pass, and only when a verdict actually changed
+    // (see the fingerprint above): counts and timestamps may move in memory,
+    // but nothing is persisted unless reachability/quarantine/identity flips.
+    let changed = before.iter().any(|(key, fp)| fingerprint(&state, key) != *fp);
     if changed {
         if let Ok(kv) = env.kv(KV_BINDING) {
             if let Ok(document) = serde_json::to_string(&state) {
-                if let Ok(pending) = kv.put(outbound_state::KV_KEY, document) {
+                if let Ok(pending) = kv.put(crate::relay::outbound_state::KV_KEY, document) {
                     let _ = pending.execute().await;
                 }
             }
@@ -1118,7 +1146,7 @@ async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<R
 #[cfg(target_arch = "wasm32")]
 fn health_counts(
     snapshot: &crate::catalog::Snapshot,
-    state: &outbound_state::OutboundState,
+    state: &crate::relay::outbound_state::OutboundState,
 ) -> serde_json::Value {
     use std::collections::BTreeMap;
     let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
