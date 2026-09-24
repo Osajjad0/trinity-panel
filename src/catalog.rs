@@ -532,9 +532,19 @@ fn bounded(
             deduped.push(e);
         }
     }
-    // Stable sort keeps catalog order inside each band.
+    // Stable sort keeps catalog order inside each band. Then enforce host
+    // diversity: one IP with many port variants must not occupy the whole
+    // pool (the US feed had 2 IPs x 4 ports filling all 8 slots — every dial
+    // failed while 42 other US IPs sat lower in the feed).
     deduped.sort_by_key(|e| rank(e));
-    deduped.into_iter().take(MAX_POOL_CANDIDATES).collect()
+    let mut seen_hosts = std::collections::HashSet::new();
+    let mut diversified: Vec<Endpoint> = Vec::new();
+    for e in deduped {
+        if seen_hosts.insert(e.host.to_ascii_lowercase()) {
+            diversified.push(e);
+        }
+    }
+    diversified.into_iter().take(MAX_POOL_CANDIDATES).collect()
 }
 
 /// Panel metadata about the stored snapshot — never the 865 KB document.
@@ -770,6 +780,35 @@ mod tests {
     fn feed_rejects_wrong_schema_version() {
         let bad = VALID.replace("\"schema_version\":1", "\"schema_version\":2");
         assert!(Snapshot::parse(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn pool_caps_one_port_per_host_so_one_dead_ip_cannot_fill_the_pool() {
+        // US-feed failure shape: a family of ports on the same IP ranked first;
+        // every one of them undialable from the worker while 42 other US IPs
+        // sat lower in the feed. The pool must spread across distinct hosts.
+        let mk = |h: &str, p: u16| Endpoint {
+            host: h.into(),
+            port: p,
+        };
+        let health = std::collections::BTreeMap::new(); // nothing known: band 1
+        let pool = bounded(
+            [
+                mk("104.129.166.131", 2083),
+                mk("104.129.166.131", 2087),
+                mk("104.129.166.131", 2096),
+                mk("104.129.166.131", 443),
+                mk("198.51.100.9", 443),
+                mk("198.51.100.10", 443),
+            ]
+            .into_iter(),
+            &health,
+        );
+        let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
+        assert_eq!(hosts.len(), hosts.iter().collect::<std::collections::HashSet<_>>().len(),
+            "duplicate host in pool: {hosts:?}");
+        assert_eq!(hosts[0], "104.129.166.131"); // feed order preserved
+        assert_ne!(hosts[1], "104.129.166.131"); // next host, not next port
     }
 
     #[test]
