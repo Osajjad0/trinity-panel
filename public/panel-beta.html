@@ -622,6 +622,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
           source <span id="cat-runtime-loc">AUTO</span> · revision
           <span id="cat-rev" class="mono">—</span></p>
         <div id="cat-runtime" class="cand-list"></div>
+        <div id="cat-capability" class="help" style="margin-top:.25rem"></div>
         <div id="cat-fallback" class="st st-warning" style="margin:.4rem 0 .2rem"></div>
         <div class="row" style="margin-top:.4rem">
           <button type="button" id="cat-sync-btn" class="primary">Sync feed</button>
@@ -1370,6 +1371,26 @@ function renderCatalog() {
     listBox.append(row);
   });
   $("cat-runtime-loc").textContent = (OUTBOUND.catalogCountry || "AUTO").toUpperCase();
+  // Stage-C capability census for the selected country (fetched separately;
+  // absent = older feed). Rendered as its own truth line, never invented.
+  const capBox = $("cat-capability");
+  if (capBox) {
+    capBox.textContent = "";
+    const cc = (OUTBOUND.catalogCountry || "").toUpperCase();
+    if (cc && cc !== "AUTO") {
+      fetch(`api/health-overlay`, { credentials: "same-origin" })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          const c = d && d.ok ? d.counts && d.counts[cc] : null;
+          if (!c) return;
+          capBox.textContent =
+            `${cc}: ${c.discovered} discovered · ${c.trinityReachable} Trinity-reachable · ` +
+            `${c.passthrough || 0} passthrough · ${c.cfRelay || 0} cf-relay · ` +
+            `${c.sniTerminate || 0} sni-terminate · ${c.quarantined || 0} quarantined`;
+        })
+        .catch(() => {});
+    }
+  }
   // v1.9.5 enforced-location semantics: Pool + concrete country = the runtime
   // dials ONLY that country's verified candidates (no direct-first, no
   // cross-country fallback). Say so where the operator is looking.

@@ -526,7 +526,18 @@ async fn serve(
 /// Persist one outbound-state document, or quietly do nothing. Failures are
 /// not reportable: the preference is an optimisation, never a requirement.
 async fn write_lkg(env: &worker::Env, state: &OutboundState) {
-    let Ok(document) = serde_json::to_string(state) else {
+    // Re-read + freshness merge: the session's snapshot is minutes old; a
+    // probe that landed mid-session must survive this write-back.
+    let merged = match env.kv("SETTINGS") {
+        Ok(kv) => match kv.get(outbound_state::KV_KEY).text().await {
+            Ok(Some(raw)) => {
+                outbound_state::merged_with_stored(state.clone(), OutboundState::from_json(&raw))
+            }
+            _ => state.clone(),
+        },
+        Err(_) => state.clone(),
+    };
+    let Ok(document) = serde_json::to_string(&merged) else {
         return;
     };
     if let Ok(kv) = env.kv("SETTINGS") {

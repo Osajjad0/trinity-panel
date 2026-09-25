@@ -1059,6 +1059,9 @@ async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<R
     let order = crate::catalog::verify_order(&snapshot, &state.geo, &configured);
     let total = order.len();
     let start = cursor.min(total);
+    // Clamp a zero/negative budget to one probe: a caller asking for 0 would
+    // otherwise loop forever on the same cursor without ever advancing.
+    let budget = budget.max(1);
     let end = (start + budget).min(total);
     let now = worker::Date::now().as_millis();
     // Verdict-relevant fingerprint BEFORE the fold: the KV write below only
@@ -1144,7 +1147,27 @@ async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<R
     let changed = before.iter().any(|(key, fp)| fingerprint(&state, key) != *fp);
     if changed {
         if let Ok(kv) = env.kv(KV_BINDING) {
-            if let Ok(document) = serde_json::to_string(&state) {
+            // Merge, don't clobber: a probe or session write that landed while
+            // this pass ran must survive. Our probed keys' verdicts are the
+            // freshest (just measured); everything else — including the
+            // stored last-known-good preference — stays as stored.
+            let merged = match kv.get(crate::relay::outbound_state::KV_KEY).text().await {
+                Ok(Some(raw)) => {
+                    let stored = crate::relay::outbound_state::OutboundState::from_json(&raw);
+                    let mut merged = stored.clone();
+                    for (key, health) in &state.geo {
+                        match merged.geo.get(key) {
+                            Some(old) if old.updated_at_ms > health.updated_at_ms => {}
+                            _ => {
+                                merged.geo.insert(key.clone(), health.clone());
+                            }
+                        }
+                    }
+                    merged
+                }
+                _ => state.clone(),
+            };
+            if let Ok(document) = serde_json::to_string(&merged) {
                 if let Ok(pending) = kv.put(crate::relay::outbound_state::KV_KEY, document) {
                     let _ = pending.execute().await;
                 }

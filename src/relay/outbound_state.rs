@@ -32,6 +32,34 @@ use crate::relay::outbound::DialPlan;
 /// document would need read-modify-write races against the panel UI.
 pub const KV_KEY: &str = "panel:outbound_state";
 
+/// Merge a session's LKG decision into the currently-stored document without
+/// discarding fresher health data.
+///
+/// A session reads the state doc when it starts (minutes earlier) and writes
+/// its decision back at teardown. A panel probe or a verify pass that landed
+/// in between would be wiped by the naive write-back, because the session's
+/// snapshot carries stale `geo` records. Merging per-candidate by the records'
+/// own `updated_at_ms` keeps whichever verdict is newer, so teardown can
+/// never un-verify a candidate the worker learned about mid-session.
+#[must_use]
+pub fn merged_with_stored(session: OutboundState, stored: OutboundState) -> OutboundState {
+    // The preferred-candidate decision and its debounce timestamp belong to
+    // the session: it measured the actual dial outcome. Keep the session's
+    // preference fields wholesale; only health verdicts merge per record.
+    let mut out = session;
+    let mut geo = stored.geo;
+    for (key, session_health) in out.geo.iter() {
+        match geo.get(key) {
+            Some(stored_health) if stored_health.updated_at_ms > session_health.updated_at_ms => {}
+            _ => {
+                geo.insert(key.clone(), session_health.clone());
+            }
+        }
+    }
+    out.geo = geo;
+    out
+}
+
 /// How long a recorded preference stays fresh enough to act on.
 pub const HEALTH_TTL_SECS: u64 = 3600;
 
@@ -622,6 +650,50 @@ mod tests {
     const NOW: u64 = 1_800_000_000_000;
 
     #[test]
+    fn teardown_merge_keeps_fresher_health_verdicts() {
+        // A session reads the state doc at start; a verify pass re-verifies
+        // the same candidate mid-session; the session's naive write-back would
+        // un-verify it. merged_with_stored must keep the fresher verdict.
+        let stale = state(Some("di.nscl.ir:443"), NOW - 60_000);
+        let mut session = stale.clone();
+        session.geo.insert(
+            "di.nscl.ir:443".into(),
+            crate::relay::outbound_state::Health {
+                country: "DE".into(),
+                ok: false,
+                updated_at_ms: NOW - 120_000, // older verdict from session start
+                ..Default::default()
+            },
+        );
+        // The stored doc got a FRESH verdict mid-session:
+        let mut stored = stale.clone();
+        stored.geo.insert(
+            "di.nscl.ir:443".into(),
+            crate::relay::outbound_state::Health {
+                country: "DE".into(),
+                ok: true,
+                updated_at_ms: NOW - 30_000,
+                ..Default::default()
+            },
+        );
+        let merged = merged_with_stored(session, stored);
+        assert!(merged.geo["di.nscl.ir:443"].ok, "fresher ok verdict must survive");
+        // And the other direction: a session that learned something new wins.
+        let mut newer_session = state(Some("di.nscl.ir:443"), NOW);
+        newer_session.geo.insert(
+            "di.nscl.ir:443".into(),
+            crate::relay::outbound_state::Health {
+                country: "DE".into(),
+                ok: false,
+                updated_at_ms: NOW,
+                ..Default::default()
+            },
+        );
+        let merged2 = merged_with_stored(newer_session, stale);
+        assert!(!merged2.geo["di.nscl.ir:443"].ok, "session's newer verdict must win");
+    }
+
+#[test]
     fn fresh_preferred_moves_behind_the_direct_candidate() {
         let p = plan(&["dest.example", "di.nscl.ir", "nima.nscl.ir"], 443);
         let ordered = order_plan(p, &state(Some("di.nscl.ir:443"), NOW - 1_000), NOW);

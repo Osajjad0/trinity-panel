@@ -612,7 +612,7 @@ async fn catalog_snapshot_from_kv(kv: &worker::kv::KvStore) -> Option<crate::cat
     // than declining. (`req.payload` borrows `header`, so both stay alive for
     // the rest of establishment -- an 8 KB buffer, not worth contorting for.)
     let Ok((mut decoder, mut encoder)) = req.body.split(&crate::random::bytes32()) else {
-        return;
+        break 'owner OwnerOutcome::Refused;
     };
     // Route through the outbound layer using the session's loaded config. In
     // Off mode this is a single direct candidate; with Proxy IP or NAT64 each
@@ -1007,6 +1007,16 @@ async fn catalog_snapshot_from_kv(kv: &worker::kv::KvStore) -> Option<crate::cat
     }
 
     let write_lkg = |doc: OutboundState| async move {
+        // Re-read the stored doc and merge per-candidate by freshness: the
+        // session snapshot is minutes old, and a probe/verify pass that ran
+        // mid-session must survive this write-back (see merged_with_stored).
+        let doc = match env.kv("SETTINGS") {
+            Ok(kv) => match kv.get(outbound_state::KV_KEY).text().await {
+                Ok(Some(raw)) => outbound_state::merged_with_stored(doc, OutboundState::from_json(&raw)),
+                _ => doc,
+            },
+            Err(_) => doc,
+        };
         if let Ok(document) = serde_json::to_string(&doc) {
             if let Ok(kv) = env.kv("SETTINGS") {
                 if let Ok(pending) = kv.put(outbound_state::KV_KEY, document) {
