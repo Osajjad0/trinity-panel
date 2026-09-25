@@ -431,6 +431,15 @@ async fn push_down(shared_down: &Mutex<Option<DownSender>>, wrapped: Bytes) -> b
     tx.send(Ok(wrapped)).await.is_ok()
 }
 
+/// The verified snapshot document itself (KV read) — pool construction is
+/// pure and happens after the join, where the worker-vantage health overlay
+/// is available.
+async fn catalog_snapshot_from_kv(kv: &worker::kv::KvStore) -> Option<crate::catalog::Snapshot> {
+    let raw = kv.get(crate::catalog::KV_KEY).text().await.ok().flatten()?;
+    let document: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    serde_json::from_value(document.get("snapshot")?.clone()).ok()
+}
+
 /// The single task that owns the outbound socket for one session.
 ///
 /// Everything that touches the socket happens here, sequentially. No request
@@ -496,15 +505,6 @@ async fn own_session(ctx: OwnerContext) {
             Err(_) => OutboundState::default(),
         }
     };
-
-/// The verified snapshot document itself (KV read) — pool construction is
-/// pure and happens after the join, where the worker-vantage health overlay
-/// is available.
-async fn catalog_snapshot_from_kv(kv: &worker::kv::KvStore) -> Option<crate::catalog::Snapshot> {
-    let raw = kv.get(crate::catalog::KV_KEY).text().await.ok().flatten()?;
-    let document: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    serde_json::from_value(document.get("snapshot")?.clone()).ok()
-}
 
     // Accumulate until a complete header parses. A header CAN arrive split
     // across chunks -- transport framing does not align with protocol framing,
