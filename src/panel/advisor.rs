@@ -1055,7 +1055,7 @@ mod tests {
         assert!(!upstream.exportable, "upstream sing-box cannot take an XHTTP node");
         assert!(!upstream.findings.is_empty(), "and must say so");
 
-        let hiddify = m.iter().find(|v| v.slug == "hiddify").expect("hiddify is listed");
+        let hiddify = m.iter().find(|v| v.slug == "singbox").expect("singbox is listed");
         assert!(hiddify.exportable, "Hiddify ships a patched sing-box that can");
     }
 

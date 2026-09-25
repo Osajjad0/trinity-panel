@@ -180,11 +180,11 @@ pub fn parse_request(rest: &str) -> Option<(ClientTarget, Shape)> {
 pub fn client_from_name(name: &str) -> Option<ClientTarget> {
     let n = name.trim().to_ascii_lowercase();
     match n.as_str() {
-        "v2rayn" => Some(ClientTarget::V2rayN),
+        "xray" | "v2rayn" => Some(ClientTarget::V2rayN),
         "v2rayng" => Some(ClientTarget::V2rayNg),
-        "hiddify" => Some(ClientTarget::Hiddify),
+        "singbox" | "hiddify" => Some(ClientTarget::Hiddify),
         "karing" => Some(ClientTarget::Karing),
-        "sing-box" | "singbox" => Some(ClientTarget::SingBoxUpstream),
+        "sing-box" => Some(ClientTarget::SingBoxUpstream),
         "mihomo" | "clash" | "clash-meta" | "clashmeta" => Some(ClientTarget::Mihomo),
         "nekobox" => Some(ClientTarget::NekoBox),
         _ => None,
@@ -209,9 +209,9 @@ pub const fn all_clients() -> [ClientTarget; 7] {
 #[must_use]
 pub const fn client_slug(target: ClientTarget) -> &'static str {
     match target {
-        ClientTarget::V2rayN => "v2rayn",
+        ClientTarget::V2rayN => "xray",
         ClientTarget::V2rayNg => "v2rayng",
-        ClientTarget::Hiddify => "hiddify",
+        ClientTarget::Hiddify => "singbox",
         ClientTarget::Karing => "karing",
         ClientTarget::SingBoxUpstream => "sing-box",
         ClientTarget::Mihomo => "mihomo",
@@ -349,8 +349,12 @@ mod tests {
         for (text, want) in [
             ("Clash", ClientTarget::Mihomo),
             ("clash-meta", ClientTarget::Mihomo),
-            ("SingBox", ClientTarget::SingBoxUpstream),
+            ("sing-box", ClientTarget::SingBoxUpstream),
             ("V2rayN", ClientTarget::V2rayN),
+            ("xray", ClientTarget::V2rayN),
+            ("v2rayn", ClientTarget::V2rayN),
+            ("singbox", ClientTarget::Hiddify),
+            ("hiddify", ClientTarget::Hiddify),
         ] {
             assert_eq!(client_from_name(text), Some(want), "{text}");
         }

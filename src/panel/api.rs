@@ -817,14 +817,14 @@ mod tests {
         let v2rayn = s
             .clients
             .iter()
-            .find(|c| c.slug == "v2rayn")
+            .find(|c| c.slug == "xray")
             .expect("listed");
-        assert_eq!(v2rayn.subscription, "https://example.com/sub/v2rayn");
+        assert_eq!(v2rayn.subscription, "https://example.com/sub/xray");
         assert_eq!(v2rayn.included, 2);
         assert!(v2rayn.skipped.is_empty());
         assert_eq!(
             v2rayn.config.as_deref(),
-            Some("https://example.com/sub/v2rayn.json")
+            Some("https://example.com/sub/xray.json")
         );
 
         // Upstream sing-box cannot take an XHTTP node, and must say so rather
@@ -888,7 +888,7 @@ mod tests {
         assert!(first
             .links
             .iter()
-            .any(|l| l.client == "v2rayn" && l.uri.starts_with("vless://")));
+            .any(|l| l.client == "xray" && l.uri.starts_with("vless://")));
         assert!(!first.links.iter().any(|l| l.client == "sing-box"));
         assert_eq!(first.matrix.len(), bundle::all_clients().len());
     }
