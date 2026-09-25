@@ -58,6 +58,12 @@ pub struct Snapshot {
     #[serde(default)]
     pub capability_counts:
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, u32>>,
+    /// Per-endpoint Stage-C class from the feed (`ip:port` → class). Absent
+    /// key = unclassified; `passthrough` ranks above every other class for
+    /// pool ordering because a true passthrough carries every SNI the
+    /// cf-relay class can, and more.
+    #[serde(default)]
+    pub capability_by_endpoint: std::collections::BTreeMap<String, String>,
 }
 
 /// What a hex string looks like.
@@ -389,12 +395,24 @@ pub fn pool_for_with_health(
                 }
             }
             spread.truncate(crate::catalog::MAX_AUTO_FALLBACK);
-            return Some(bounded(spread.into_iter(), health));
+            return Some(bounded(
+                spread.into_iter(),
+                health,
+                &snapshot.capability_by_endpoint,
+            ));
         }
-        return Some(bounded(snapshot.auto.iter().cloned(), health));
+        return Some(bounded(
+            snapshot.auto.iter().cloned(),
+            health,
+            &snapshot.capability_by_endpoint,
+        ));
     }
     let selected = snapshot.pool(Some(country))?;
-    Some(bounded(selected.iter().cloned(), health))
+    Some(bounded(
+        selected.iter().cloned(),
+        health,
+        &snapshot.capability_by_endpoint,
+    ))
 }
 
 /// Coarse region classification for fallback preference. ISO-2 codes only;
@@ -542,13 +560,29 @@ pub async fn write_fallback_state(env: &worker::Env, state: &crate::relay::outbo
 fn bounded(
     candidates: impl Iterator<Item = Endpoint>,
     health: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
+    capability: &std::collections::BTreeMap<String, String>,
 ) -> Vec<Endpoint> {
-    let rank = |e: &Endpoint| -> u8 {
-        match health.get(&format!("{}:{}", e.host.to_ascii_lowercase(), e.port)) {
-            Some(h) if h.healthy() => 0,
-            Some(h) if !h.ok => 2,
+    // Capability band: a Stage-C `passthrough` is strictly more capable than
+    // cf-relay (it forwards any SNI, including a CF edge's), so it outranks
+    // everything; unclassified and cf-relay share a band; sni-terminate (it
+    // terminates the destination TLS with its own certificate) sinks.
+    let cap_rank = |e: &Endpoint| -> u8 {
+        match capability
+            .get(&format!("{}:{}", e.host.to_ascii_lowercase(), e.port))
+            .map(String::as_str)
+        {
+            Some("passthrough") => 0,
+            Some("sni-terminate") => 2,
             _ => 1,
         }
+    };
+    let rank = |e: &Endpoint| -> u8 {
+        (match health.get(&format!("{}:{}", e.host.to_ascii_lowercase(), e.port)) {
+            Some(h) if h.healthy() => 0u8,
+            Some(h) if !h.ok => 2,
+            _ => 1,
+        }) * 3
+            + cap_rank(e)
     };
     let mut deduped: Vec<Endpoint> = Vec::new();
     for e in candidates {
@@ -715,6 +749,7 @@ mod fallback_tests {
             unassigned: Vec::new(),
             auto: Vec::new(),
             capability_counts: std::collections::BTreeMap::new(),
+            capability_by_endpoint: std::collections::BTreeMap::new(),
         }
     }
 
@@ -911,6 +946,7 @@ mod tests {
             ]
             .into_iter(),
             &health,
+            &std::collections::BTreeMap::new(),
         );
         let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
         assert!(
@@ -925,6 +961,25 @@ mod tests {
             Some(&"soft-once.example"),
             "single soft failure ranks last: {hosts:?}"
         );
+    }
+
+    #[test]
+    fn passthrough_outranks_cf_relay_at_equal_health() {
+        // Capability-aware ranking (spec PHASE 5): with identical health
+        // bands, a Stage-C passthrough candidate sorts before cf-relay and
+        // sni-terminate sinks below both. All unmeasured here (band 1).
+        let mk = |h: &str| Endpoint { host: h.into(), port: 443 };
+        let mut capability = std::collections::BTreeMap::new();
+        capability.insert("relay.example:443".to_string(), "cf-relay".to_string());
+        capability.insert("pass.example:443".to_string(), "passthrough".to_string());
+        capability.insert("terminating.example:443".to_string(), "sni-terminate".to_string());
+        let pool = bounded(
+            [mk("relay.example"), mk("pass.example"), mk("terminating.example")].into_iter(),
+            &std::collections::BTreeMap::new(),
+            &capability,
+        );
+        let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
+        assert_eq!(hosts, vec!["pass.example", "relay.example", "terminating.example"]);
     }
 
     #[test]
@@ -989,6 +1044,7 @@ mod tests {
             ]
             .into_iter(),
             &health,
+            &std::collections::BTreeMap::new(),
         );
         let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
         assert_eq!(hosts.len(), hosts.iter().collect::<std::collections::HashSet<_>>().len(),
