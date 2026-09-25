@@ -339,6 +339,7 @@ def main() -> int:
         "(diagnostics only; production deployments omit it)",
     )
     ap.add_argument("--no-do", action="store_true", help="Skip the Durable Object migration (redeploys)")
+    ap.add_argument("--diagnostics", action="store_true", help="Set DIAGNOSTICS=true (do_error surfaces the DO error text)")
     ap.add_argument("--ws", action="store_true", help="Enable the WebSocket transport (WS_ENABLED=true); omit for XHTTP-only")
     args = ap.parse_args()
 
@@ -417,6 +418,10 @@ def main() -> int:
             {"type": "secret_text", "name": "SS_USERS", "text": ss_users},
             {"type": "secret_text", "name": "PANEL_PASSWORD", "text": panel_password},
         ]
+        if args.diagnostics:
+            # Temporary: surface DO stub errors as "DO-ERR ..." instead of the
+            # decoy. Only for debugging a live deployment; remove after use.
+            bindings.append({"type": "plain_text", "name": "DIAGNOSTICS", "text": "true"})
         if args.session_diag:
             # Diagnostics-only namespace: session teardown writes one small
             # JSON blob per session here. Never bound on production.
