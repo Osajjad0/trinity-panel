@@ -22,6 +22,66 @@ use crate::transport::xhttp::wire::Class;
 /// Header that marks a WebSocket upgrade.
 const UPGRADE: &str = "Upgrade";
 
+/// Scheduled handler (V24.8 decoupling, spec §4/§5/§10): Trinity pulls the
+/// published catalog itself every 2 hours — no GitHub push, no OIDC, no
+/// Trinity secrets in the catalog repo. The catalog repo publishes and stops.
+///
+/// One cycle, fail-closed at every step:
+///   1. `catalog::sync` fetch → parse → integrity-check → revision-gate →
+///      activate atomically. Any failure keeps the previous snapshot.
+///   2. On a fresh revision, run worker-vantage verify passes until the cron
+///      wall-clock guard; the pass writes KV only when a verdict changed.
+///   3. On an unchanged revision, skip verify entirely: geo verdicts are
+///      already ≤2 h old, far inside the 48 h freshness TTL.
+/// Cursor always restarts at 0: `verify_order` is stale-first (oldest verdict
+/// first, current country first), so each cycle re-measures exactly the
+/// candidates that most need it — a fixed cursor would measure a moving feed
+/// incorrectly.
+#[event(scheduled)]
+async fn scheduled(event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
+    let started = worker::Date::now().as_millis();
+    let report = crate::catalog::sync(&env).await;
+    // Meta refresh mirrors the operator route: only on an actual change.
+    if report.ok && report.changed {
+        crate::panel::serve::refresh_catalog_meta(&env).await;
+    }
+    // Verify on every successful sync, changed or not: the pass budget and
+    // the paused-on-subrequest-cap guard bound the work, oldest records are
+    // probed first (verify_order), and fingerprint-gated writes keep a
+    // steady-state pass at zero KV writes. This is what progressively fills
+    // missing measurements and re-probes stale verdicts — a change-gated
+    // verify would leave a stable catalog's stale quarantines unhealed.
+    if report.ok {
+        // Cron guard: stop launching passes at T+4 min (cron fires every 2 h).
+        const CRON_GUARD_MS: u64 = 240_000;
+        let mut cursor = 0usize;
+        loop {
+            // Read the pass report from the response body (one parse per pass).
+            let Ok(mut resp) =
+                crate::panel::serve::verify_catalog_run(cursor, 40, &env).await
+            else {
+                break;
+            };
+            let Ok(text) = resp.text().await else { break };
+            let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else { break };
+            let done = body.get("done").and_then(|v| v.as_bool()) == Some(true);
+            let probed = body.get("probed").and_then(|v| v.as_u64()).unwrap_or(0);
+            cursor = body
+                .get("cursor")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(0);
+            // Done, no progress, or cron guard hit: stop launching passes.
+            let paused = body.get("paused").and_then(|v| v.as_bool()) == Some(true);
+            if done || paused || probed == 0 ||
+                worker::Date::now().as_millis().saturating_sub(started) > CRON_GUARD_MS {
+                break;
+            }
+        }
+    }
+    let _ = event; // cron pattern unused; schedule lives in deploy metadata
+}
+
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // A panic in a WASM isolate takes every connection on it down, so the

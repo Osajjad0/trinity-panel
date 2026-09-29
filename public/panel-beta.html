@@ -257,6 +257,13 @@ td,th{overflow-wrap:anywhere}
 .esel-main{min-width:0;overflow-wrap:anywhere}
 .esel-col{display:flex;flex-direction:column;gap:.05rem;min-width:0;flex:1}
 .esel-sub{font-size:.72rem;color:var(--dim);font-family:var(--mono)}
+/* Country capability badges (v1.9.5): compact chips right-aligned in the row. */
+.cap-badge{flex:none;font-size:.62rem;font-weight:700;letter-spacing:.04em;
+  padding:.1rem .4rem;border-radius:999px;align-self:center}
+.cap-limited{color:#fff;background:#c0392b}
+.cap-degraded{color:#fff;background:#d68910}
+.esel-sep{color:var(--dim);font-size:.72rem;cursor:default;opacity:.75}
+.esel-sep:hover{background:transparent!important}
 .esel-glider{position:absolute;left:0.375rem;right:0.375rem;top:0;
   background:var(--accent-soft);border-radius:var(--radius-sm);
   box-shadow:inset 3px 0 0 0 var(--accent);
@@ -522,6 +529,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
     <div class="spread" style="margin-bottom:1rem">
       <div>
         <h1 id="panel-title">Trinity Panel</h1>
+        <div class="muted mono" id="panel-version">TRINITY v1.9.6 — Phase 1 + 2 Applied · Phase 3</div>
         <div class="muted mono" id="host"></div>
       </div>
       <div class="row">
@@ -609,7 +617,9 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
         <p class="muted" style="margin:.3rem 0 .5rem">
           <span id="cat-countries">—</span> locations ·
           <span id="cat-endpoints">—</span> verified ·
-          last sync <span id="cat-sync-time">—</span></p>
+          last sync <span id="cat-sync-time">—</span><br>
+          pulls <span id="cat-source" class="mono">—</span> every 2 h
+          (auto; next pull <span id="cat-next" class="mono">—</span>)</p>
         <div class="field" style="max-width:340px">
           <label for="cat-country">Location</label>
           <select id="cat-country">
@@ -723,8 +733,8 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 "use strict";
 
 // Trinity Panel release version (shown only as the Advanced badge).
-const APP_VERSION = "1.9.5";
-const APP_RELEASE_NAME = "Mega Huge Update";
+const APP_VERSION = "1.9.6";
+const APP_RELEASE_NAME = "Phase 1 + 2 Applied";
 {
   const badge = document.getElementById("app-version-badge");
   if (badge) badge.textContent = `v${APP_VERSION}`;
@@ -876,6 +886,24 @@ $("signout").onclick = async () => {
   location.reload();
 };
 
+// ---- egress check (Bug #1 honesty aid) -------------------------------------
+// The panel page itself may be loaded through the tunnel (browser routed via
+// the proxy client). This check reports THAT route's public exit — the same
+// signal whoer-style sites show — labeled exactly as what it is: this
+// browser's current route, one fetch per click, nothing stored.
+$("egress-btn").onclick = async () => {
+  const out = $("egress-check");
+  out.textContent = "Measured exit: checking…";
+  try {
+    const r = await fetch("https://ipwho.is/", { cache: "no-store" });
+    const j = await r.json();
+    out.textContent = "Measured exit (this browser route): " + (j.ip || "?")
+      + " — " + (j.country || "?") + " (" + new Date().toLocaleTimeString() + ")";
+  } catch {
+    out.textContent = "Measured exit: lookup failed (offline or blocked)";
+  }
+};
+
 // ---- boot ------------------------------------------------------------------
 
 async function boot() {
@@ -973,7 +1001,7 @@ function renderHealth() {
   // Source-listed is NOT healthy — health comes only from these probes.
   const table = el("table", { style: "width:100%;border-collapse:collapse;font-size:.92rem" });
   const head = el("tr");
-  for (const h of ["", "Candidate", "Dial", "TCP", "Probe", "RTT", "Exit country", "Status", "Reason"]) {
+  for (const h of ["", "Candidate", "Quality", "Dial", "TCP", "Probe", "RTT", "Exit country", "Status", "Reason"]) {
     head.append(el("th", { style: "text-align:left;padding:.25rem .5rem;border-bottom:1px solid var(--border)", textContent: h }));
   }
   table.append(head);
@@ -990,6 +1018,16 @@ function renderHealth() {
     const mark = !r.measured ? "·" : r.healthy ? "✓" : "✗";
     const cls = !r.measured ? "muted" : r.healthy ? "" : "sev-degraded";
     tr.append(el("td", { style: "padding:.25rem .5rem", className: cls, textContent: `${r.host}${r.port ? ":" + r.port : ""}` }));
+    // v1.9.6: feed quality verdict "risk/type/confidence/source". Empty (or a
+    // host key with no port suffix) = unmeasured — rendered muted, never bad.
+    const qcell = el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: "—" });
+    if (r.quality) {
+      const [risk = "unknown", type = "unknown", conf = "unknown", source = "unknown"] = r.quality.split("/");
+      qcell.textContent = `${risk}/${type}`;
+      qcell.title = `risk=${risk} type=${type} confidence=${conf} source=${source}`;
+      if (risk === "high") qcell.className = "sev-degraded";
+    }
+    tr.append(qcell);
     tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.dialIp ? (r.dialIp.includes(":") ? r.dialIp : `${r.dialIp}:${r.port ?? 443}`) : "—" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: r.tcpMs != null ? "" : "muted", textContent: r.tcpMs != null ? `PASS ${r.tcpMs} ms` : "FAIL" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: r.probeMs != null ? "" : "muted", textContent: r.probeMs != null ? `PASS ${r.probeMs} ms` : "FAIL" }));
@@ -1318,23 +1356,79 @@ function renderCatalog() {
   status.className = "st " + (!c ? "" : c.contentRevision ? "st-ready" : "st-error");
   $("cat-rev").textContent = c && c.contentRevision ? c.contentRevision.slice(0, 12) + "…" : "—";
   $("cat-sync-time").textContent = c && c.fetchedAt ? new Date(c.fetchedAt).toLocaleString() : "—";
+  const src = c && c.sourceUrl ? c.sourceUrl.replace(/^https:\/\//, "") : null;
+  $("cat-source").textContent = src || "public verified feed";
+  // §20: next scheduled pull — the deploy-registered cron fires at :23 of
+  // every even UTC hour ("23 0-22/2 * * *"); compute the next fire locally.
+  {
+    const now = new Date();
+    const next = new Date(now); // strict: first even-hour :23 strictly after now
+    next.setUTCMinutes(23, 0, 0);
+    if (next <= now) next.setUTCHours(next.getUTCHours() + 1);
+    if (next.getUTCHours() % 2 !== 0) next.setUTCHours(next.getUTCHours() + 1);
+    $("cat-next").textContent = next.toISOString().slice(11, 16) + " UTC";
+  }
   setVal("cat-countries", c ? String(c.countryCount ?? "—") : "—");
   setVal("cat-endpoints", c ? String(c.endpointCount ?? "—") : "—");
 
-  // Country options: Auto + the countries the catalog actually has.
+  // Country options: Auto + the countries the catalog actually has, sorted
+  // by VERIFIED capability (v1.9.5 country quality): Auto first, then
+  // full → degraded → limited → unavailable, quality descending inside a
+  // state, feed order as the final tiebreak. Data source: the server's
+  // countryQuality aggregation (Stage-C census + worker-vantage health) —
+  // never geography or name inference. Unavailable countries get a separator
+  // option so they can never read as ordinary usable entries.
   const saved = (OUTBOUND.catalogCountry || "").toUpperCase();
   const sel = $("cat-country");
   sel.textContent = "";
   sel.append(el("option", { value: "", textContent: "Auto (catalog spread)" }));
   const counts = (c && c.countryCounts) || {};
-  for (const code of (c && c.countries) || []) {
+  const codes = [...((c && c.countries) || [])];
+  const q = STATE.countryQuality || {};
+  const RANK = { full: 0, degraded: 1, limited: 2, unavailable: 3 };
+  codes.sort((a, b) => {
+    const qa = q[a], qb = q[b];
+    const ra = qa ? RANK[qa.state] : 4, rb = qb ? RANK[qb.state] : 4;
+    if (ra !== rb) return ra - rb;
+    if (ra !== 4 && qa.quality !== qb.quality) return (qb.quality ?? -1) - (qa.quality ?? -1);
+    return codes.indexOf(a) - codes.indexOf(b);
+  });
+  let lastState = null;
+  for (const code of codes) {
     const n = counts[code];
+    const cq = q[code];
+    const st = cq && cq.state;
     const o = el("option", {
       value: code,
-      textContent: `${flag(code)} ${COUNTRY_NAMES[code] || code}`,
+      textContent: `${flag(code)} ${COUNTRY_NAMES[code] || code}` +
+        (st === "limited" ? "   [LIMITED]"
+          : st === "degraded" ? "   [DEGRADED]"
+          : st === "unavailable" ? "   [UNAVAILABLE]" : ""),
     });
     // Structured row data for the dropdown renderer (spec 6): code + count.
     if (n != null) o.dataset.sub = `${code} · ${n} verified`;
+    if (cq) {
+      o.dataset.state = st;
+      o.dataset.quality = String(cq.quality);
+      // Tooltip: the reason behind the verdict, from verified counts only.
+      o.title = st === "full"
+        ? `FULL: ${cq.passthrough} passthrough candidate(s) — generic internet verified${cq.healthy ? `, ${cq.healthy} healthy now` : " (liveness unmeasured yet — not a failure)"}.`
+        : st === "degraded"
+          ? `DEGRADED: repeated/hard probe failures on the passthrough pool (success ${cq.successRatePct}%).`
+          : st === "limited"
+            ? "Limited egress: generic internet destinations may be unavailable (no passthrough candidates; cf-relay carries only Cloudflare-fronted destinations)."
+            : "Unavailable: no healthy usable candidates at the moment.";
+    }
+    // Visible separator before the unavailable block.
+    if (st === "unavailable" && lastState !== "unavailable") {
+      const sep = el("option", {
+        value: "__sep__",
+        textContent: "── unavailable ──",
+      });
+      sep.disabled = true;
+      sel.append(sep);
+    }
+    lastState = st;
     sel.append(o);
   }
   sel.value = saved;
@@ -1386,7 +1480,10 @@ function renderCatalog() {
           capBox.textContent =
             `${cc}: ${c.discovered} discovered · ${c.trinityReachable} Trinity-reachable · ` +
             `${c.passthrough || 0} passthrough · ${c.cfRelay || 0} cf-relay · ` +
-            `${c.sniTerminate || 0} sni-terminate · ${c.quarantined || 0} quarantined`;
+            `${c.sniTerminate || 0} sni-terminate · ${c.quarantined || 0} quarantined` +
+            (c.passthrough > 0
+              ? " · GENERIC INTERNET: READY"
+              : " · GENERIC INTERNET: LIMITED (cf-relay carries only Cloudflare-fronted destinations)");
         })
         .catch(() => {});
     }
@@ -2071,11 +2168,15 @@ function enhancedSelect(sel) {
     menu.textContent = "";
     menu.prepend(glider);
     for (const { o, i } of options()) {
+      // Disabled separator rows (country-quality unavailable divider) render
+      // inert: greyed text, no pointer cursor, clicks do nothing.
       const row = el("div", {
-        className: "esel-opt", id: `${id}-opt-${i}`,
+        className: "esel-opt" + (o.disabled ? " esel-sep" : ""),
+        id: `${id}-opt-${i}`,
       });
       row.setAttribute("role", "option");
       row.setAttribute("aria-selected", String(o.selected));
+      if (o.disabled) row.setAttribute("aria-disabled", "true");
       // Real app icon when this option is a known app (V24.5.6 spec 13).
       const icon = APP_ICONS[(o.textContent || "").trim().toLowerCase()];
       if (icon) {
@@ -2088,12 +2189,28 @@ function enhancedSelect(sel) {
       if (o.dataset && o.dataset.sub) {
         col.append(el("span", { className: "esel-sub", textContent: o.dataset.sub }));
       }
+      // Capability badge (v1.9.5): red LIMITED / orange DEGRADED chips with
+      // the reason as tooltip; never shown for FULL (that is the normal case).
       row.append(col);
+      if (o.dataset && o.dataset.state === "limited") {
+        const b = el("span", { className: "cap-badge cap-limited", textContent: "LIMITED" });
+        b.title = o.title || "";
+        row.append(b);
+      } else if (o.dataset && o.dataset.state === "degraded") {
+        const b = el("span", { className: "cap-badge cap-degraded", textContent: "DEGRADED" });
+        b.title = o.title || "";
+        row.append(b);
+      } else if (o.dataset && o.dataset.state === "unavailable") {
+        const b = el("span", { className: "cap-badge cap-limited", textContent: "UNAVAILABLE" });
+        b.title = o.title || "";
+        row.append(b);
+      }
+      if (o.title) row.title = o.title;
       // Selection indicator = the CSS accent rail on [aria-selected=true]
       // (V24.5.12: ONE indicator, no check icon — the JS check span is gone).
       // V24.6.12: the fn is closeMenu — a bare close() resolves to window.close()
       // and the panel tries to close itself on every option click.
-      row.onclick = () => { pick(i); closeMenu(); };
+      row.onclick = () => { if (!o.disabled) { pick(i); closeMenu(); } };
       menu.append(row);
     }
   }
@@ -2105,6 +2222,7 @@ function enhancedSelect(sel) {
     btn.append(el("span", { textContent: label() }));
   }
   function pick(i) {
+    if (sel.options[i] && sel.options[i].disabled) return;
     sel.selectedIndex = i;
     sel.dispatchEvent(new Event("change", { bubbles: true }));
     syncBtn();
@@ -2132,8 +2250,14 @@ function enhancedSelect(sel) {
   }
   function setActive(i, scroll = true) {
     const rows = [...menu.querySelectorAll(".esel-opt")];
-    active = Math.max(0, Math.min(rows.length - 1, i));
-    rows.forEach((r, k) => r.classList.toggle("esel-active", k === active));
+    // Skip disabled separator rows: the highlight never rests on them.
+    let k = Math.max(0, Math.min(rows.length - 1, i));
+    while (rows[k] && rows[k].classList.contains("esel-sep")) {
+      k += i >= active ? 1 : -1;
+      if (k < 0 || k >= rows.length) { k = Math.max(0, Math.min(rows.length - 1, i)); break; }
+    }
+    active = k;
+    rows.forEach((r, j) => r.classList.toggle("esel-active", j === active));
     btn.setAttribute("aria-activedescendant", rows[active]?.id || "");
     if (scroll) rows[active]?.scrollIntoView({ block: "nearest" });
     if (matchMedia("(prefers-reduced-motion: reduce)").matches) moveGlider(rows[active], true);

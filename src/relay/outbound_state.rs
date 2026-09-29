@@ -60,6 +60,19 @@ pub fn merged_with_stored(session: OutboundState, stored: OutboundState) -> Outb
     out
 }
 
+/// Whether a fallback-state write should proceed (Bug Hunter 2): at most one
+/// write per 60 s floor per (primary, fallback) pair — reconnect storms must
+/// not put a KV write on every session teardown — while a rotation to a
+/// different fallback country always writes (rotation must never be
+/// swallowed). Pure so the quota rule is unit-testable.
+#[must_use]
+pub fn fallback_write_needed(stored: &OutboundState, next: &OutboundState) -> bool {
+    let within_floor = next.fallback_at_ms.saturating_sub(stored.fallback_at_ms) < 60_000
+        && next.fallback_active == stored.fallback_active
+        && next.fallback_primary == stored.fallback_primary;
+    !within_floor
+}
+
 /// How long a recorded preference stays fresh enough to act on.
 pub const HEALTH_TTL_SECS: u64 = 3600;
 
@@ -195,7 +208,18 @@ impl Health {
     /// [`Self::observed_ok`] clears the verdict (self-healing re-verify).
     #[must_use]
     pub fn quarantined(&self) -> bool {
-        !self.ok && (self.fail_count >= 2 || self.error.starts_with("tcp connect"))
+        !self.ok
+            && !self.is_runtime_error()
+            && (self.fail_count >= 2 || self.error.starts_with("tcp connect"))
+    }
+
+    /// Worker-runtime failure (e.g. the free plan's 50-subrequests-per-
+    /// invocation limit tripping a wide verify pass): the platform ran out of
+    /// budget, the candidate said nothing. Never counts as candidate evidence
+    /// — 09-28 hardening, "one probe failed" must not manufacture DEGRADED.
+    #[must_use]
+    pub fn is_runtime_error(&self) -> bool {
+        !self.ok && self.error.contains("Too many subrequests")
     }
 
     /// Whether the exit identity has held still across probes.
@@ -416,7 +440,15 @@ pub fn order_plan_pref(
     now_ms: u64,
     country: &str,
 ) -> DialPlan {
-    order_plan_ranked(plan, state, now_ms, country, "")
+    order_plan_ranked(
+        plan,
+        state,
+        now_ms,
+        country,
+        "",
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )
 }
 
 /// Order the proxy candidates: manual pin, then LKG, then measured quality.
@@ -438,9 +470,11 @@ pub fn order_plan_ranked(
     now_ms: u64,
     country: &str,
     pin: &str,
+    quality: &std::collections::BTreeMap<String, String>,
+    capability: &std::collections::BTreeMap<String, String>,
 ) -> DialPlan {
     let at = usize::from(plan.candidates.first() == Some(&plan.logical));
-    rank_by_quality(&mut plan, state, at, country);
+    rank_by_quality(&mut plan, state, at, country, quality, capability);
     if let Some(pref) = state.preferred_fresh(now_ms) {
         if let Some(idx) = plan.candidates.iter().position(|c| candidate_key(c) == pref) {
             if idx > at {
@@ -459,18 +493,91 @@ pub fn order_plan_ranked(
 /// measurement costs attempt order and never reachability. Unmeasured
 /// candidates keep their configured order behind measured healthy ones —
 /// "unknown" must not outrank "known good", and must not be dropped either.
-fn rank_by_quality(plan: &mut DialPlan, state: &OutboundState, at: usize, country: &str) {
+///
+/// Exception — enforced location (a concrete 2-letter `country` in Pool
+/// mode): capability outranks unmeasured health. A `passthrough` candidate
+/// forwards any SNI/port; a `cf-relay` forwards only TLS:443 to CF-fronted
+/// destinations. Bug #2 (Speedtest "Server Fetch Failed"): the discovery
+/// list is CF-fronted HTTPS and loads, but Ookla's latency probes are plain
+/// HTTP :8080 to non-CF hosts, which cf-relay boxes cannot forward — every
+/// probe fails and no server can be selected. When the operator has picked
+/// a country, the pool must try full-capability boxes before CF-only ones,
+/// even when the passthrough has not been TCP-probed yet (unmeasured ≠ bad);
+/// measured failures still sink, so a dead passthrough never blocks.
+fn rank_by_quality(
+    plan: &mut DialPlan,
+    state: &OutboundState,
+    at: usize,
+    country: &str,
+    quality: &std::collections::BTreeMap<String, String>,
+    capability: &std::collections::BTreeMap<String, String>,
+) {
     if plan.candidates.len().saturating_sub(at) < 2 {
         return;
     }
+    let wanted = country.trim();
+    let enforced = wanted.len() == 2 && !wanted.eq_ignore_ascii_case("AUTO");
+    let cap_band = |t: &Target| -> u8 {
+        match capability.get(&candidate_key(t)).map(String::as_str) {
+            Some("passthrough") => 0,
+            Some("sni-terminate") => 2,
+            _ => 1,
+        }
+    };
+    // Health band: only MEASURED-BAD evidence sinks a candidate — quarantined
+    // (hard/repeated failures) or a rotating exit (an egress that moves
+    // between IPs/countries cannot hold a location, Phase-2 contract).
+    // Unmeasured and healthy share the top band — "unmeasured != bad" — so an
+    // unprobed passthrough still outranks a healthy cf-only box in an
+    // enforced pool.
+    let health_band = |t: &Target| -> u8 {
+        match state.geo.get(&host_key(t)) {
+            Some(h) if h.quarantined() || h.rotating => 2,
+            _ => 0,
+        }
+    };
     let mut tail: Vec<Target> = plan.candidates.split_off(at);
-    // Stable sort on the negated score: equal-scoring candidates (including
-    // every unmeasured one, all scoring 0) keep the operator's own order.
-    tail.sort_by(|a, b| {
-        let sa = state.geo.get(&host_key(a)).map_or(0.0, |h| h.score(country));
-        let sb = state.geo.get(&host_key(b)).map_or(0.0, |h| h.score(country));
-        sb.partial_cmp(&sa).unwrap_or(core::cmp::Ordering::Equal)
-    });
+    if enforced {
+        // Capability first, then measured health, then an exit-geo match with
+        // the selected country, then reputation. Stable sort keeps catalog
+        // order inside each band.
+        let geo_match = |t: &Target| -> u8 {
+            match state.geo.get(&host_key(t)) {
+                Some(h) if h.country.eq_ignore_ascii_case(wanted) => 0,
+                _ => 1,
+            }
+        };
+        tail.sort_by(|a, b| {
+            (
+                health_band(a),
+                cap_band(a),
+                geo_match(a),
+                high_risk(a, quality),
+            )
+                .cmp(&(
+                    health_band(b),
+                    cap_band(b),
+                    geo_match(b),
+                    high_risk(b, quality),
+                ))
+        });
+    } else {
+        // Stable sort on the negated score: equal-scoring candidates (including
+        // every unmeasured one, all scoring 0) keep the operator's own order.
+        tail.sort_by(|a, b| {
+            let sa = state.geo.get(&host_key(a)).map_or(0.0, |h| h.score(country));
+            let sb = state.geo.get(&host_key(b)).map_or(0.0, |h| h.score(country));
+            let ord = sb.partial_cmp(&sa).unwrap_or(core::cmp::Ordering::Equal);
+            // Feed reputation (v1.9.6) breaks health ties so the scanner's
+            // risk verdict survives to dial time. Only a tie-breaker: health
+            // stays dominant, so an excellent-health high-risk candidate still
+            // outranks a mediocre low-risk one (risk never destroys usability).
+            if ord.is_eq() {
+                return high_risk(a, quality).cmp(&high_risk(b, quality));
+            }
+            ord
+        });
+    }
     plan.candidates.extend(tail);
 }
 
@@ -493,6 +600,16 @@ fn apply_pin(plan: &mut DialPlan, at: usize, pin: &str) {
         let candidate = plan.candidates.remove(at + idx);
         plan.candidates.insert(at, candidate);
     }
+}
+
+/// Whether the feed marks this candidate's endpoint high-risk (v1.9.6).
+/// Absent from the map = unmeasured = not high-risk (unknown is never bad).
+fn high_risk(target: &Target, quality: &std::collections::BTreeMap<String, String>) -> u8 {
+    quality
+        .get(&candidate_key(target))
+        .and_then(|v| v.split('/').next())
+        .map(str::trim)
+        .is_some_and(|risk| risk.eq_ignore_ascii_case("high")) as u8
 }
 
 /// The host part of a candidate key, without the port: geo is a property of
@@ -1141,6 +1258,58 @@ mod tests {
     }
 
     #[test]
+    fn feed_quality_breaks_health_ties_high_risk_last() {
+        // v1.9.6: equal-health candidates order by feed reputation — the
+        // scanner's risk verdict must survive to dial time (paste §8).
+        let p = plan(&["dest.example", "dirty.example", "clean.example"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("dirty.example".into(), healthy("DE", 30));
+        s.geo.insert("clean.example".into(), healthy("DE", 30));
+        let mut quality = std::collections::BTreeMap::new();
+        quality.insert("dirty.example:443".into(), "high/datacenter/high/ip-api".into());
+        quality.insert("clean.example:443".into(), "low/residential/high/ip-api".into());
+        let out = order_plan_ranked(p, &s, NOW, "", "", &quality, &std::collections::BTreeMap::new());
+        assert_eq!(out.candidates[1], t("clean.example", 443));
+        assert!(out.candidates.contains(&t("dirty.example", 443)));
+    }
+
+    #[test]
+    fn feed_health_dominates_risk_never_destroys_usability() {
+        // An excellent-health high-risk candidate still outranks a mediocre
+        // low-risk one: reputation is a tie-breaker, never a disqualifier.
+        let p = plan(&["dest.example", "dirty.example", "clean.example"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("dirty.example".into(), healthy("DE", 10));
+        s.geo.insert("clean.example".into(), healthy("DE", 300));
+        let mut quality = std::collections::BTreeMap::new();
+        quality.insert("dirty.example:443".into(), "high/datacenter/high/ip-api".into());
+        quality.insert("clean.example:443".into(), "low/residential/high/ip-api".into());
+        let out = order_plan_ranked(p, &s, NOW, "", "", &quality, &std::collections::BTreeMap::new());
+        assert_eq!(out.candidates[1], t("dirty.example", 443));
+    }
+
+    #[test]
+    fn feed_quality_absent_keeps_previous_ordering() {
+        // Empty map (no feed / old snapshot): behavior identical to before.
+        let p = plan(&["dest.example", "unknown.example", "di.nscl.ir"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("di.nscl.ir".into(), healthy("DE", 30));
+        let out = order_plan_ranked(
+            p,
+            &s,
+            NOW,
+            "",
+            "",
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(
+            out.candidates,
+            vec![t("dest.example", 443), t("di.nscl.ir", 443), t("unknown.example", 443)]
+        );
+    }
+
+    #[test]
     fn a_failing_candidate_ranks_below_everything_but_stays_in_the_plan() {
         let p = plan(&["dest.example", "dead.example", "live.example"], 443);
         let mut s = state(None, NOW);
@@ -1177,6 +1346,28 @@ mod tests {
         // about reachability, not identity).
         assert_eq!(recovered.country, "US");
         assert_eq!(recovered.exit_ip, "198.51.100.7");
+
+        // Bug Hunter 2: runtime/platform errors are not candidate evidence.
+        let capped = Health::default()
+            .observed_fail("Error: Too many subrequests by single Worker invocation.".into(), NOW);
+        assert!(!capped.quarantined(), "a Worker budget error is not a candidate verdict");
+        assert!(capped.is_runtime_error());
+    }
+
+    #[test]
+    fn fallback_write_floor_gates_repeat_writes() {
+        let mut stored = OutboundState::default();
+        stored.fallback_primary = "US".into();
+        stored.fallback_active = "IT".into();
+        stored.fallback_at_ms = 1_000_000;
+        let mut next = stored.clone();
+        next.fallback_at_ms = 1_030_000; // 30 s later, same fallback pair
+        assert!(!fallback_write_needed(&stored, &next), "within the floor and unchanged: no write");
+        next.fallback_at_ms = 1_061_000; // past the floor
+        assert!(fallback_write_needed(&stored, &next), "past the floor: write");
+        let mut rotated = stored.clone();
+        rotated.fallback_active = "BD".into(); // rotation must never be swallowed
+        assert!(fallback_write_needed(&stored, &rotated));
     }
 
     #[test]
@@ -1186,12 +1377,28 @@ mod tests {
         s.geo.insert("fast.example".into(), healthy("DE", 10));
         s.geo.insert("slow.example".into(), healthy("DE", 300));
         // Pin loses nothing: the better-scoring candidate is still behind it.
-        let pinned = order_plan_ranked(p.clone(), &s, NOW, "", "slow.example");
+        let pinned = order_plan_ranked(
+            p.clone(),
+            &s,
+            NOW,
+            "",
+            "slow.example",
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+        );
         assert_eq!(pinned.candidates[0], t("dest.example", 443));
         assert_eq!(pinned.candidates[1], t("slow.example", 443));
         assert_eq!(pinned.candidates.len(), 3);
         // A pin that is not a candidate cannot cost the session its route.
-        let bogus = order_plan_ranked(p.clone(), &s, NOW, "", "gone.example");
+        let bogus = order_plan_ranked(
+            p.clone(),
+            &s,
+            NOW,
+            "",
+            "gone.example",
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+        );
         assert_eq!(bogus.candidates, order_plan_pref(p, &s, NOW, "").candidates);
     }
 
@@ -1203,6 +1410,84 @@ mod tests {
         s.geo.insert("lkg.example".into(), healthy("DE", 200));
         let out = order_plan_pref(p, &s, NOW, "");
         assert_eq!(out.candidates[1], t("lkg.example", 443));
+    }
+
+    #[test]
+    fn enforced_pool_healthy_passthrough_leads() {
+        // Bug #2: in an enforced pool a full-capability candidate outranks a
+        // cf-only box at equal health, because the cf-only box cannot serve
+        // the traffic class (plain HTTP :8080 to non-CF hosts) the operator
+        // selected that country for.
+        let p = plan(&["dest.example", "cf.example", "pass.example"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("cf.example".into(), healthy("TR", 30));
+        let mut cap = std::collections::BTreeMap::new();
+        cap.insert("pass.example:443".to_string(), "passthrough".to_string());
+        cap.insert("cf.example:443".to_string(), "cf-relay".to_string());
+        let out = order_plan_ranked(p, &s, NOW, "TR", "", &std::collections::BTreeMap::new(), &cap);
+        assert_eq!(out.candidates[1], t("pass.example", 443));
+        assert_eq!(out.candidates[2], t("cf.example", 443));
+    }
+
+    #[test]
+    fn enforced_pool_unmeasured_passthrough_still_leads() {
+        // Unmeasured != bad: an unprobed passthrough outranks a measured-
+        // healthy cf-relay in an enforced pool. Ordering only — the plan
+        // still contains every candidate.
+        let p = plan(&["dest.example", "cf.example", "pass.example"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("cf.example".into(), healthy("TR", 30));
+        let mut cap = std::collections::BTreeMap::new();
+        cap.insert("pass.example:443".to_string(), "passthrough".to_string());
+        cap.insert("cf.example:443".to_string(), "cf-relay".to_string());
+        let out = order_plan_ranked(p, &s, NOW, "TR", "", &std::collections::BTreeMap::new(), &cap);
+        assert_eq!(out.candidates[1], t("pass.example", 443));
+        assert_eq!(out.candidates.len(), 3);
+    }
+
+    #[test]
+    fn enforced_pool_quarantined_passthrough_sinks() {
+        // Measured-bad evidence still sinks, passthrough or not: capability
+        // never overrides the health contract.
+        let p = plan(&["dest.example", "cf.example", "dead.example"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("cf.example".into(), healthy("TR", 30));
+        let bad = Health::default()
+            .observed_fail("tcp connect: cannot connect to the specified address".into(), NOW);
+        s.geo.insert("dead.example".into(), bad);
+        let mut cap = std::collections::BTreeMap::new();
+        cap.insert("dead.example:443".to_string(), "passthrough".to_string());
+        cap.insert("cf.example:443".to_string(), "cf-relay".to_string());
+        let out = order_plan_ranked(p, &s, NOW, "TR", "", &std::collections::BTreeMap::new(), &cap);
+        assert_eq!(out.candidates[2], t("dead.example", 443));
+    }
+
+    #[test]
+    fn non_enforced_pool_ordering_unchanged() {
+        // AUTO / empty country keeps the score-based order: a healthy cf-relay
+        // outranks an unmeasured passthrough outside enforced mode. Capability
+        // is not a universal ranking override.
+        let p = plan(&["dest.example", "cf.example", "pass.example"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("cf.example".into(), healthy("TR", 30));
+        let mut cap = std::collections::BTreeMap::new();
+        cap.insert("pass.example:443".to_string(), "passthrough".to_string());
+        cap.insert("cf.example:443".to_string(), "cf-relay".to_string());
+        let out = order_plan_ranked(p, &s, NOW, "", "", &std::collections::BTreeMap::new(), &cap);
+        assert_eq!(out.candidates[1], t("cf.example", 443));
+        assert_eq!(out.candidates[2], t("pass.example", 443));
+    }
+
+    #[test]
+    fn enforced_pool_ignores_auto_string() {
+        // "AUTO" is not a country; the enforced exception must not fire on it.
+        let p = plan(&["dest.example", "cf.example", "pass.example"], 443);
+        let mut s = state(None, NOW);
+        s.geo.insert("cf.example".into(), healthy("TR", 30));
+        let mut cap = std::collections::BTreeMap::new();
+        cap.insert("pass.example:443".to_string(), "passthrough".to_string());
+        let out = order_plan_ranked(p, &s, NOW, "AUTO", "", &std::collections::BTreeMap::new(), &cap);
+        assert_eq!(out.candidates[1], t("cf.example", 443));
     }
 
     #[test]

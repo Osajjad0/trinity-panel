@@ -91,20 +91,38 @@ async fn load(env: &Env, host: &str) -> (Settings, Source, Option<String>) {
         Ok(kv) => kv.get(super::store::KEY).text().await.ok().flatten(),
         Err(_) => None,
     };
+    // The DO store mirrors `panel:settings` whenever a KV write was refused
+    // (daily quota). Either side can be the fresher one — KV after the quota
+    // reset, the DO right after a fallback save — so the document with the
+    // higher revision wins. Comparing revisions is what prevents a stale KV
+    // copy from silently reverting a saved country change.
+    let do_stored = super::settings_do::read(env, super::store::KEY).await;
+    let parsed = |raw: &Option<String>| -> Option<Settings> {
+        raw.as_deref()
+            .and_then(|r| Settings::parse(r).ok())
+            .filter(|s| !s.nodes.is_empty())
+    };
+    let (kv_parsed, do_parsed) = (parsed(&stored), parsed(&do_stored));
+    let (raw, warning) = match (&kv_parsed, &do_parsed) {
+        (Some(a), Some(b)) if b.rev > a.rev => (do_stored.clone(), None),
+        (Some(_), Some(_)) | (Some(_), None) => (stored.clone(), None),
+        (None, Some(_)) => (do_stored.clone(), None),
+        // Neither store has a live document (or both are unreadable): the
+        // malformed warning only matters when something was actually stored.
+        (None, None) => {
+            let warning = stored.as_deref().and_then(|raw| match Settings::parse(raw) {
+                Err(e) => Some(format!("Saved settings could not be read ({e}).")),
+                Ok(_) => None,
+            });
+            (None, warning)
+        }
+    };
 
-    let mut warning = None;
-    if let Some(raw) = stored {
-        match Settings::parse(&raw) {
-            // An empty stored document still means "nothing configured", so
-            // fall through to the derived set rather than serving zero nodes.
-            Ok(settings) if !settings.nodes.is_empty() => {
-                return (settings, Source::Stored, None);
+    if let Some(raw) = raw {
+        if let Ok(settings) = Settings::parse(&raw) {
+            if !settings.nodes.is_empty() {
+                return (settings, Source::Stored, warning);
             }
-            Ok(_) => {}
-            // A malformed or too-new document is not silently replaced: the
-            // derived set is served so the deployment keeps working, and the
-            // panel reports the problem when someone logs in.
-            Err(e) => warning = Some(format!("Saved settings could not be read ({e}).")),
         }
     }
 
@@ -195,27 +213,6 @@ pub async fn panel(mut req: Request, env: &Env, rest: &str) -> Result<Response> 
         return crate::entry::decoy(env).await;
     }
 
-    // The GitHub scanner is a machine: it has no browser session and no
-    // cookie. Its POST authenticates with its OIDC identity instead — a
-    // separate path from the panel password, decided in `github_oidc`. This
-    // must sit before the session gate or the workflow would 401.
-    if action == Api::CatalogSyncGithub {
-        return github_oidc_sync(&req, env).await;
-    }
-    // The 2-hour verification pass is also a machine caller (the workflow
-    // right after the sync), authenticating with the same GitHub OIDC
-    // identity. An operator session rides the normal gate below.
-    if action == Api::VerifyCatalog
-        && req
-            .headers()
-            .get("Authorization")
-            .ok()
-            .flatten()
-            .is_some_and(|v| v.starts_with("Bearer "))
-    {
-        return github_oidc_verify(&req, env).await;
-    }
-
     if !action.is_public() && !has_session(&req, &password) {
         return refuse("Your session has expired. Sign in again.");
     }
@@ -242,7 +239,7 @@ pub async fn panel(mut req: Request, env: &Env, rest: &str) -> Result<Response> 
         Api::Qr => qr(&req, env).await,
         Api::ProbeProxy => probe_proxy(env).await,
         Api::CatalogSync => catalog_sync(env).await,
-        Api::CatalogSyncGithub => unreachable!("handled before the session gate"),
+
         Api::PoolDialTest => pool_dial_test(&req, env).await,
         Api::VerifyCatalog => verify_catalog(&req, env).await,
         Api::HealthOverlay => health_overlay(env).await,
@@ -320,6 +317,11 @@ async fn state(req: &Request, env: &Env) -> Result<Response> {
             primary: settings.outbound.catalog_country.clone(),
             active: outbound_state.fallback_active.clone(),
         });
+    let snapshot = crate::catalog::stored(env).await;
+    let country_quality = snapshot.as_ref().map(|snapshot| {
+        let now = worker::Date::now().as_millis();
+        crate::catalog::country_quality(snapshot, &geo, now)
+    });
     json(&api::state(
         &settings,
         &host,
@@ -332,6 +334,8 @@ async fn state(req: &Request, env: &Env) -> Result<Response> {
         &catalog_hosts,
         &runtime_candidates,
         fallback,
+        country_quality,
+        &snapshot.map(|s| s.quality_by_endpoint).unwrap_or_default(),
     ))
 }
 
@@ -459,19 +463,64 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         enhanced_reachability: body.enhanced_reachability,
         rev: new_rev,
     };
+    // No-op guard: when the incoming content equals the stored content (rev
+    // excluded), nothing was changed and no store is written — identical saves
+    // must not consume KV quota. The stored document (and its rev) stands.
+    if stored.nodes == settings.nodes
+        && stored.outbound == settings.outbound
+        && stored.enhanced_reachability == settings.enhanced_reachability
+    {
+        let sub_base = format!("https://{host}{}", var(env, "SUB_PATH"));
+        let xhttp_path = var(env, "XHTTP_PATH");
+        let geo = load_health(env).await;
+        let catalog = load_catalog_meta(env).await;
+        let catalog_hosts = catalog_hosts_for_state(env, &stored.outbound).await;
+        let runtime_candidates =
+            runtime_candidates_for_state(env, &stored.outbound).await;
+        let snapshot = crate::catalog::stored(env).await;
+        let country_quality = snapshot.as_ref().map(|snapshot| {
+            let now = worker::Date::now().as_millis();
+            crate::catalog::country_quality(snapshot, &geo, now)
+        });
+        let state = api::state(
+            &stored,
+            &host,
+            &sub_base,
+            &xhttp_path,
+            Source::Stored,
+            None,
+            &geo,
+            catalog,
+            &catalog_hosts,
+            &runtime_candidates,
+            None,
+            country_quality,
+            &snapshot
+                .map(|s| s.quality_by_endpoint)
+                .unwrap_or_default(),
+        );
+        return json(&state);
+    }
     let Ok(document) = settings.to_json() else {
         return refuse("Those settings could not be stored.");
     };
-    let Ok(kv) = env.kv(KV_BINDING) else {
-        return refuse("This deployment has no settings storage bound.");
+    // Primary write: KV. When KV refuses (the free-tier daily write cap, or a
+    // missing binding) the DO settings store takes the write — DO storage does
+    // not count against the KV daily cap, so a country change still lands.
+    // Only when BOTH stores refuse is the save refused.
+    let kv_put_ok = match env.kv(KV_BINDING) {
+        Ok(kv) => match kv.put(super::store::KEY, document.clone()) {
+            Ok(put) => put.execute().await.is_ok(),
+            Err(_) => false,
+        },
+        Err(_) => false,
     };
-    match kv.put(super::store::KEY, document) {
-        Ok(put) => {
-            if put.execute().await.is_err() {
-                return refuse("Saving failed. Nothing was changed.");
-            }
+    if !kv_put_ok {
+        if let Err(do_err) = super::settings_do::write(env, super::store::KEY, &document).await {
+            return refuse(&format!(
+                "Saving failed: the settings stores refused the write ({do_err}). Nothing was changed."
+            ));
         }
-        Err(_) => return refuse("Saving failed. Nothing was changed."),
     }
     let sub_base = format!("https://{host}{}", var(env, "SUB_PATH"));
     let xhttp_path = var(env, "XHTTP_PATH");
@@ -482,6 +531,11 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
     let catalog = load_catalog_meta(env).await;
     let catalog_hosts = catalog_hosts_for_state(env, &settings.outbound).await;
     let runtime_candidates = runtime_candidates_for_state(env, &settings.outbound).await;
+    let snapshot = crate::catalog::stored(env).await;
+    let country_quality = snapshot.as_ref().map(|snapshot| {
+        let now = worker::Date::now().as_millis();
+        crate::catalog::country_quality(snapshot, &geo, now)
+    });
     let state = api::state(
         &settings,
         &host,
@@ -494,6 +548,10 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         &catalog_hosts,
         &runtime_candidates,
         None,
+        country_quality,
+        &snapshot
+            .map(|s| s.quality_by_endpoint)
+            .unwrap_or_default(),
     );
     Ok(json(&SavedResponse { ok: true, state })?)
 }
@@ -873,42 +931,6 @@ async fn catalog_sync(env: &Env) -> Result<Response> {
     }
 }
 
-/// The GitHub Actions scanner's machine-to-machine sync (V24.7).
-///
-/// Authentication is the OIDC identity token in the Authorization header —
-/// never a shared password, never a session cookie. The token is verified
-/// against GitHub's published JWKS keys, and every identity claim must equal
-/// the one trusted value (repo, ref, workflow path, event). Anything less
-/// than a full pass is a 401; the previous snapshot in KV is untouched.
-#[cfg(target_arch = "wasm32")]
-async fn github_oidc_sync(req: &Request, env: &Env) -> Result<Response> {
-    use super::github_oidc as oidc;
-
-    let bearer = req
-        .headers()
-        .get("Authorization")
-        .ok()
-        .flatten()
-        .and_then(|v| v.strip_prefix("Bearer ").map(str::to_owned));
-    let Some(token) = bearer else {
-        return refuse("GitHub OIDC token required.");
-    };
-
-    let verified = oidc::verify_wasm(&token).await;
-    let Ok(identity) = verified else {
-        return refuse("GitHub identity not accepted.");
-    };
-
-    // Same shared, fail-closed validate+no-op+persist path the operator
-    // route uses — there is exactly one sync implementation.
-    let report = crate::catalog::sync(env).await;
-    if report.ok && report.changed {
-        refresh_catalog_meta(env).await;
-    }
-    let _ = identity; // subject kept for logs if reporting ever needs it
-    json(&report)
-}
-
 /// The session-written outbound state (LKG + V24.4.4 fallback), for the panel.
 #[cfg(target_arch = "wasm32")]
 async fn load_outbound_state(env: &Env) -> crate::relay::outbound_state::OutboundState {
@@ -1016,29 +1038,8 @@ async fn verify_catalog(req: &Request, env: &Env) -> Result<Response> {
     verify_catalog_run(cursor, budget, env).await
 }
 
-/// [`verify_catalog`] behind the GitHub OIDC identity: the scheduled workflow
-/// is a machine, exactly like the catalog sync it follows.
 #[cfg(target_arch = "wasm32")]
-async fn github_oidc_verify(req: &Request, env: &Env) -> Result<Response> {
-    use super::github_oidc as oidc;
-
-    let bearer = req
-        .headers()
-        .get("Authorization")
-        .ok()
-        .flatten()
-        .and_then(|v| v.strip_prefix("Bearer ").map(str::to_owned));
-    let Some(token) = bearer else {
-        return refuse("GitHub OIDC token required.");
-    };
-    if oidc::verify_wasm(&token).await.is_err() {
-        return refuse("GitHub identity not accepted.");
-    }
-    verify_catalog(req, env).await
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<Response> {
+pub(crate) async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<Response> {
     let Some(snapshot) = crate::catalog::stored(env).await else {
         return refuse("No verified catalog snapshot. Sync first.");
     };
@@ -1136,6 +1137,14 @@ async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<R
                 reachable += 1;
                 prior.observed_ok(c, colo, ip, trace.latency_ms, now)
             }
+            Err((error, _, _)) if error.contains("Too many subrequests") => {
+                // Platform budget exhaustion (free-plan 50-subrequest
+                // invocation limit), not candidate evidence — recording it
+                // would poison country states (09-28 Bug #4). Stop the pass;
+                // the workflow's next invocation starts with a fresh budget.
+                paused = true;
+                break;
+            }
             Err((error, _, _)) => prior.observed_fail(error, now),
         };
         state.geo.insert(key, updated);
@@ -1185,6 +1194,7 @@ async fn verify_catalog_run(cursor: usize, budget: usize, env: &Env) -> Result<R
         "probed": probed,
         "reachable": reachable,
         "total": total,
+        "paused": paused,
         "counts": health_counts(&snapshot, &state),
     }))
 }
@@ -1232,6 +1242,19 @@ fn health_counts(
     serde_json::Value::Object(out.into_iter().map(|(k, v)| (k, v)).collect())
 }
 
+/// The full country-quality aggregation for the health overlay: per-country
+/// state (`full`/`degraded`/`limited`/`unavailable`), deterministic quality
+/// score, and the underlying capability counts that caused the verdict.
+#[cfg(target_arch = "wasm32")]
+fn country_quality_json(
+    snapshot: &crate::catalog::Snapshot,
+    state: &crate::relay::outbound_state::OutboundState,
+) -> serde_json::Value {
+    let now = worker::Date::now().as_millis();
+    let map = crate::catalog::country_quality(snapshot, &state.geo, now);
+    serde_json::to_value(&map).unwrap_or(serde_json::Value::Null)
+}
+
 /// The health overlay itself, for the panel/API debug view.
 #[cfg(target_arch = "wasm32")]
 async fn health_overlay(env: &Env) -> Result<Response> {
@@ -1248,6 +1271,7 @@ async fn health_overlay(env: &Env) -> Result<Response> {
     json(&serde_json::json!({
         "ok": true,
         "counts": health_counts(&snapshot, &state),
+        "countryQuality": country_quality_json(&snapshot, &state),
         "quarantined": quarantined,
     }))
 }
@@ -1288,13 +1312,19 @@ async fn probe_tcp_one(host: &str, port: u16) -> core::result::Result<Trace, Pro
     };
     let dial_ip = match verdict {
         Dial::Ok(ip) => ip,
-        Dial::Err(e) => return Err((e, format!("{host}:{port}"), None)),
+        Dial::Err(e) => {
+            let _ = sock.close().await;
+            return Err((e, format!("{host}:{port}"), None));
+        }
         Dial::Timeout => {
+            // No Drop on worker::Socket — an abandoned handle on the timeout
+            // path would leak until the invocation ends (Bug Hunter 2).
+            let _ = sock.close().await;
             return Err((
                 "tcp connect: handshake timed out".into(),
                 format!("{host}:{port}"),
                 None,
-            ))
+            ));
         }
     };
     let tcp_ms =
@@ -1323,7 +1353,7 @@ async fn load_catalog_snapshot(env: &Env) -> Option<crate::catalog::Snapshot> {
 /// Rebuild `panel:catalog_meta` from the snapshot just stored. A failure here
 /// is non-fatal: the panel degrades to the previous meta view.
 #[cfg(target_arch = "wasm32")]
-async fn refresh_catalog_meta(env: &Env) {
+pub(crate) async fn refresh_catalog_meta(env: &Env) {
     let Ok(kv) = env.kv(KV_BINDING) else { return };
     let Some(document) = kv.get(crate::catalog::KV_KEY).text().await.ok().flatten() else {
         return;
@@ -1408,6 +1438,9 @@ async fn pool_dial_test(req: &Request, env: &Env) -> Result<Response> {
         .find(|(k, _)| k == "source")
         .map(|(_, v)| v)
         .unwrap_or_default();
+    let trace_egress = query(req)
+        .into_iter()
+        .any(|(k, v)| k == "egress" && v == "1");
     // `source=feed` reads the published verified feed directly (read-only,
     // never persisted) so a stale/unsyncable KV snapshot can be validated
     // against what the next Sync would install. Default stays the snapshot.
@@ -1465,6 +1498,34 @@ async fn pool_dial_test(req: &Request, env: &Env) -> Result<Response> {
         // misreports them as dead. Probe IPs the way the runtime dials them.
         let is_ip = endpoint.host.parse::<std::net::IpAddr>().is_ok();
         if is_ip {
+            // ?egress=1: attempt the stage-A style TLS trace through the box so
+            // the OPERATOR can see the box's egress from the worker's own
+            // vantage (scanner evidence is measured from the scanner's vantage
+            // and a multi-upstream box can route differently per source). A
+            // failed TLS attempt degrades to the plain TCP row — never a
+            // misreported death. Diagnostic only: no state is written.
+            if trace_egress {
+                match probe_one(&endpoint.host, endpoint.port).await {
+                    Ok(t) => {
+                        rows.push(Row {
+                            candidate,
+                            dial_ip: t.dial_ip,
+                            tcp_ms: Some(t.tcp_ms),
+                            probe_ms: Some(t.probe_ms),
+                            observed_country: t.country,
+                            colo: t.colo,
+                            exit_ip: t.exit_ip,
+                            ok: true,
+                            error: String::new(),
+                        });
+                        continue;
+                    }
+                    Err((reason, _, _)) => {
+                        // fall through to the plain TCP row below
+                        let _ = reason;
+                    }
+                }
+            }
             match probe_tcp_one(&endpoint.host, endpoint.port).await {
                 Ok(t) => rows.push(Row {
                     candidate,

@@ -64,6 +64,11 @@ pub struct Snapshot {
     /// cf-relay class can, and more.
     #[serde(default)]
     pub capability_by_endpoint: std::collections::BTreeMap<String, String>,
+    /// v1.9.6: per-endpoint quality verdict from the feed (`ip:port` →
+    /// `risk/type/confidence/source`). Absent key = unmeasured; unknown is
+    /// never bad. Older feeds without it default to empty.
+    #[serde(default)]
+    pub quality_by_endpoint: std::collections::BTreeMap<String, String>,
 }
 
 /// What a hex string looks like.
@@ -195,6 +200,60 @@ pub struct SyncReport {
 }
 
 
+/// Spec §8 (V24.8 decoupling): tamper-evidence. The feed's own
+/// `content_revision` is a SHA-256 over its countries map, canonicalized by
+/// the scanner (Python `json.dumps(..., sort_keys=True)` over `[addr, port]`
+/// pairs). Rebuild that exact canonical string and compare — proves the
+/// artifact survived transport intact without inventing cryptography, adding
+/// feed fields, or writing anything. Integrity ≠ authenticity: raw HTTPS to
+/// the pinned repo is the authenticity story for now. Pure fn — host tests
+/// exercise it against the real scanner recipe.
+fn verify_integrity(bytes: &[u8], declared: &str) -> Result<(), String> {
+    use sha2::Digest as _;
+    let document: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("feed is not valid JSON: {e}"))?;
+    let countries = document
+        .get("countries")
+        .and_then(|v| v.as_object())
+        .ok_or("feed has no countries map")?;
+    let mut keys: Vec<&String> = countries.keys().collect();
+    keys.sort();
+    let mut body = String::with_capacity(bytes.len() / 2);
+    body.push('{');
+    for (i, cc) in keys.iter().enumerate() {
+        if i > 0 {
+            body.push_str(", ");
+        }
+        body.push_str(&format!("{}: [", serde_json::json!(cc.as_str())));
+        let list = countries[*cc]
+            .as_array()
+            .ok_or("countries entry is not a list")?;
+        for (j, e) in list.iter().enumerate() {
+            if j > 0 {
+                body.push_str(", ");
+            }
+            // Feed entries are pairs: ["addr", port].
+            let pair = e
+                .as_array()
+                .filter(|p| p.len() == 2)
+                .ok_or("countries entry is not an [address, port] pair")?;
+            let addr = pair[0].as_str().ok_or("address is not a string")?;
+            let port = pair[1].as_u64().ok_or("port is not a number")?;
+            body.push_str(&format!("[{}, {port}]", serde_json::json!(addr)));
+        }
+        body.push(']');
+    }
+    body.push('}');
+    let hex: String = sha2::Sha256::digest(body.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if hex != declared {
+        return Err("content_revision does not match the feed body (integrity check failed)".into());
+    }
+    Ok(())
+}
+
 /// Fetch + parse + persist the catalog snapshot. NEVER called per session:
 /// the only caller is the operator-triggered `api/catalog-sync` panel route.
 ///
@@ -202,20 +261,50 @@ pub struct SyncReport {
 /// stays exactly as it was and the error is reported.
 #[cfg(target_arch = "wasm32")]
 pub async fn sync(env: &worker::Env) -> SyncReport {
+    let (status, report, reason, active) = sync_inner(env).await;
+    // §21: exactly one line per pull — HTTP status, both revisions, validation
+    // and activation outcome, last success/failure, rejection reason.
+    worker::console_log!("{}", sync_log(status, &report, &reason, &active));
+    report
+}
+
+/// The pull itself. Returns `(http_status, report, validation_reason,
+/// active_revision)` so the caller logs one line without re-reading KV.
+#[cfg(target_arch = "wasm32")]
+async fn sync_inner(env: &worker::Env) -> (Option<u16>, SyncReport, String, String) {
     let fetched_at = worker::Date::now().as_millis();
-    let (bytes, mut error) = match fetch_feed().await {
-        Ok(b) => (b, None),
-        Err(e) => (Vec::new(), Some(e)),
+    let (bytes, status, mut error) = match fetch_feed(env).await {
+        Ok((b, s)) => (b, Some(s), None),
+        Err(e) => (Vec::new(), None, Some(e)),
     };
+    // The stored document is read before validation so the §21 line can report
+    // the still-active revision on every outcome, a rejected feed included.
+    let kv = env.kv("SETTINGS").ok();
+    let previous: Option<String> = match kv.as_ref() {
+        Some(kv) => kv.get(KV_KEY).text().await.ok().flatten(),
+        None => None,
+    };
+    let active = stored_revision(previous.as_deref()).unwrap_or_default();
     if error.is_none() {
         // Surface the real validation reason to the operator.
         if let Err(failure) = Snapshot::parse(&bytes) {
             error = Some(format!("feed rejected: {failure}; previous snapshot kept"));
         }
     }
+    if error.is_none() {
+        // Integrity gate (spec §8): revision must match the body. Fail closed
+        // — the previous snapshot in KV stays active on any mismatch.
+        let declared = Snapshot::parse(&bytes)
+            .map(|s| s.content_revision)
+            .unwrap_or_default();
+        if let Err(failure) = verify_integrity(&bytes, &declared) {
+            error = Some(format!("feed rejected: {failure}; previous snapshot kept"));
+        }
+    }
     let parsed = if error.is_none() { Snapshot::parse(&bytes).ok() } else { None };
     let Some(snapshot) = parsed else {
-        return SyncReport {
+        let reason = error.clone().unwrap_or_else(|| "unparsable feed".into());
+        return (status, SyncReport {
             ok: false,
             changed: false,
             content_revision: String::new(),
@@ -225,12 +314,7 @@ pub async fn sync(env: &worker::Env) -> SyncReport {
             country_count: 0,
             endpoint_count: 0,
             error,
-        };
-    };
-    let kv = env.kv("SETTINGS").ok();
-    let previous: Option<String> = match kv.as_ref() {
-        Some(kv) => kv.get(KV_KEY).text().await.ok().flatten(),
-        None => None,
+        }, reason, active);
     };
     // Content identity, not document identity: `fetchedAt` changes on every
     // run, so comparing whole documents made every sync a KV write even when
@@ -239,8 +323,22 @@ pub async fn sync(env: &worker::Env) -> SyncReport {
     // publishes — decides. Unchanged revision: zero KV writes, previous
     // `fetchedAt` kept (it dates the stored content, not this probe).
     let incoming_rev = snapshot.content_revision.as_str();
-    let changed = stored_revision(previous.as_deref()).as_deref() != Some(incoming_rev);
-    let mut error = None;
+    // §6: one decision covers the no-op (equal revision → zero writes) and
+    // the rollback guard (older generated_at → reject, keep previous).
+    let decision = revision_decision(
+        incoming_rev,
+        snapshot.generated_at.as_str(),
+        stored_revision(previous.as_deref()).as_deref(),
+        stored_generated_at(previous.as_deref()).as_deref(),
+    );
+    let (changed, mut error): (bool, Option<String>) = match decision {
+        Ok(true) => (true, None),
+        Ok(false) => (false, None),
+        Err(rejection) => (
+            false,
+            Some(format!("feed rejected: {rejection}; previous snapshot kept")),
+        ),
+    };
     if changed {
         let document = serde_json::json!({
             "snapshot": snapshot,
@@ -260,7 +358,8 @@ pub async fn sync(env: &worker::Env) -> SyncReport {
         }
     }
     if error.is_some() {
-        return SyncReport {
+        let reason = error.clone().unwrap_or_else(|| "write failed".into());
+        return (status, SyncReport {
             ok: false,
             changed: false,
             content_revision: snapshot.content_revision,
@@ -270,9 +369,10 @@ pub async fn sync(env: &worker::Env) -> SyncReport {
             country_count: snapshot.countries.len(),
             endpoint_count: snapshot.countries.values().map(Vec::len).sum::<usize>(),
             error,
-        };
+        }, reason, active);
     }
-    SyncReport {
+    let reason = if changed { "new revision activated" } else { "revision unchanged; zero writes" };
+    (status, SyncReport {
         ok: true,
         changed,
         content_revision: snapshot.content_revision,
@@ -282,11 +382,8 @@ pub async fn sync(env: &worker::Env) -> SyncReport {
         country_count: snapshot.countries.len(),
         endpoint_count: snapshot.countries.values().map(Vec::len).sum::<usize>(),
         error: None,
-    }
+    }, reason.to_owned(), active)
 }
-
-/// The last snapshot stored in KV, if any and if valid. An unreadable or
-/// outdated-schema document yields `None` (fail closed to operator candidates).
 
 /// The content revision stored in a `panel:catalog` document, if any.
 ///
@@ -305,6 +402,48 @@ fn stored_revision(previous: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The `generated_at` of the snapshot stored in a `panel:catalog` document,
+/// if any. Sibling of `stored_revision`; feeds the §6 rollback guard.
+#[must_use]
+fn stored_generated_at(previous: Option<&str>) -> Option<String> {
+    let document: serde_json::Value = serde_json::from_str(previous?).ok()?;
+    document
+        .get("snapshot")?
+        .get("generated_at")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Decoupling §6: revision-aware decision, made before any write.
+///
+/// - equal `content_revision`  → no-op (`Ok(false)`): zero KV writes.
+/// - `generated_at` older than the stored one → reject (`Err`): never roll
+///   backward, the previous snapshot stays active. Both timestamps are
+///   scanner-generated RFC 3339 UTC (`…Z`), so lexicographic order is
+///   chronological order.
+/// - anything else (newer revision, or no stored document) → activate
+///   (`Ok(true)`); a missing/unreadable stored timestamp fails safe toward
+///   freshness, matching `stored_revision`.
+#[must_use]
+fn revision_decision(
+    incoming_rev: &str,
+    incoming_at: &str,
+    stored_rev: Option<&str>,
+    stored_at: Option<&str>,
+) -> Result<bool, String> {
+    if stored_rev == Some(incoming_rev) {
+        return Ok(false);
+    }
+    if let Some(prev) = stored_at {
+        if prev > incoming_at {
+            return Err(format!(
+                "older feed rejected (stored generated_at {prev}, incoming {incoming_at}); never roll backward"
+            ));
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(target_arch = "wasm32")]
 #[must_use]
 pub async fn stored(env: &worker::Env) -> Option<Snapshot> {
@@ -320,11 +459,15 @@ fn now_iso(ms: u64) -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn fetch_feed() -> Result<Vec<u8>, String> {
+async fn fetch_feed(env: &worker::Env) -> Result<(Vec<u8>, u16), String> {
+    // CATALOG_URL (decoupling §4): the feed source is configurable per
+    // deployment via a plain-text binding; the pinned public repo is the
+    // default so a deployment that sets nothing still works.
+    let base = catalog_url(env);
     // Cache-bust: raw.githubusercontent.com serves stale copies for minutes
     // after a push, and a sync that runs right after publishing must see the
     // revision it was invoked for (the idempotency check compares hashes).
-    let url = format!("{FEED_URL}?t={}", worker::Date::now().as_millis());
+    let url = format!("{base}?t={}", worker::Date::now().as_millis());
     let request = worker::Request::new(&url, worker::Method::Get).map_err(|e| e.to_string())?;
     // Bounded fetch: race the send against a deadline so a hung edge never
     // blocks the operator route. Both futures are pinned in place.
@@ -338,11 +481,55 @@ async fn fetch_feed() -> Result<Vec<u8>, String> {
         }
     };
     let mut response = response;
+    let status = response.status_code();
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
     if bytes.len() > MAX_FEED_BYTES {
         return Err(format!("feed exceeds {MAX_FEED_BYTES} bytes"));
     }
-    Ok(bytes)
+    Ok((bytes, status))
+}
+
+/// §4: the feed source, CATALOG_URL binding first, pinned default second.
+#[cfg(target_arch = "wasm32")]
+fn catalog_url(env: &worker::Env) -> String {
+    env.var("CATALOG_URL")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| FEED_URL.to_owned())
+}
+
+/// §21 observability: one compact line per pull, built here as a pure fn so
+/// the host tests pin the shape. Never includes the URL's query, headers or
+/// any binding value — no secrets in logs.
+#[must_use]
+fn sync_log(
+    status: Option<u16>,
+    report: &SyncReport,
+    reason: &str,
+    active_revision: &str,
+) -> String {
+    format!(
+        "catalog pull: http={} fetched_revision={} active_revision={} validation={} activation={} countries={} endpoints={} last_success={} last_failure={} reason={}",
+        status.map_or_else(|| "none".to_owned(), |s| s.to_string()),
+        short(&report.content_revision),
+        short(active_revision),
+        if report.error.is_none() { "ok" } else { "rejected" },
+        if report.changed { "activated" } else { "kept" },
+        report.country_count,
+        report.endpoint_count,
+        report.fetched_at,
+        report.error.as_deref().unwrap_or("none"),
+        reason,
+    )
+}
+
+/// First 12 hex chars of a revision, or `none` — logs stay one line.
+#[must_use]
+fn short(revision: &str) -> String {
+    if revision.is_empty() {
+        "none".to_owned()
+    } else {
+        revision.chars().take(12).collect()
+    }
 }
 
 /// Bounded maximum catalog candidates appended to a dial plan behind direct.
@@ -399,12 +586,16 @@ pub fn pool_for_with_health(
                 spread.into_iter(),
                 health,
                 &snapshot.capability_by_endpoint,
+                &snapshot.quality_by_endpoint,
+                false,
             ));
         }
         return Some(bounded(
             snapshot.auto.iter().cloned(),
             health,
             &snapshot.capability_by_endpoint,
+            &snapshot.quality_by_endpoint,
+            false,
         ));
     }
     let selected = snapshot.pool(Some(country))?;
@@ -412,6 +603,8 @@ pub fn pool_for_with_health(
         selected.iter().cloned(),
         health,
         &snapshot.capability_by_endpoint,
+        &snapshot.quality_by_endpoint,
+        cfg.enforces_location(),
     ))
 }
 
@@ -448,30 +641,206 @@ pub fn region_of(cc: &str) -> &'static str {
 /// spread across candidates instead of hammering one country. Skips the
 /// exhausted primary and empty pools. European countries enter only when no
 /// non-European pool remains (Tier 2).
+///
+/// Capability gates the ranking: a country with verified passthrough
+/// candidates outranks every zero-passthrough country (a 100-candidate
+/// cf-relay-only pool cannot carry generic internet; a smaller pool with
+/// passthrough can). Region and size rank inside each capability band.
 #[must_use]
 pub fn choose_fallback_country(
     snapshot: &Snapshot,
     excluded: &[&str],
     epoch: u64,
 ) -> Option<String> {
-    let mut ranked: Vec<(bool, usize, &String)> = snapshot
+    let has_pt = |cc: &str| -> u8 {
+        u8::from(
+            snapshot
+                .capability_counts
+                .get(cc)
+                .and_then(|c| c.get("passthrough"))
+                .copied()
+                .unwrap_or(0)
+                > 0,
+        )
+    };
+    let mut ranked: Vec<(u8, bool, usize, &String)> = snapshot
         .countries
         .iter()
         .filter(|(cc, pool)| !excluded.contains(&cc.as_str()) && !pool.is_empty())
-        .map(|(cc, pool)| (region_of(cc) == "Europe", pool.len(), cc))
+        .map(|(cc, pool)| (has_pt(cc), region_of(cc) == "Europe", pool.len(), cc))
         .collect();
-    // Sort: non-Europe first, larger pools first, then cc for stability.
+    // Sort: passthrough-capable first, non-Europe first, larger pools first,
+    // then cc for stability.
     ranked.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(b.1.cmp(&a.1))
-            .then(a.2.cmp(b.2))
+        b.0.cmp(&a.0)
+            .then(a.1.cmp(&b.1))
+            .then(b.2.cmp(&a.2))
+            .then(a.3.cmp(b.3))
     });
     if ranked.is_empty() {
         return None;
     }
     let top = ranked.len().min(3);
     let pick = &ranked[(epoch % top as u64) as usize];
-    Some(pick.2.clone())
+    Some(pick.3.clone())
+}
+
+/// Per-country capability state and deterministic quality score, derived ONLY
+/// from verified data: the feed's Stage-C census (`capability_counts`) and
+/// Trinity's own worker-vantage health records. No geography, ASN, or
+/// name-based inference.
+///
+/// States (spec v1.9.5 country quality; 09-28 hardening: UNMEASURED ≠ BAD):
+/// - `full`: verified passthrough candidates with no failure evidence —
+///   either at least one currently healthy candidate, or the census is
+///   verified and nothing has been measured failing. Missing liveness
+///   measurements never demote (the 2-h scanner fills them progressively).
+/// - `degraded`: passthrough exists AND concrete repeated/hard probe
+///   failures (the dial path's quarantine predicate) — measurable
+///   degradation, never "metadata missing".
+/// - `limited`: zero passthrough (cf-relay-only census) — reachable maybe,
+///   but generic destinations fail by design.
+/// - `unavailable`: no candidates, or every candidate measured and none
+///   healthy (all quarantined/dead).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CountryQuality {
+    /// `full` | `degraded` | `limited` | `unavailable`.
+    pub state: String,
+    /// 0–100. Orders countries inside a state; the state orders between.
+    /// `None` when nothing was measured: quality unknown, never a fake 0.
+    pub quality: Option<u32>,
+    pub passthrough: u32,
+    pub cf_relay: u32,
+    pub sni_terminate: u32,
+    pub healthy: u32,
+    pub discovered: u32,
+    /// Mean worker-vantage success rate over measured candidates, percent.
+    pub success_rate_pct: u32,
+}
+
+/// Freshness window for health records feeding the score (spec §9).
+const FRESH_MS: u64 = 24 * 60 * 60 * 1000;
+
+#[must_use]
+pub fn country_quality(
+    snapshot: &Snapshot,
+    health: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
+    now_ms: u64,
+) -> std::collections::BTreeMap<String, CountryQuality> {
+    let mut out = std::collections::BTreeMap::new();
+    for (cc, list) in &snapshot.countries {
+        let census = snapshot.capability_counts.get(cc);
+        let pt = census
+            .and_then(|c| c.get("passthrough"))
+            .copied()
+            .unwrap_or(0);
+        let cf = census
+            .and_then(|c| c.get("cf-relay"))
+            .copied()
+            .unwrap_or(0);
+        let sni = census
+            .and_then(|c| c.get("sni-terminate"))
+            .copied()
+            .unwrap_or(0);
+        let discovered = list.len() as u32;
+        // Worker-vantage evidence for this country's candidates.
+        let mut measured = 0u32;
+        let mut healthy = 0u32;
+        let mut fresh = 0u32;
+        // 09-28 hardening: concrete degradation evidence — repeated/hard probe
+        // failures, the same predicate the dial path quarantines on. Counted
+        // inside this loop so the freshness TTL above applies too: an old
+        // failure can no more pin a country DEGRADED forever than an old
+        // success can keep it FULL.
+        let mut quarantined_fresh = 0u32;
+        let mut success_sum = 0.0f64;
+        let mut healthy_hosts = std::collections::HashSet::new();
+        for e in list {
+            let key = format!("{}:{}", e.host.to_ascii_lowercase(), e.port);
+            if let Some(h) = health.get(&key) {
+                // Stale evidence is not current proof (spec: freshness TTL).
+                // A record older than 2x the freshness window decays to
+                // unmeasured — it can neither keep a country FULL nor pin
+                // it to a past failure. The 24h freshness share already
+                // decays the score; this TTL also removes the liveness.
+                if now_ms.saturating_sub(h.updated_at_ms) >= 2 * FRESH_MS {
+                    continue;
+                }
+                // Platform runtime errors (e.g. the free-plan subrequest cap)
+                // say nothing about the candidate — no measurement, no
+                // evidence (Bug #4); poisoned records become inert here.
+                if h.is_runtime_error() {
+                    continue;
+                }
+                measured += 1;
+                success_sum += h.success_rate();
+                if h.quarantined() {
+                    quarantined_fresh += 1;
+                }
+                // Same liveness predicate the health overlay's
+                // `trinityReachable` uses: the last probe succeeded. The
+                // stricter `healthy()` (which also demands a known exit
+                // country) would miscount TCP-verified candidates whose
+                // trace lookup never captured a country.
+                if h.ok && !h.quarantined() {
+                    healthy += 1;
+                    healthy_hosts.insert(e.host.to_ascii_lowercase());
+                }
+                if now_ms.saturating_sub(h.updated_at_ms) < FRESH_MS {
+                    fresh += 1;
+                }
+            }
+        }
+        // UNMEASURED ≠ BAD (paste 09-28): absence of measurements is not
+        // evidence of degradation. A verified passthrough country with no
+        // failure evidence is FULL — healthy now, or simply not yet probed
+        // (the 2-h scanner fills that gap). Only concrete repeated/hard
+        // failures demote it to DEGRADED; JSON shape unchanged for the UI.
+        let state = if pt > 0 && (healthy > 0 || quarantined_fresh == 0) {
+            "full"
+        } else if pt > 0 {
+            // Passthrough exists, nothing healthy, real failed probes on
+            // record — measurable current degradation.
+            "degraded"
+        } else if discovered == 0 || (healthy == 0 && measured > 0) {
+            "unavailable"
+        } else {
+            "limited"
+        };
+        // Deterministic score per spec weights: 35% passthrough availability,
+        // 25% recent success rate, 15% reachable share, 15% freshness,
+        // 10% host diversity of healthy candidates. Zero passthrough therefore
+        // caps at 65; candidate count never enters directly.
+        let pt_share = f64::from(pt) / f64::from(discovered.max(1));
+        let success = if measured > 0 { success_sum / f64::from(measured) } else { 0.0 };
+        let reach_share = f64::from(healthy) / f64::from(discovered.max(1));
+        let fresh_share = f64::from(fresh) / f64::from(measured.max(1));
+        let diversity = f64::from(healthy_hosts.len() as u32) / f64::from(healthy.max(1));
+        let quality = (35.0 * pt_share
+            + 25.0 * success
+            + 15.0 * reach_share
+            + 15.0 * fresh_share
+            + 10.0 * diversity)
+            .round() as u32;
+        // UNMEASURED ≠ BAD (paste 09-28): with zero measurements the score is
+        // unknown, not zero — emit null ("Quality: —"), never a fake 0.
+        let quality = (measured > 0).then(|| quality.min(100));
+        out.insert(
+            cc.clone(),
+            CountryQuality {
+                state: state.to_owned(),
+                quality,
+                passthrough: pt,
+                cf_relay: cf,
+                sni_terminate: sni,
+                healthy,
+                discovered,
+                success_rate_pct: (success * 100.0).round() as u32,
+            },
+        );
+    }
+    out
 }
 
 /// Runtime fallback hook (V24.4.4): pick a fallback country for an exhausted
@@ -545,7 +914,24 @@ pub async fn try_pool_fallback(
 #[cfg(target_arch = "wasm32")]
 pub async fn write_fallback_state(env: &worker::Env, state: &crate::relay::outbound_state::OutboundState) {
     if let Ok(kv) = env.kv("SETTINGS") {
-        if let Ok(document) = serde_json::to_string(state) {
+        // Read + merge (Bug Hunter 2): a probe pass or LKG write landing while
+        // this session ran must survive — a wholesale put would clobber their
+        // fresher per-candidate verdicts. Then two quota guards: a 60 s floor
+        // (reconnect storms must not put a KV write on every session; the
+        // hold clock drifts at most one floor, rotation stays epoch-granular)
+        // and a no-op skip when the merged document equals what is stored.
+        let stored = match kv.get(crate::relay::outbound_state::KV_KEY).text().await {
+            Ok(Some(raw)) => crate::relay::outbound_state::OutboundState::from_json(&raw),
+            _ => crate::relay::outbound_state::OutboundState::default(),
+        };
+        if !crate::relay::outbound_state::fallback_write_needed(&stored, state) {
+            return;
+        }
+        let merged = crate::relay::outbound_state::merged_with_stored(state.clone(), stored.clone());
+        if merged == stored {
+            return;
+        }
+        if let Ok(document) = serde_json::to_string(&merged) {
             if let Ok(pending) = kv.put(crate::relay::outbound_state::KV_KEY, document) {
                 let _ = pending.execute().await;
             }
@@ -556,11 +942,16 @@ pub async fn write_fallback_state(env: &worker::Env, state: &crate::relay::outbo
 /// Order-preserving dedupe by host+port, capped at MAX_POOL_CANDIDATES.
 /// Health evidence orders within the pool: measured-healthy first, then
 /// unmeasured, then known-failed — so Auto does not re-serve the same dead
-/// addresses the probe already condemned while healthy ones exist.
+/// addresses the probe already condemned while healthy ones exist. Feed
+/// reputation (`quality_by_endpoint`, "risk/type/confidence/source") only
+/// re-ranks: a `high`-risk verdict sinks within its health/capability band
+/// but never disqualifies — absent or unparseable = unmeasured, never bad.
 fn bounded(
     candidates: impl Iterator<Item = Endpoint>,
     health: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
     capability: &std::collections::BTreeMap<String, String>,
+    quality: &std::collections::BTreeMap<String, String>,
+    capability_first: bool,
 ) -> Vec<Endpoint> {
     // Capability band: a Stage-C `passthrough` is strictly more capable than
     // cf-relay (it forwards any SNI, including a CF edge's), so it outranks
@@ -576,13 +967,30 @@ fn bounded(
             _ => 1,
         }
     };
+    // capability_first (enforced pools, Bug #2): a full-capability candidate
+    // must not be crowded out of the pool slot cap by measured-healthy
+    // cf-only boxes — a cf-relay cannot serve the plain-HTTP/:8080 traffic
+    // class the operator selected that country for. The 8x weight puts the
+    // capability band above the whole health*risk range below it; quarantines
+    // still win because they drop candidates entirely (eligibility, not rank).
     let rank = |e: &Endpoint| -> u8 {
-        (match health.get(&format!("{}:{}", e.host.to_ascii_lowercase(), e.port)) {
+        let health_part = (match health.get(&format!("{}:{}", e.host.to_ascii_lowercase(), e.port)) {
             Some(h) if h.healthy() => 0u8,
             Some(h) if !h.ok => 2,
             _ => 1,
         }) * 3
-            + cap_rank(e)
+            + u8::from(
+                quality
+                    .get(&format!("{}:{}", e.host.to_ascii_lowercase(), e.port))
+                    .and_then(|v| v.split('/').next())
+                    .map(str::trim)
+                    .is_some_and(|risk| risk.eq_ignore_ascii_case("high")),
+            ) * 9;
+        if capability_first {
+            cap_rank(e) * 8 + health_part.min(7)
+        } else {
+            health_part + cap_rank(e)
+        }
     };
     let mut deduped: Vec<Endpoint> = Vec::new();
     for e in candidates {
@@ -670,6 +1078,11 @@ pub struct Meta {
     /// Verified endpoint count per country (V24.5.8 spec 15: the Location
     /// menu shows "US · 54 verified"). Absent in older stored metas.
     pub country_counts: std::collections::BTreeMap<String, usize>,
+    /// The public feed URL this panel pulls from (V24.8 decoupling §4/§30):
+    /// shown in the panel so the source is visible, not secret. Absent in
+    /// older stored metas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 impl Default for Meta {
@@ -683,6 +1096,7 @@ impl Default for Meta {
             countries: Vec::new(),
             endpoint_count: 0,
             country_counts: Default::default(),
+            source_url: None,
         }
     }
 }
@@ -705,6 +1119,7 @@ impl Meta {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.len()))
                 .collect(),
+            source_url: Some(FEED_URL.to_owned()),
         }
     }
 
@@ -750,6 +1165,7 @@ mod fallback_tests {
             auto: Vec::new(),
             capability_counts: std::collections::BTreeMap::new(),
             capability_by_endpoint: std::collections::BTreeMap::new(),
+            quality_by_endpoint: std::collections::BTreeMap::new(),
         }
     }
 
@@ -836,6 +1252,375 @@ mod fallback_tests {
         assert_eq!(back.fallback_active, "SG");
         assert_eq!(back.fallback_at_ms, 42);
     }
+
+    // ---- v1.9.5 country capability & quality (spec §13) ----
+
+    use std::collections::BTreeMap;
+
+    use crate::relay::outbound_state::Health;
+
+    fn snap_with_capabilities(
+        countries: &[(&str, usize, &[(&str, u32)])],
+    ) -> Snapshot {
+        let mut map = std::collections::BTreeMap::new();
+        let mut caps = std::collections::BTreeMap::new();
+        for (cc, n, c) in countries {
+            map.insert(
+                (*cc).to_owned(),
+                (0..*n)
+                    .map(|i| Endpoint { host: format!("10.{cc}.{i}.1").to_ascii_lowercase(), port: 443 })
+                    .collect(),
+            );
+            let mut m = std::collections::BTreeMap::new();
+            for (k, v) in *c {
+                m.insert((*k).to_owned(), *v);
+            }
+            caps.insert((*cc).to_owned(), m);
+        }
+        Snapshot {
+            schema_version: 1,
+            upstream_revision: String::new(),
+            content_revision: String::new(),
+            generated_at: String::new(),
+            countries: map,
+            unassigned: Vec::new(),
+            auto: Vec::new(),
+            capability_counts: caps,
+            capability_by_endpoint: std::collections::BTreeMap::new(),
+            quality_by_endpoint: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn healthy(cc: &str, at_ms: u64) -> (String, Health) {
+        (
+            format!("10.{cc}.0.1:443").to_ascii_lowercase(),
+            Health {
+                country: cc.to_owned(),
+                ok: true,
+                ok_count: 3,
+                updated_at_ms: at_ms,
+                ..Health::default()
+            },
+        )
+    }
+
+    #[test]
+    fn full_country_has_passthrough_and_a_healthy_candidate() {
+        let s = snap_with_capabilities(&[("JO", 4, &[("passthrough", 4)])]);
+        let health = BTreeMap::from([healthy("JO", 1_000)]);
+        let q = country_quality(&s, &health, 2_000);
+        assert_eq!(q["JO"].state, "full");
+        assert!(q["JO"].quality.unwrap_or(0) >= 35, "passthrough share must contribute");
+    }
+
+    #[test]
+    fn limited_is_a_zero_passthrough_reachable_country() {
+        // The Finland shape: 64 verified cf-relays, zero passthrough, alive.
+        let s = snap_with_capabilities(&[
+            ("FI", 64, &[("cf-relay", 64)]),
+            ("JO", 4, &[("passthrough", 4)]),
+        ]);
+        let health = BTreeMap::from([healthy("FI", 1_000), healthy("JO", 1_000)]);
+        let q = country_quality(&s, &health, 2_000);
+        assert_eq!(q["FI"].state, "limited");
+        // Spec §6: a cf-relay-only country must not rank alongside FULL ones —
+        // even a fully healthy cf-relay pool scores below a passthrough pool.
+        assert!(q["FI"].quality < q["JO"].quality);
+    }
+
+    #[test]
+    fn single_soft_failure_does_not_degrade() {
+        // 09-28 hardening (paste #11): ONE failed probe is not repeated
+        // evidence — the dial path's quarantine predicate (fail_count >= 2
+        // or a hard TCP connect error) is the degradation bar.
+        let s = snap_with_capabilities(&[("US", 4, &[("passthrough", 2), ("cf-relay", 2)])]);
+        let health = BTreeMap::from([(
+            "10.us.0.1:443".to_owned(),
+            Health { ok: false, fail_count: 1, updated_at_ms: 1_000, ..Health::default() },
+        )]);
+        let q = country_quality(&s, &health, 2_000);
+        assert_eq!(q["US"].state, "full");
+    }
+
+    #[test]
+    fn unmeasured_passthrough_country_is_full_not_degraded() {
+        // 09-28 hardening (paste #1/#2/#9): a fresh catalog with verified
+        // passthrough and ZERO health evidence is healthy-and-unmeasured,
+        // never DEGRADED. Missing liveness data is not failure data.
+        let s = snap_with_capabilities(&[("GB", 8, &[("passthrough", 8)])]);
+        let q = country_quality(&s, &BTreeMap::new(), 1_000);
+        assert_eq!(q["GB"].state, "full");
+    }
+
+    #[test]
+    fn recovered_candidate_returns_country_to_full() {
+        // 09-28 hardening (paste #12): quarantine evidence demotes; a later
+        // successful probe clears it — transitions stay dynamic, no label
+        // sticks.
+        let s = snap_with_capabilities(&[("JO", 2, &[("passthrough", 2)])]);
+        let dead = BTreeMap::from([(
+            "10.jo.0.1:443".to_owned(),
+            Health { ok: false, fail_count: 2, updated_at_ms: 1_000, ..Health::default() },
+        )]);
+        assert_eq!(country_quality(&s, &dead, 2_000)["JO"].state, "degraded");
+        let mut healed = dead;
+        healed.get_mut("10.jo.0.1:443").unwrap().ok = true;
+        assert_eq!(country_quality(&s, &healed, 3_000)["JO"].state, "full");
+    }
+
+    #[test]
+    fn runtime_error_records_are_not_candidate_evidence() {
+        // Bug #4 (09-28): the verify pass tripping Cloudflare's per-invocation
+        // subrequest cap recorded "Too many subrequests" as candidate
+        // failures, quarantining whole countries. A platform budget error is
+        // not evidence: state stays full, quality stays unmeasured (null).
+        let s = snap_with_capabilities(&[("JO", 2, &[("passthrough", 2)])]);
+        let poisoned = BTreeMap::from([(
+            "10.jo.0.1:443".to_owned(),
+            Health {
+                ok: false,
+                fail_count: 2,
+                error: "Error: Too many subrequests by single Worker invocation.".to_owned(),
+                updated_at_ms: 1_000,
+                ..Health::default()
+            },
+        )]);
+        let q = country_quality(&s, &poisoned, 2_000);
+        assert_eq!(q["JO"].state, "full");
+        assert_eq!(q["JO"].quality, None);
+    }
+
+    #[test]
+    fn quarantined_ignores_runtime_errors() {
+        let poisoned = Health {
+            ok: false,
+            fail_count: 2,
+            error: "Error: Too many subrequests by single Worker invocation.".to_owned(),
+            ..Health::default()
+        };
+        assert!(!poisoned.quarantined());
+        assert!(poisoned.is_runtime_error());
+        // Real probe failures still quarantine.
+        let real = Health {
+            ok: false,
+            fail_count: 2,
+            error: "tcp connect: refused".to_owned(),
+            ..Health::default()
+        };
+        assert!(real.quarantined());
+        assert!(!real.is_runtime_error());
+    }
+
+    #[test]
+    fn ancient_failure_evidence_does_not_pin_degraded() {
+        // 09-28 hardening: the degradation signal obeys the same 2x freshness
+        // TTL as liveness. A stale quarantine record decays to unmeasured —
+        // otherwise a country would stay DEGRADED forever with no current
+        // evidence, which is the same lie in the other direction.
+        let s = snap_with_capabilities(&[("JO", 2, &[("passthrough", 2)])]);
+        let stale_dead = BTreeMap::from([(
+            "10.jo.0.1:443".to_owned(),
+            Health { ok: false, fail_count: 2, updated_at_ms: 0, ..Health::default() },
+        )]);
+        assert_eq!(country_quality(&s, &stale_dead, 3 * FRESH_MS)["JO"].state, "full");
+    }
+
+    #[test]
+    fn unavailable_when_everything_measured_is_unhealthy() {
+        let s = snap_with_capabilities(&[("AD", 1, &[("cf-relay", 1)])]);
+        let health = BTreeMap::from([(
+            "10.ad.0.1:443".to_owned(),
+            Health { ok: false, fail_count: 2, updated_at_ms: 1_000, ..Health::default() },
+        )]);
+        let q = country_quality(&s, &health, 2_000);
+        assert_eq!(q["AD"].state, "unavailable");
+    }
+
+    #[test]
+    fn stale_health_downgrades_full_to_degraded() {
+        // Spec §9: an old success must not keep a country FULL forever. The
+        // healthy record is 25h old — outside the freshness window the score
+        // decays; liveness itself is the state signal here: still "full"
+        // (nothing measured-failed) but the freshness share contributes 0.
+        let s = snap_with_capabilities(&[("JO", 2, &[("passthrough", 2)])]);
+        let health = BTreeMap::from([healthy("JO", 0)]);
+        let q = country_quality(&s, &health, 25 * 60 * 60 * 1000);
+        assert_eq!(q["JO"].state, "full");
+        assert!(q["JO"].quality.unwrap_or(100) < 90, "stale evidence must not score like fresh");
+    }
+
+    #[test]
+    fn unmeasured_candidates_do_not_make_a_country_unavailable() {
+        // A fresh catalog with zero health evidence: census says limited (no
+        // passthrough) but NOT unavailable — nothing was measured yet.
+        let s = snap_with_capabilities(&[("FI", 8, &[("cf-relay", 8)])]);
+        let q = country_quality(&s, &BTreeMap::new(), 1_000);
+        assert_eq!(q["FI"].state, "limited");
+    }
+
+    #[test]
+    fn mixed_passthrough_beats_cf_relay_only_at_equal_health() {
+        let s = snap_with_capabilities(&[
+            ("JO", 4, &[("passthrough", 4)]),
+            ("FI", 64, &[("cf-relay", 64)]),
+        ]);
+        let health = BTreeMap::from([healthy("JO", 1_000), healthy("FI", 1_000)]);
+        let q = country_quality(&s, &health, 2_000);
+        assert!(q["JO"].quality > q["FI"].quality);
+    }
+
+    #[test]
+    fn quality_orders_countries_inside_the_same_state() {
+        let s = snap_with_capabilities(&[
+            ("GB", 8, &[("passthrough", 8)]),
+            ("US", 8, &[("passthrough", 2), ("cf-relay", 6)]),
+        ]);
+        let health = BTreeMap::from([healthy("GB", 1_000), healthy("US", 1_000)]);
+        let q = country_quality(&s, &health, 2_000);
+        assert!(q["GB"].quality > q["US"].quality, "higher passthrough share wins");
+    }
+
+    #[test]
+    fn fallback_prefers_a_passthrough_country_over_a_bigger_cf_relay_pool() {
+        // Spec §7: 100 cf-relay candidates must not outrank a smaller pool
+        // with passthrough. JO (non-EU, 8, all passthrough) beats SG
+        // (non-EU, 64, all cf-relay).
+        let s = snap_with_capabilities(&[
+            ("DE", 8, &[("cf-relay", 8)]),
+            ("SG", 64, &[("cf-relay", 64)]),
+            ("JO", 8, &[("passthrough", 8)]),
+        ]);
+        let cc = choose_fallback_country(&s, &["DE"], 0).unwrap();
+        assert_eq!(cc, "JO");
+    }
+
+    #[test]
+    fn fallback_still_prefers_non_european_within_a_capability_band() {
+        let s = snap_with_capabilities(&[
+            ("DE", 8, &[("cf-relay", 8)]),
+            ("FR", 4, &[("cf-relay", 4)]),
+            ("JO", 8, &[("passthrough", 8)]),
+        ]);
+        // JO is excluded (exhausted): remaining band has no passthrough, so
+        // region + size rank as before → DE (non... DE is Europe) → DE vs FR:
+        // both Europe; DE larger. With no non-EU candidate left, DE wins.
+        let cc = choose_fallback_country(&s, &["JO"], 0).unwrap();
+        assert_eq!(cc, "DE");
+    }
+
+    #[test]
+    fn country_enforcement_unchanged_by_quality_ranking() {
+        // A LIMITED country selected explicitly still uses ONLY its own
+        // candidates (spec §12/§14: ranking never weakens enforcement).
+        let s = snap_with_capabilities(&[
+            ("JO", 8, &[("passthrough", 8)]),
+            ("FI", 64, &[("cf-relay", 64)]),
+        ]);
+        let cfg = crate::relay::outbound::OutboundConfig {
+            mode: crate::relay::outbound::ProxyMode::Pool,
+            catalog_pool: true,
+            catalog_country: "FI".to_owned(),
+            ..crate::relay::outbound::OutboundConfig::default()
+        };
+        let pool = pool_for(&cfg, Some(&s)).expect("FI pool");
+        assert!(!pool.is_empty());
+        assert!(pool.iter().all(|e| e.host.starts_with("10.fi.")));
+    }
+
+    // ---- v1.9.5 dynamic re-evaluation (spec: classification is never frozen) ----
+
+    #[test]
+    fn limited_becomes_full_when_new_passthrough_candidates_arrive() {
+        // Scan N: FI cf-relay-only → limited. Scan N+1: the feed now carries
+        // passthrough candidates and they are healthy → full. Same country,
+        // no persisted label.
+        let scan_n = snap_with_capabilities(&[("FI", 8, &[("cf-relay", 8)])]);
+        let q_n = country_quality(&scan_n, &BTreeMap::new(), 1_000);
+        assert_eq!(q_n["FI"].state, "limited");
+        let scan_n1 = snap_with_capabilities(&[("FI", 5, &[("passthrough", 5)])]);
+        let health = BTreeMap::from([healthy("FI", 1_000)]);
+        let q_n1 = country_quality(&scan_n1, &health, 2_000);
+        assert_eq!(q_n1["FI"].state, "full");
+    }
+
+    #[test]
+    fn full_becomes_limited_when_the_feed_loses_passthrough() {
+        // Reverse transition: a country that WAS full re-classifies from the
+        // new snapshot alone — nothing cached the old verdict.
+        let old = snap_with_capabilities(&[("TR", 4, &[("passthrough", 4)])]);
+        let health = BTreeMap::from([healthy("TR", 1_000)]);
+        let q_old = country_quality(&old, &health, 2_000);
+        assert_eq!(q_old["TR"].state, "full");
+        let new = snap_with_capabilities(&[("TR", 4, &[("cf-relay", 4)])]);
+        let q_new = country_quality(&new, &health, 2_000);
+        assert_eq!(q_new["TR"].state, "limited");
+    }
+
+    #[test]
+    fn full_drops_to_degraded_when_its_passthrough_candidates_die() {
+        let s = snap_with_capabilities(&[("JO", 4, &[("passthrough", 4)])]);
+        let alive = BTreeMap::from([healthy("JO", 1_000)]);
+        assert_eq!(country_quality(&s, &alive, 2_000)["JO"].state, "full");
+        // Same feed, same candidates — but the latest measurements all failed
+        // (two consecutive failures → quarantined). Nothing stale involved.
+        let dead = BTreeMap::from([(
+            "10.jo.0.1:443".to_owned(),
+            Health { ok: false, fail_count: 2, updated_at_ms: 2_000, ..Health::default() },
+        )]);
+        let q = country_quality(&s, &dead, 3_000);
+        assert_eq!(q["JO"].state, "degraded");
+    }
+
+    #[test]
+    fn ancient_evidence_is_not_current_proof_in_either_direction() {
+        let s = snap_with_capabilities(&[("FI", 8, &[("cf-relay", 8)])]);
+        // A 3-day-old HEALTHY record must not make the country look alive…
+        let old_ok = BTreeMap::from([healthy("FI", 0)]);
+        let q = country_quality(&s, &old_ok, 72 * 60 * 60 * 1000);
+        assert_eq!(q["FI"].healthy, 0, "stale success is not liveness");
+        // …and a 3-day-old FAILED record must not brand it broken.
+        let old_dead = BTreeMap::from([(
+            "10.fi.0.1:443".to_owned(),
+            Health { ok: false, fail_count: 2, updated_at_ms: 0, ..Health::default() },
+        )]);
+        let q2 = country_quality(&s, &old_dead, 72 * 60 * 60 * 1000);
+        assert_eq!(q2["FI"].state, "limited", "stale failure is not unavailability");
+    }
+
+    #[test]
+    fn every_catalog_country_is_reclassified_on_each_call() {
+        // No hardcoded exceptions: the map covers exactly the snapshot's
+        // countries, whatever they are, and a changed snapshot changes the map.
+        let a = snap_with_capabilities(&[
+            ("JO", 2, &[("passthrough", 2)]),
+            ("XX", 2, &[("cf-relay", 2)]),
+        ]);
+        let qa = country_quality(&a, &BTreeMap::new(), 1_000);
+        assert_eq!(qa.len(), 2);
+        assert!(qa.contains_key("JO") && qa.contains_key("XX"));
+        let b = snap_with_capabilities(&[("ZZ", 1, &[("passthrough", 1)])]);
+        let qb = country_quality(&b, &BTreeMap::new(), 1_000);
+        assert_eq!(qb.len(), 1);
+        assert!(qb.contains_key("ZZ") && !qb.contains_key("JO"));
+    }
+
+    #[test]
+    fn ordering_follows_current_quality_not_history() {
+        // The spec's example: quality moves, and so must the order. Deriving
+        // (state, quality) fresh, the sort key flips when the evidence flips.
+        let s = snap_with_capabilities(&[
+            ("JO", 8, &[("passthrough", 8)]),
+            ("TR", 8, &[("passthrough", 2), ("cf-relay", 6)]),
+        ]);
+        let health = BTreeMap::from([healthy("JO", 1_000), healthy("TR", 1_000)]);
+        let q = country_quality(&s, &health, 2_000);
+        let rank = |v: &CountryQuality| (match v.state.as_str() {
+            "full" => 0, "degraded" => 1, "limited" => 2, _ => 3
+        }, 100 - v.quality.unwrap_or(0));
+        let mut keys: Vec<_> = q.values().map(rank).collect();
+        keys.sort();
+        assert_eq!(keys[0], rank(&q["JO"]), "higher passthrough share leads");
+    }
 }
 
 #[cfg(test)]
@@ -857,6 +1642,60 @@ mod tests {
         assert_eq!(stored_revision(Some(&doc)).as_deref(), Some("b".repeat(64).as_str()));
     }
 
+    // §6 revision-aware fetch: decision table.
+    #[test]
+    fn same_revision_is_a_noop_even_with_a_newer_timestamp() {
+        let s = snapshot();
+        // Equal content_revision wins over any generated_at: zero writes.
+        assert_eq!(
+            revision_decision(&s.content_revision, "2026-09-25T00:00:00Z", Some(&s.content_revision), Some("2026-09-20T16:33:24Z")),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn newer_revision_activates() {
+        let doc = serde_json::json!({ "snapshot": snapshot(), "fetchedAt": "x" }).to_string();
+        assert_eq!(
+            revision_decision(
+                &"c".repeat(64),
+                "2026-09-21T00:00:00Z", // later than stored 2026-09-20T16:33:24Z
+                stored_revision(Some(&doc)).as_deref(),
+                stored_generated_at(Some(&doc)).as_deref(),
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn older_generated_at_is_rejected() {
+        let doc = serde_json::json!({ "snapshot": snapshot(), "fetchedAt": "x" }).to_string();
+        let decision = revision_decision(
+            &"c".repeat(64),
+            "2026-09-19T00:00:00Z", // older than stored 2026-09-20T16:33:24Z
+            stored_revision(Some(&doc)).as_deref(),
+            stored_generated_at(Some(&doc)).as_deref(),
+        );
+        assert!(decision.is_err(), "older feed must be rejected, not activated");
+    }
+
+    #[test]
+    fn equal_timestamp_with_new_revision_still_activates() {
+        // Republish within the same second must not wedge the pipeline.
+        assert_eq!(
+            revision_decision(&"c".repeat(64), "2026-09-20T16:33:24Z", Some(&"b".repeat(64)), Some("2026-09-20T16:33:24Z")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn first_sync_activates_without_stored_document() {
+        assert_eq!(
+            revision_decision(&"c".repeat(64), "2026-09-21T00:00:00Z", None, None),
+            Ok(true)
+        );
+    }
+
     #[test]
     fn first_sync_and_damaged_store_write() {
         // No stored document.
@@ -874,6 +1713,89 @@ mod tests {
         }).to_string();
         let other = "c".repeat(64);
         assert_ne!(stored_revision(Some(&doc)).as_deref(), Some(other.as_str()));
+    }
+
+    // §29 failure safety: an upstream that dies, hangs, or starts serving
+    // garbage must leave the previous catalog active. sync() represents every
+    // such outcome as a SyncReport with ok=false, changed=false — the write
+    // block is gated on `changed`, so no KV mutation can happen. These tests
+    // pin that decision table end-to-end at the pure layer (the wasm fetch/KV
+    // halves are exercised live in §29's deploy proof).
+    #[test]
+    fn old_catalog_survives_upstream_fetch_failure() {
+        // Fetch failure: status none, empty report fields, no activation.
+        let r = SyncReport {
+            ok: false,
+            changed: false,
+            content_revision: String::new(),
+            upstream_revision: String::new(),
+            generated_at: String::new(),
+            fetched_at: "now".into(),
+            country_count: 0,
+            endpoint_count: 0,
+            error: Some("catalog fetch timed out".into()),
+        };
+        let line = sync_log(None, &r, "fetch failed", "82fa9022b9f8");
+        // The active revision is reported as still-active; nothing "activated".
+        assert!(line.contains("active_revision=82fa9022b9f8"));
+        assert!(line.contains("activation=kept"));
+        assert!(line.contains("validation=rejected"));
+        assert!(line.contains("http=none"));
+        assert!(!r.changed);
+    }
+
+    #[test]
+    fn old_catalog_survives_upstream_garbage() {
+        // Garbage body: parse failure path — previous snapshot kept, changed=false.
+        assert!(Snapshot::parse(b"not a feed").is_err());
+        let doc = serde_json::json!({ "snapshot": snapshot(), "fetchedAt": "x" }).to_string();
+        // And even a parseable feed that is BOTH older and differently
+        // revisioned is rejected by the §6 guard (a replayed stale feed).
+        let older = VALID
+            .replace("2026-09-20T16:33:24Z", "2026-09-19T00:00:00Z")
+            .replace("bbbbbbbbbbbb", "cccccccccccc");
+        let snap = Snapshot::parse(older.as_bytes()).expect("older feed parses");
+        let decision = revision_decision(
+            snap.content_revision.as_str(),
+            snap.generated_at.as_str(),
+            stored_revision(Some(&doc)).as_deref(),
+            stored_generated_at(Some(&doc)).as_deref(),
+        );
+        assert!(decision.is_err(), "rollback must be rejected; old catalog stays active");
+    }
+
+    #[test]
+    fn sync_log_shape_pins_the_operability_fields() {
+        // §21: the one line per pull carries every operability field and no
+        // secrets — no URL, no query, no binding values.
+        let r = SyncReport {
+            ok: true,
+            changed: true,
+            content_revision: "96781ded18f9fc12ffffffffffffffffffffffffffffffffffffffffffff".into(),
+            upstream_revision: "e6107b3ffa0b93d2".into(),
+            generated_at: "2026-09-28T00:23:00Z".into(),
+            fetched_at: "2026-09-28T00:23:05Z".into(),
+            country_count: 79,
+            endpoint_count: 1945,
+            error: None,
+        };
+        let line = sync_log(Some(200), &r, "new revision activated", "82fa9022b9f8");
+        for needle in [
+            "http=200",
+            "fetched_revision=96781ded18f9",
+            "active_revision=82fa9022b9f8",
+            "validation=ok",
+            "activation=activated",
+            "countries=79",
+            "endpoints=1945",
+            "last_success=2026-09-28T00:23:05Z",
+            "last_failure=none",
+            "reason=new revision activated",
+        ] {
+            assert!(line.contains(needle), "missing `{needle}` in: {line}");
+        }
+        assert!(!line.contains("https://"), "no URL in the log line");
+        assert_eq!(line.matches('\n').count(), 0, "one line");
     }
 
     #[test]
@@ -947,6 +1869,8 @@ mod tests {
             .into_iter(),
             &health,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            false,
         );
         let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
         assert!(
@@ -977,9 +1901,38 @@ mod tests {
             [mk("relay.example"), mk("pass.example"), mk("terminating.example")].into_iter(),
             &std::collections::BTreeMap::new(),
             &capability,
+            &std::collections::BTreeMap::new(),
+            false,
         );
         let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
         assert_eq!(hosts, vec!["pass.example", "relay.example", "terminating.example"]);
+    }
+
+    #[test]
+    fn bounded_high_risk_sinks_within_band_unknown_never_demoted() {
+        let mk = |h: &str, p: u16| Endpoint {
+            host: h.to_string(),
+            port: p,
+        };
+        // All healthy-band, same capability: feed risk must only reorder, not evict.
+        let mut quality = std::collections::BTreeMap::new();
+        quality.insert("risky.example:443".to_string(), "high/datacenter/0.9/ip-api".to_string());
+        quality.insert("fine.example:443".to_string(), "low/residential/0.9/ip-api".to_string());
+        // unknown.example: deliberately absent — unmeasured must NOT rank after healthy-low.
+        let pool = bounded(
+            [mk("unknown.example", 443), mk("risky.example", 443), mk("fine.example", 443)]
+                .into_iter(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &quality,
+            false,
+        );
+        let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
+        // Measured-low beats high; ties (low vs unmeasured) keep catalog order —
+        // absent evidence is never treated as worse evidence.
+        assert_eq!(hosts, vec!["unknown.example", "fine.example", "risky.example"]);
+        // All three remain eligible — high risk re-ranks, never disqualifies.
+        assert_eq!(pool.len(), 3);
     }
 
     #[test]
@@ -1024,6 +1977,44 @@ mod tests {
     }
 
     #[test]
+    fn enforced_pool_spends_slots_on_capability_not_only_measured_health() {
+        // Bug #2: `pool_for_with_health` bounded the slot cap before any
+        // capability-aware ranking ran, so a country whose only
+        // full-capability (passthrough) boxes were unmeasured got a runtime
+        // pool of measured cf-relay candidates — and a cf-relay cannot serve
+        // the plain-HTTP traffic class the operator picked that country for.
+        // In an enforced pool a passthrough must outrank a healthy cf-relay.
+        let mk = |host: &str, port: u16| Endpoint { host: host.into(), port };
+        let mut capability = std::collections::BTreeMap::new();
+        capability.insert("relay.example:2053".to_string(), "cf-relay".to_string());
+        capability.insert("pass.example:2053".to_string(), "passthrough".to_string());
+        let mut health = std::collections::BTreeMap::new();
+        health.insert(
+            "relay.example:2053".to_string(),
+            crate::relay::outbound_state::Health {
+                country: "TR".into(),
+                latency_ms: 40,
+                ok: true,
+                ..Default::default()
+            },
+        );
+        let quality = std::collections::BTreeMap::new();
+        let enforced = bounded(
+            [mk("relay.example", 2053), mk("pass.example", 2053)].into_iter(),
+            &health, &capability, &quality, true,
+        );
+        assert_eq!(enforced[0].host, "pass.example",
+            "enforced pool must not let a healthy cf-relay crowd out passthrough");
+        // Auto (non-enforced) selection keeps the legacy health-first ordering.
+        let auto = bounded(
+            [mk("relay.example", 2053), mk("pass.example", 2053)].into_iter(),
+            &health, &capability, &quality, false,
+        );
+        assert_eq!(auto[0].host, "relay.example");
+
+    }
+
+    #[test]
     fn pool_caps_one_port_per_host_so_one_dead_ip_cannot_fill_the_pool() {
         // US-feed failure shape: a family of ports on the same IP ranked first;
         // every one of them undialable from the worker while 42 other US IPs
@@ -1045,6 +2036,8 @@ mod tests {
             .into_iter(),
             &health,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            false,
         );
         let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
         assert_eq!(hosts.len(), hosts.iter().collect::<std::collections::HashSet<_>>().len(),
@@ -1073,6 +2066,44 @@ mod tests {
         assert!(Snapshot::parse(bad.as_bytes()).is_err());
         let bad = VALID.replace(&"b".repeat(64), &"z".repeat(64));
         assert!(Snapshot::parse(bad.as_bytes()).is_err());
+    }
+
+#[test]
+    /// V24.8 §8: the integrity gate accepts a body whose content_revision is
+    /// the scanner-recipe hash over its countries map.
+    fn integrity_accepts_real_recipe_body() {
+        let countries = r#"{"FI": [["1.2.3.4", 443], ["5.6.7.8", 8443]], "US": [["9.9.9.9", 80]]}"#;
+        // Python: json.dumps(json.loads(countries), sort_keys=True)
+        let canonical = "{\"FI\": [[\"1.2.3.4\", 443], [\"5.6.7.8\", 8443]], \"US\": [[\"9.9.9.9\", 80]]}";
+        use sha2::Digest as _;
+        let hex: String = sha2::Sha256::digest(canonical.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let feed = format!(
+            r#"{{"schema_version":1,"upstream_revision":"{}","content_revision":"{}","generated_at":"t","countries":{countries}}}"#,
+            "a".repeat(64),
+            hex
+        );
+        assert!(verify_integrity(feed.as_bytes(), &hex).is_ok());
+    }
+
+    #[test]
+    /// A tampered body (one port flipped) must fail the gate.
+    fn integrity_rejects_tampered_body() {
+        let declared = "0".repeat(64);
+        let feed = format!(
+            r#"{{"schema_version":1,"content_revision":"{declared}","countries":{{"FI":[["1.2.3.4",443]]}}}}"#
+        );
+        assert!(verify_integrity(feed.as_bytes(), &declared).is_err());
+    }
+
+    #[test]
+    /// Malformed JSON and missing countries never pass the gate.
+    fn integrity_rejects_structural_garbage() {
+        let declared = "0".repeat(64);
+        assert!(verify_integrity(b"not json", &declared).is_err());
+        assert!(verify_integrity(br#"{"schema_version":1}"#, &declared).is_err());
     }
 
     #[test]

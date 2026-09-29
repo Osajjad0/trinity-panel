@@ -286,6 +286,21 @@ def enable_subdomain(token, account, name):
         content_type="application/json",
     )
 
+def register_cron(token, account, name, cron):
+    """Replace this Worker's Cron Triggers with `cron`.
+
+    PUT (not POST) and the full list semantics are the API's own: the
+    endpoint always sets the complete schedule set. Omitting --cron from a
+    deploy leaves whatever schedules exist untouched.
+    """
+    _request(
+        "PUT",
+        f"/accounts/{account}/workers/scripts/{name}/schedules",
+        token,
+        body=json.dumps([{"cron": cron}]).encode(),
+        content_type="application/json",
+    )
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Deploy the Worker via the Cloudflare API.")
@@ -341,6 +356,12 @@ def main() -> int:
     ap.add_argument("--no-do", action="store_true", help="Skip the Durable Object migration (redeploys)")
     ap.add_argument("--diagnostics", action="store_true", help="Set DIAGNOSTICS=true (do_error surfaces the DO error text)")
     ap.add_argument("--ws", action="store_true", help="Enable the WebSocket transport (WS_ENABLED=true); omit for XHTTP-only")
+    ap.add_argument(
+        "--cron",
+        default=None,
+        help="Register this cron expression as the Worker's Cron Trigger "
+        "(e.g. '0 */2 * * *'). Omit to leave existing schedules untouched.",
+    )
     args = ap.parse_args()
 
     token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
@@ -431,6 +452,9 @@ def main() -> int:
 
         upload(token, account, args.name, entry, modules, bindings, not args.no_do)
         enable_subdomain(token, account, args.name)
+        if args.cron:
+            register_cron(token, account, args.name, args.cron)
+            print(f"  Cron          {args.cron}")
 
         host = f"{args.name}.{subdomain}.workers.dev"
         print("\nDeployed.\n")

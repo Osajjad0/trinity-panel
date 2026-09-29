@@ -229,12 +229,22 @@ async fn serve(
                 // anything dials — a pure reorder of the same candidate list.
                 let resolved =
                     outbound_cfg.resolve_with_catalog(&target, &generated);
+                let quality = snapshot
+        .as_ref()
+        .map(|s| s.quality_by_endpoint.clone())
+        .unwrap_or_default();
+                let capability = snapshot
+        .as_ref()
+        .map(|s| s.capability_by_endpoint.clone())
+        .unwrap_or_default();
                 let plan = outbound_state::order_plan_ranked(
                     resolved,
                     &known_state,
                     worker::Date::now().as_millis(),
                     &outbound_cfg.catalog_country,
                     &outbound_cfg.pinned_proxy,
+                    &quality,
+                    &capability,
                 );
                 let (sock, winner_idx, failed_first) = match
                     connect::open_with_plan_tracked(&plan).await
@@ -269,12 +279,22 @@ async fn serve(
                                 .map(|e| format!("{}:{}", e.host, e.port))
                                 .collect();
                             let resolved = outbound_cfg.resolve_with_catalog(&target, &fb_generated);
+                            let quality = snapshot
+        .as_ref()
+        .map(|s| s.quality_by_endpoint.clone())
+        .unwrap_or_default();
+                            let capability = snapshot
+        .as_ref()
+        .map(|s| s.capability_by_endpoint.clone())
+        .unwrap_or_default();
                             let plan = outbound_state::order_plan_ranked(
                                 resolved,
                                 &known_state,
                                 worker::Date::now().as_millis(),
                                 &outbound_cfg.catalog_country,
                                 &outbound_cfg.pinned_proxy,
+                                &quality,
+                                &capability,
                             );
                             if let Ok(triple) = connect::open_with_plan_tracked(&plan).await {
                                 triple

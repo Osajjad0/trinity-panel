@@ -53,17 +53,15 @@ pub enum Api {
     ProbeProxy,
     /// Sync the public Proxy-IP catalog snapshot (operator-initiated).
     CatalogSync,
-    /// Sync from the GitHub Actions scheduled scanner, authenticated by its
-    /// OIDC identity (machine-to-machine; separate auth path — V24.7).
-    CatalogSyncGithub,
+
     /// Dial-test the verified pool for a location WITHOUT persisting anything
     /// (KV-quota-independent validation path; operator-initiated).
     PoolDialTest,
     /// One bounded worker-vantage verification pass (TCP reachability FROM
     /// this Worker's egress) over catalog candidates. Session-gated for
-    /// operators; the 2-hour GitHub workflow rides the same OIDC verifier as
-    /// `CatalogSyncGithub` (vantage model: scanner health is source
-    /// evidence, this is the Trinity-usable verdict).
+    /// operators; the cron trigger calls the Rust function directly
+    /// (vantage model: scanner health is source evidence, this is the
+    /// Trinity-usable verdict).
     VerifyCatalog,
     /// Per-country health counts + quarantined list — the honest debug view
     /// (discovered vs Trinity-reachable vs quarantined).
@@ -98,7 +96,7 @@ pub fn route(method: &str, rest: &str) -> Api {
         ("GET", "api/qr") => Api::Qr,
         ("POST", "api/probe-proxy") => Api::ProbeProxy,
         ("POST", "api/catalog-sync") => Api::CatalogSync,
-        ("POST", "api/catalog-sync-github") => Api::CatalogSyncGithub,
+
         ("POST", "api/pool-dial-test") => Api::PoolDialTest,
         ("POST" | "GET", "api/verify-catalog") => Api::VerifyCatalog,
         ("GET", "api/health-overlay") => Api::HealthOverlay,
@@ -258,6 +256,12 @@ pub struct State {
     /// V24.4.4 runtime-only geographic failover (Pool mode). Empty strings =
     /// no fallback active. The configured location is never rewritten.
     pub fallback: Option<crate::panel::api::FallbackView>,
+    /// Per-country verified capability + quality (v1.9.5): the aggregation the
+    /// country selector sorts and badges by. `None` = no catalog snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country_quality: Option<
+        std::collections::BTreeMap<String, crate::catalog::CountryQuality>,
+    >,
 }
 
 /// Compact fallback view for the panel.
@@ -276,6 +280,10 @@ pub struct FallbackView {
 #[serde(rename_all = "camelCase")]
 pub struct CandidateHealth {
     pub host: String,
+    /// v1.9.6 feed quality verdict "risk/type/confidence/source" for this
+    /// endpoint. Empty = unmeasured (never rendered as bad).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub quality: String,
     /// False when this candidate has never been probed.
     pub measured: bool,
     pub ok: bool,
@@ -301,6 +309,7 @@ pub fn candidate_health(
     cfg: &OutboundConfig,
     geo: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
     extra_hosts: &[String],
+    quality: &std::collections::BTreeMap<String, String>,
 ) -> Vec<CandidateHealth> {
     let wanted = "";
     let mut hosts: Vec<String> = cfg.proxy_candidates.clone();
@@ -311,6 +320,28 @@ pub fn candidate_health(
             hosts.push(host.clone());
         }
     }
+    let q = |host: &str| -> String {
+        // Feed keys are "ip:port"; settings candidates may be bare "ip" or
+        // "host". Match the whole trimmed key, else its ip-prefix up to ":".
+        let key = host.trim().to_ascii_lowercase();
+        if let Some(hit) = quality.get(key.as_str()) {
+            return hit.clone();
+        }
+        let bare = key.split(':').next().unwrap_or("");
+        if let Some(hit) = quality.get(bare) {
+            return hit.clone();
+        }
+        // bare-ip lookup can be ambiguous across ports — only accept when
+        // exactly one feed entry shares this IP.
+        let hits: Vec<&String> = quality
+            .keys()
+            .filter(|k| k.split(':').next() == Some(bare))
+            .collect();
+        if hits.len() == 1 {
+            return quality[hits[0]].clone();
+        }
+        String::new()
+    };
     let mut rows: Vec<CandidateHealth> = hosts
         .iter()
         .map(|host| {
@@ -318,6 +349,7 @@ pub fn candidate_health(
             match geo.get(&key) {
                 Some(h) => CandidateHealth {
                     host: host.clone(),
+                    quality: q(host),
                     measured: true,
                     ok: h.ok,
                     healthy: h.healthy(),
@@ -332,6 +364,7 @@ pub fn candidate_health(
                 },
                 None => CandidateHealth {
                     host: host.clone(),
+                    quality: q(host),
                     measured: false,
                     ok: false,
                     healthy: false,
@@ -392,6 +425,10 @@ pub fn state(
     catalog_hosts: &[String],
     runtime_candidates: &[String],
     fallback: Option<FallbackView>,
+    country_quality: Option<
+        std::collections::BTreeMap<String, crate::catalog::CountryQuality>,
+    >,
+    quality_by_endpoint: &std::collections::BTreeMap<String, String>,
 ) -> State {
     let clients = bundle::all_clients()
         .into_iter()
@@ -422,12 +459,13 @@ pub fn state(
         views,
         clients,
         blank: super::advisor::blank(host, xhttp_path),
-        proxy_health: candidate_health(&settings.outbound, geo, catalog_hosts),
+        proxy_health: candidate_health(&settings.outbound, geo, catalog_hosts, quality_by_endpoint),
         outbound: settings.outbound.clone(),
         enhanced_reachability: settings.enhanced_reachability,
         catalog,
         runtime_candidates: runtime_candidates.to_vec(),
         fallback,
+        country_quality,
         rev: settings.rev,
     }
 }
@@ -680,6 +718,37 @@ mod tests {
     };
 
     #[test]
+    fn quality_joins_feed_keys_to_panel_candidates_without_false_positives() {
+        let quality = [
+            ("203.0.113.10:443".to_string(), "low/datacenter/high/ip-api/proxycheck".to_string()),
+            ("198.51.100.7:8443".to_string(), "high/vpn-proxy/high/ip-api/proxycheck".to_string()),
+            ("198.51.100.7:993".to_string(), "low/isp/medium/ip-api/proxycheck".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let cfg = OutboundConfig {
+            proxy_candidates: vec![
+                "203.0.113.10".into(),          // bare IP, unique port in feed -> joins
+                "198.51.100.7".into(),          // bare IP, two ports -> ambiguous -> empty
+                "198.51.100.7:8443".into(),     // exact key -> joins
+                "edge.example.com".into(),      // hostname, absent -> empty (never bad)
+            ],
+            ..Default::default()
+        };
+        let rows = candidate_health(&cfg, &Default::default(), &[], &quality);
+        let q: Vec<&str> = rows.iter().map(|r| r.quality.as_str()).collect();
+        assert_eq!(
+            q,
+            vec![
+                "low/datacenter/high/ip-api/proxycheck",
+                "", // ambiguous bare IP stays unmeasured, not worst-case
+                "high/vpn-proxy/high/ip-api/proxycheck",
+                "",
+            ]
+        );
+    }
+
+    #[test]
     fn a_stale_expected_revision_is_refused_with_guidance() {
         assert_eq!(resolve_save_rev(Some(3), 5), Err(REV_CONFLICT_MESSAGE));
         assert_eq!(
@@ -778,15 +847,8 @@ mod tests {
             Api::Qr,
             Api::Logout,
             Api::ProbeProxy,
-            // The GitHub OIDC sync route is NOT session-gated (a machine has no
-            // browser session) but is NOT public either: `serve` short-circuits
-            // it to the OIDC verifier before the session check. Listed here to
-            // pin that it can never quietly become session-free without the
-            // verifier in front.
-            Api::CatalogSyncGithub,
-            // Same contract as the sync route: `serve` short-circuits a
-            // Bearer-carrying request to the same OIDC verifier; a session
-            // rides the normal gate. Never public.
+            // The operator/operator-session verify route is never public;
+            // the cron trigger calls the Rust function directly, not HTTP.
             Api::VerifyCatalog,
             Api::HealthOverlay,
         ] {
@@ -810,6 +872,8 @@ mod tests {
             &[],
             &[],
             None,
+            None,
+            &Default::default(),
         );
         assert_eq!(s.clients.len(), bundle::all_clients().len());
         assert_eq!(s.source, "derived");
@@ -854,6 +918,8 @@ mod tests {
             &[],
             &[],
             None,
+            None,
+            &Default::default(),
         );
         let mihomo = s
             .clients
@@ -880,6 +946,8 @@ mod tests {
             &[],
             &[],
             None,
+            None,
+            &Default::default(),
         );
         let first = &s.views[0];
         assert_eq!(first.tag, "a");
@@ -1135,6 +1203,8 @@ mod tests {
             &[],
             &[],
             None,
+            None,
+            &Default::default(),
         );
         assert!(s.catalog.is_none());
         let meta = crate::catalog::Meta::default();
@@ -1164,5 +1234,57 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_outbound(&cfg).is_err());
+    }
+
+    // ---- v1.9.5 country-change saves (spec: TR→US, US→FI, FI→AUTO, invalid) ----
+
+    fn outbound_with_country(cc: &str) -> OutboundConfig {
+        OutboundConfig {
+            catalog_country: cc.to_owned(),
+            ..OutboundConfig::default()
+        }
+    }
+
+    #[test]
+    fn country_change_saves_are_accepted_in_every_direction() {
+        // TR -> US, US -> FI, FI -> AUTO: any prior country may be replaced
+        // by any other valid target. Validation never pins the old value.
+        assert!(validate_outbound(&outbound_with_country("US")).is_ok());
+        assert!(validate_outbound(&outbound_with_country("FI")).is_ok());
+        assert!(validate_outbound(&outbound_with_country("AUTO")).is_ok());
+        assert!(validate_outbound(&outbound_with_country("")).is_ok());
+        // Case-insensitive: the dropdown sends uppercase, but tr is the same
+        // country and must not be refused.
+        assert!(validate_outbound(&outbound_with_country("tr")).is_ok());
+    }
+
+    #[test]
+    fn invalid_country_is_rejected_not_silently_kept() {
+        for bad in ["TUR", "USA", "U", "1T", "TR1"] {
+            assert!(
+                validate_outbound(&outbound_with_country(bad)).is_err(),
+                "{bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_country_round_trips_through_the_settings_document() {
+        // "Value survives reload": the settings document is what KV stores
+        // and what a reload parses — a saved country must survive it.
+        let settings = Settings {
+            version: super::super::store::VERSION,
+            nodes: Vec::new(),
+            outbound: outbound_with_country("US"),
+            enhanced_reachability: false,
+            rev: 7,
+        };
+        let back = Settings::parse(&settings.to_json().unwrap()).unwrap();
+        assert_eq!(back.outbound.catalog_country, "US");
+        assert_eq!(back.rev, 7);
+        // AUTO survives too.
+        let settings = Settings { outbound: outbound_with_country("AUTO"), ..settings };
+        let back = Settings::parse(&settings.to_json().unwrap()).unwrap();
+        assert_eq!(back.outbound.catalog_country, "AUTO");
     }
 }

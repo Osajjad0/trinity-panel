@@ -11,8 +11,9 @@ pub mod auth;
 
 // The HTTP layer exists only on the runtime that has HTTP. Keeping it behind
 // a cfg is what lets the decision modules above compile and test on the host.
-pub mod github_oidc;
 
 #[cfg(target_arch = "wasm32")]
 pub mod serve;
+#[cfg(target_arch = "wasm32")]
+pub mod settings_do;
 pub mod store;

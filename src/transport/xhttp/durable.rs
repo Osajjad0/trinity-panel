@@ -180,6 +180,30 @@ impl DurableObject for XhttpSession {
         // otherwise see a server that accepts padding no real one accepts.
         let referer = req.headers().get("Referer").ok().flatten();
         let query = req.url().ok().and_then(|u| u.query().map(str::to_owned)).unwrap_or_default();
+        // Settings escape hatch (v1.9.5): the panel stores its small mutable
+        // routing state (settings + outbound state) here when the KV daily
+        // write quota is exhausted. Guarded by the panel password — the stub
+        // fetch is reachable from the public XHTTP path, so the path alone is
+        // not a gate. Storage is per-DO-instance: the caller addresses a
+        // dedicated id ("panel-settings"), fully separate from sessions.
+        if path.starts_with("/settings") {
+            let key = self
+                .env
+                .var("PANEL_PASSWORD")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let presented = req
+                .headers()
+                .get("x-trinity-settings-key")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if key.is_empty() || presented != key {
+                return reply(Status::Rejected);
+            }
+            return self.settings(req, &path["/settings".len()..]).await;
+        }
+
         if wire::validate_padding(&wire::PaddingConfig::default(), &query, |name| {
             if name.eq_ignore_ascii_case("Referer") {
                 referer.as_deref()
@@ -227,6 +251,13 @@ enum Status {
     TooLarge,
 }
 
+/// Shared empty quality map: dial paths with no catalog snapshot still typecheck.
+fn empty_quality() -> &'static std::collections::BTreeMap<String, String> {
+    static EMPTY: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::BTreeMap::new)
+}
+
 fn reply(status: Status) -> Result<Response> {
     let code = match status {
         Status::Ok => 200,
@@ -237,7 +268,69 @@ fn reply(status: Status) -> Result<Response> {
     Response::empty().map(|r| r.with_status(code))
 }
 
+/// Row shape for the settings table: `SELECT value` yields one field.
+#[derive(serde::Deserialize)]
+struct Row {
+    value: String,
+}
+
 impl XhttpSession {
+    /// Panel settings store (v1.9.5): a KV-style key/value table in this
+    /// object's SQLite storage. Two keys: `settings` (the panel settings
+    /// document) and `outbound_state` (LKG/fallback/health). DO storage
+    /// writes do not count against the account's daily KV write limit, so a
+    /// country change stays possible on the free plan even when KV writes
+    /// are quota-refused. Reachable only from the worker (password-guarded
+    /// in `fetch`), never from the public internet.
+    ///
+    /// `sub` is the path after `/settings`: `/<key>` GET = read, PUT = write,
+    /// DELETE = remove. An unknown key shape is a 404, not an error page.
+    async fn settings(&self, mut req: Request, sub: &str) -> Result<Response> {
+        use worker::Method;
+        let key = sub.trim_matches('/').to_owned();
+        if key.is_empty() || key.contains('/') {
+            return reply(Status::NotFound);
+        }
+        let sql = self.state.storage().sql();
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            None,
+        )?;
+        let method = req.method();
+        if method == Method::Get {
+            let cursor = sql.exec(
+                "SELECT value FROM settings WHERE key = ?1",
+                Some(vec![key.into()]),
+            )?;
+            // Each row deserializes as {"value": "<text>"}.
+            let found: Option<String> = cursor
+                .next::<Row>()
+                .find_map(|row| row.ok().map(|r| r.value))
+                .filter(|v| !v.is_empty());
+            let Some(body) = found else {
+                return Response::empty().map(|r| r.with_status(404));
+            };
+            return Response::from_body(worker::ResponseBody::Body(body.into_bytes()));
+        }
+        if method == Method::Put || method == Method::Post {
+            let body = req.text().await.unwrap_or_default();
+            if body.is_empty() {
+                return reply(Status::Rejected);
+            }
+            sql.exec(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+                Some(vec![key.into(), body.into()]),
+            )?;
+            return Response::empty().map(|r| r.with_status(200));
+        }
+        if method == Method::Delete {
+            sql.exec("DELETE FROM settings WHERE key = ?1", Some(vec![key.into()]))?;
+            return Response::empty();
+        }
+        reply(Status::NotFound)
+    }
+
     /// Hand the client the downlink stream.
     ///
     /// Returns immediately with a streaming body, before any bytes exist. The
@@ -622,12 +715,22 @@ async fn own_session(ctx: OwnerContext) {
     // candidate to the front before anything dials. Pure reorder: every
     // candidate stays in the plan, so a stale preference costs nothing.
     let resolved = outbound_cfg.resolve_with_catalog(&target, &generated);
+    let quality = snapshot
+        .as_ref()
+        .map(|s| s.quality_by_endpoint.clone())
+        .unwrap_or_default();
+    let capability = snapshot
+        .as_ref()
+        .map(|s| s.capability_by_endpoint.clone())
+        .unwrap_or_default();
     let plan = outbound_state::order_plan_ranked(
         resolved,
         &known_state,
         now_ms(),
         &outbound_cfg.catalog_country,
         &outbound_cfg.pinned_proxy,
+        &quality,
+        &capability,
     );
     let started_ms = now_ms();
     let mut plan = plan;
@@ -671,12 +774,22 @@ async fn own_session(ctx: OwnerContext) {
                 .map(|e| format!("{}:{}", e.host, e.port))
                 .collect();
             let resolved = outbound_cfg.resolve_with_catalog(&target, &fb_generated);
+            let quality = snapshot
+        .as_ref()
+        .map(|s| s.quality_by_endpoint.clone())
+        .unwrap_or_default();
+            let capability = snapshot
+        .as_ref()
+        .map(|s| s.capability_by_endpoint.clone())
+        .unwrap_or_default();
             let plan = outbound_state::order_plan_ranked(
                 resolved,
                 &known_state,
                 now_ms(),
                 &outbound_cfg.catalog_country,
                 &outbound_cfg.pinned_proxy,
+                &quality,
+                &capability,
             );
             match connect::open_with_plan_tracked(&plan).await {
                 Ok(triple) => triple,
