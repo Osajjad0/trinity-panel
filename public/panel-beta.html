@@ -541,6 +541,12 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 
     <div id="banner"></div>
 
+    <!-- egress check (Bug #1 honesty aid): one fetch per click, nothing stored -->
+    <div class="row" style="margin:0.5rem 0">
+      <button type="button" id="egress-btn">Measured exit</button>
+      <span class="muted mono" id="egress-check"></span>
+    </div>
+
     <!-- ONE PAGE: four accordions (V24.5.3). Inner ids unchanged. -->
     <details class="acc" id="sec-connection">
       <summary><h2>Connection</h2><span class="acc-hint muted">Saved connections.</span></summary>
