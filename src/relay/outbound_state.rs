@@ -519,9 +519,13 @@ fn rank_by_quality(
     let enforced = wanted.len() == 2 && !wanted.eq_ignore_ascii_case("AUTO");
     let cap_band = |t: &Target| -> u8 {
         match capability.get(&candidate_key(t)).map(String::as_str) {
-            Some("passthrough") => 0,
-            Some("sni-terminate") => 2,
-            _ => 1,
+            // "passthrough+http": scanner-verified plain-HTTP relay (the
+            // Speedtest latency class) — outranks an unmeasured passthrough;
+            // plain passthrough still outranks every cf-only class.
+            Some("passthrough+http") => 0,
+            Some("passthrough") => 1,
+            Some("sni-terminate") => 3,
+            _ => 2,
         }
     };
     // Health band: only MEASURED-BAD evidence sinks a candidate — quarantined
@@ -1410,6 +1414,21 @@ mod tests {
         s.geo.insert("lkg.example".into(), healthy("DE", 200));
         let out = order_plan_pref(p, &s, NOW, "");
         assert_eq!(out.candidates[1], t("lkg.example", 443));
+    }
+
+    #[test]
+    fn enforced_pool_http_verified_passthrough_leads_plain_one() {
+        // Bug #2 v2: within the passthrough band, a scanner-verified
+        // plain-HTTP relay ("passthrough+http") outranks an unmeasured one —
+        // it is the only class proven to carry Speedtest latency probes.
+        let p = plan(&["dest.example", "pass.example", "ph.example"], 443);
+        let s = state(None, NOW);
+        let mut cap = std::collections::BTreeMap::new();
+        cap.insert("pass.example:443".to_string(), "passthrough".to_string());
+        cap.insert("ph.example:443".to_string(), "passthrough+http".to_string());
+        let out = order_plan_ranked(p, &s, NOW, "TR", "", &std::collections::BTreeMap::new(), &cap);
+        assert_eq!(out.candidates[1], t("ph.example", 443));
+        assert_eq!(out.candidates[2], t("pass.example", 443));
     }
 
     #[test]
