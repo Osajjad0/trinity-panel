@@ -710,7 +710,14 @@ async fn own_session(ctx: OwnerContext) {
     // directly from the Worker instead. TLS traffic (0x16 ClientHello) never
     // matches and keeps the enforced pool — country semantics unchanged.
     let plain_http = matches!(target.port, 80 | 8080 | 8880 | 3128)
-        && looks_like_http_request(req.payload);
+        && (looks_like_http_request(req.payload)
+            // TLS to a non-443 port is the Speedtest latency-probe class
+            // (https://host:8080/hello): every catalog front terminates TLS
+            // itself or relays to a fixed upstream, so the destination's real
+            // certificate never reaches the client (live-proven 2026-09-30).
+            // Port 443 keeps the enforced pool — ordinary HTTPS is untouched.
+            || (target.port == 8080
+                && req.payload.first() == Some(&0x16)));
     // Before the socket, because it can fail: a client that negotiated a body
     // mode this server cannot frame is refused rather than served a corrupted
     // tunnel. Authenticating and then garbling every byte is strictly worse

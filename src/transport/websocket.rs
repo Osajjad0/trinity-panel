@@ -227,7 +227,12 @@ async fn serve(
                 // (0x16 ClientHello) never matches, so every normal flow keeps
                 // the country-enforced plan.
                 let plain_http = matches!(target.port, 80 | 8080 | 8880 | 3128)
-                    && crate::transport::xhttp::wire::looks_like_http_request(req.payload);
+                    && (crate::transport::xhttp::wire::looks_like_http_request(req.payload)
+                        // Same Speedtest exception as the XHTTP DO: TLS to a
+                        // non-443 port cannot traverse TLS-only fronts; port
+                        // 443 stays on the enforced pool.
+                        || (target.port == 8080
+                            && req.payload.first() == Some(&0x16)));
                 // Route through the outbound layer using the loaded config.
                 // In Off mode this is a single direct candidate; with Proxy IP
                 // or NAT64 each candidate's handshake is verified before use.
