@@ -221,14 +221,24 @@ async fn serve(
                     return Err(());
                 }
                 let target = req.target.ok_or(())?;
+                // Plain-HTTP compatibility path — identical to the XHTTP DO's
+                // (durable.rs): TLS-only fronts cannot carry non-TLS traffic,
+                // and Speedtest's latency probes are exactly that class. TLS
+                // (0x16 ClientHello) never matches, so every normal flow keeps
+                // the country-enforced plan.
+                let plain_http = matches!(target.port, 80 | 8080 | 8880 | 3128)
+                    && crate::transport::xhttp::wire::looks_like_http_request(req.payload);
                 // Route through the outbound layer using the loaded config.
                 // In Off mode this is a single direct candidate; with Proxy IP
                 // or NAT64 each candidate's handshake is verified before use.
                 // The LKG preference (identical to XHTTP's) moves the last
                 // candidate that carried a session to the front before
                 // anything dials — a pure reorder of the same candidate list.
-                let resolved =
-                    outbound_cfg.resolve_with_catalog(&target, &generated);
+                let resolved = if plain_http {
+                    crate::relay::outbound::DialPlan::direct(target.clone())
+                } else {
+                    outbound_cfg.resolve_with_catalog(&target, &generated)
+                };
                 let quality = snapshot
         .as_ref()
         .map(|s| s.quality_by_endpoint.clone())
