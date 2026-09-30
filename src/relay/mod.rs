@@ -185,6 +185,45 @@ mod tests {
     use super::*;
     use tokio::io::duplex;
 
+    // workerd aborts connections (and can poison the whole isolate, observed
+    // live as 1101) when one write exceeds 64 KiB. write_chunked is the guard:
+    // pin the invariant so a refactor cannot reintroduce an oversized write.
+    #[tokio::test]
+    async fn write_chunked_never_issues_a_write_over_max_write() {
+        use std::sync::{Arc, Mutex};
+        struct RecordingSink {
+            writes: Arc<Mutex<Vec<usize>>>,
+        }
+        impl tokio::io::AsyncWrite for RecordingSink {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.writes.lock().unwrap().push(buf.len());
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = RecordingSink { writes: Arc::clone(&writes) };
+        write_chunked(&mut sink, &vec![7u8; MAX_WRITE * 3 + 17]).await.unwrap();
+        let sizes = writes.lock().unwrap().clone();
+        assert_eq!(sizes.iter().sum::<usize>(), MAX_WRITE * 3 + 17);
+        assert!(sizes.iter().all(|&n| n <= MAX_WRITE), "oversized write: {sizes:?}");
+    }
+
     #[tokio::test]
     async fn moves_all_bytes_and_reports_the_count() {
         let (mut a, mut b) = duplex(4096);

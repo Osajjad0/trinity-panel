@@ -536,13 +536,25 @@ async fn serve(
             if upbuf.is_empty() {
                 continue;
             }
-            if AsyncWriteExt::write_all(&mut write_half, &upbuf).await.is_err() {
+            // workerd destroys the connection when a single socket write
+            // carries more than 64 KiB (cloudflare/workerd#7074): the promise
+            // resolves and the failure only surfaces on the next read, which
+            // aborts the isolate and takes every request it is serving with
+            // it (observed live as intermittent Cloudflare 1101 on unrelated
+            // panel GETs, 2026-09-30 19:51-20:01 UTC). A fast client's
+            // message train can decode to pieces well past 64 KiB, so the
+            // batched buffer MUST go out in slices, not as one write.
+            if crate::relay::write_chunked(&mut write_half, &upbuf)
+                .await
+                .is_err()
+            {
                 return;
             }
             upbuf.clear();
         }
         if !upbuf.is_empty() {
-            let _ = AsyncWriteExt::write_all(&mut write_half, &upbuf).await;
+            // Same 64 KiB workerd ceiling as above: slice the drain too.
+            let _ = crate::relay::write_chunked(&mut write_half, &upbuf).await;
         }
     };
 
