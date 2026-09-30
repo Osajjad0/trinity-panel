@@ -313,6 +313,51 @@ pub fn downlink_headers(sse: bool) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+/// Whether the first client payload bytes look like a plain-HTTP request line.
+///
+/// Cheap first-line check: one of the eight standard methods, then ` HTTP/1.`
+/// later in that line. A TLS ClientHello starts with `0x16` and can never
+/// match, so this is what the plain-HTTP compatibility path keys on.
+#[must_use]
+pub fn looks_like_http_request(payload: &[u8]) -> bool {
+    let methods: [&[u8]; 8] = [
+        b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ", b"OPTIONS ", b"PATCH ", b"CONNECT ",
+    ];
+    let Some(line_end) = payload.iter().position(|&b| b == b'\n') else {
+        return false;
+    };
+    let line = &payload[..line_end];
+    methods
+        .iter()
+        .any(|m| line.starts_with(m) && line[m.len()..].windows(8).any(|w| w == b" HTTP/1."))
+}
+
+#[cfg(test)]
+mod plain_http_tests {
+    use super::looks_like_http_request;
+    #[test]
+    fn speedtest_latency_probe_matches() {
+        // The exact shape the Speedtest web app sends for a latency probe.
+        let req = b"GET /speedtest/latency.txt HTTP/1.1\r\nHost: szaspd2.mci.ir:8080\r\n\r\n";
+        assert!(looks_like_http_request(req));
+    }
+
+    #[test]
+    fn tls_clienthello_never_matches() {
+        let mut hello = vec![0x16, 0x03, 0x01, 0x00, 0x50];
+        hello.extend_from_slice(b"GET HTTP/1.1\r\n"); // decoy bytes inside the record
+        assert!(!looks_like_http_request(&hello));
+    }
+
+    #[test]
+    fn other_classes_do_not_match() {
+        assert!(!looks_like_http_request(b"GET /x HTTP/2.0\r\n")); // wrong version
+        assert!(!looks_like_http_request(b"FROB /x HTTP/1.1\r\n")); // not a method
+        assert!(!looks_like_http_request(b"GET /speedtest/latency.txt HTTP/1.1")); // no CRLF yet
+        assert!(!looks_like_http_request(b"")); // empty payload
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

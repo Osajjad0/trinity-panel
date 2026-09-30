@@ -57,7 +57,7 @@ use worker::{
 use super::diag::{SessionDiag, SessionEnd, DownExit};
 use super::deadlines;
 use super::supervise::{self, Supervisor};
-use super::wire::{self, Class};
+use super::wire::{self, looks_like_http_request, Class};
 use super::{UploadQueue, DEFAULT_MAX_BUFFERED_POSTS, DEFAULT_MAX_POST_BYTES};
 #[allow(unused_imports)] // used by the socket-owning task below on some paths
 use crate::protocol::codec::{Decoder, Encoder};
@@ -699,6 +699,18 @@ async fn own_session(ctx: OwnerContext) {
         // Mux needs framing this server does not implement.
         break 'owner OwnerOutcome::Refused;
     }
+    // Plain-HTTP compatibility path (Speedtest latency class). A payload whose
+    // first bytes are an HTTP request line is NOT TLS, and TLS-only front
+    // candidates (cf-relay / sni-terminate fronts, HTTP relays that answer from
+    // their own address) cannot carry it: the bytes reach the box, get relayed
+    // to its fixed upstream, and die as `400 The plain HTTP request was sent
+    // to HTTPS port` — live-proven across TR/IT/US enforced pools 2026-09-29/30.
+    // Non-TLS destinations carry no SNI for any front to route by, so no
+    // candidate class in the catalog serves them; dial such destinations
+    // directly from the Worker instead. TLS traffic (0x16 ClientHello) never
+    // matches and keeps the enforced pool — country semantics unchanged.
+    let plain_http = matches!(target.port, 80 | 8080 | 8880 | 3128)
+        && looks_like_http_request(req.payload);
     // Before the socket, because it can fail: a client that negotiated a body
     // mode this server cannot frame is refused rather than served a corrupted
     // tunnel. Authenticating and then garbling every byte is strictly worse
@@ -714,7 +726,11 @@ async fn own_session(ctx: OwnerContext) {
     // A fresh last-known-good preference (see `outbound_state`) moves its
     // candidate to the front before anything dials. Pure reorder: every
     // candidate stays in the plan, so a stale preference costs nothing.
-    let resolved = outbound_cfg.resolve_with_catalog(&target, &generated);
+    let resolved = if plain_http {
+        DialPlan::direct(target.clone())
+    } else {
+        outbound_cfg.resolve_with_catalog(&target, &generated)
+    };
     let quality = snapshot
         .as_ref()
         .map(|s| s.quality_by_endpoint.clone())
