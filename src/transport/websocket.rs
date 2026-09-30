@@ -36,7 +36,7 @@
 //! so clients that cannot speak XHTTP can still reach the server.
 
 use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use worker::{
     Context, Env, Request, Response, Result, WebSocket, WebSocketPair,
@@ -490,7 +490,16 @@ async fn serve(
         flushed
     };
 
+    // Uplink coalescing, mirroring the downlink pump: xray hands us one small
+    // write per message (4-16 KiB typical), and forwarding each decoded piece
+    // as its own upstream write hands the box front a dribble instead of a
+    // segment. Block for the first message of a burst, then drain whatever is
+    // already queued without awaiting, and write once per batch. Ordering:
+    // single consumer, FIFO. Backpressure: while the upstream write blocks,
+    // nobody drains `events`, so the runtime's buffer fills — the same valve
+    // the unbounded channel had, one layer earlier.
     let uplink = async {
+        let mut upbuf: Vec<u8> = Vec::with_capacity(64 * 1024);
         while let Some(event) = events.next().await {
             let Ok(WebsocketEvent::Message(msg)) = event else {
                 break;
@@ -502,10 +511,38 @@ async fn serve(
                 break;
             }
             for piece in ready.drain(..) {
-                if AsyncWriteExt::write_all(&mut write_half, &piece).await.is_err() {
-                    break;
+                upbuf.extend_from_slice(&piece);
+            }
+            // Drain every message that has already arrived, up to the flush
+            // threshold. `now_or_never() == None` means "nothing queued right
+            // now" — a flush point, never a loop exit.
+            while upbuf.len() < 64 * 1024 {
+                match events.next().now_or_never().flatten() {
+                    Some(Ok(WebsocketEvent::Message(msg))) => {
+                        let Some(bytes) = msg.bytes() else { return };
+                        if decoder.decode(bytes.into(), &mut ready).is_err() {
+                            return;
+                        }
+                        for piece in ready.drain(..) {
+                            upbuf.extend_from_slice(&piece);
+                        }
+                    }
+                    // Nothing queued, stream ended, or a non-message event:
+                    // flush what we have; a real stream end is handled by the
+                    // outer loop's next iteration (or its exit below).
+                    _ => break,
                 }
             }
+            if upbuf.is_empty() {
+                continue;
+            }
+            if AsyncWriteExt::write_all(&mut write_half, &upbuf).await.is_err() {
+                return;
+            }
+            upbuf.clear();
+        }
+        if !upbuf.is_empty() {
+            let _ = AsyncWriteExt::write_all(&mut write_half, &upbuf).await;
         }
     };
 

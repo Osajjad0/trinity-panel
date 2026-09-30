@@ -134,7 +134,11 @@ fn common_params(node: &Node, enhanced: bool) -> Vec<(&'static str, String)> {
         // full measurement table: 1M, confidence 0.975.
         p.push(("scMaxEachPostBytes", "1000000".to_owned()));
         p.push(("scMaxConcurrentPosts", "10".to_owned()));
-        p.push(("scMinPostsIntervalMs", "10".to_owned()));
+        // Measured live 2026-09-28: 30ms pacing collapsed tunnelled upload to
+        // ~0.6 Mbps where the same path carries ~14 Mbps direct; 0 pipelines
+        // POSTs (ordering stays guaranteed by the server's sequence
+        // reordering). `translate::xray` already ships 0 for config output.
+        p.push(("scMinPostsIntervalMs", "0".to_owned()));
     }
     p
 }
