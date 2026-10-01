@@ -25,6 +25,78 @@ const MAX_UNASSIGNED: usize = 256;
 const MAX_AUTO: usize = 64;
 const FETCH_TIMEOUT_MS: u64 = 10_000;
 
+/// Verdict hysteresis (paste 21-36 §5/§12): the discovery feed churns between
+/// scanner runs (measured: 928–1592 endpoints), so a country can drop from
+/// `passthrough: 2` to `passthrough: 0` on the next pull with ZERO Trinity-
+/// vantage failure evidence — the observed FULL → LIMITED flip roughly two
+/// hours after selection. While the last ACTIVATED revision that counted
+/// passthrough for a country is younger than this window, a census flip is
+/// held one cycle: the previous snapshot keeps serving and the held feed is
+/// re-decided on the next pull. Recovery is instant (any positive census
+/// activates). Trinity's own quarantine-grade worker-vantage evidence is a
+/// different half of the verdict and is never held.
+pub(crate) const CENSUS_GRACE_MS: u64 = 12 * 60 * 60 * 1000;
+
+/// One remembered census observation per country: did the last activated
+/// revision count passthrough endpoints for it, and how long the gate may
+/// still be held.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CensusNote {
+    pub pt_seen: bool,
+    pub grace_until_ms: u64,
+}
+
+/// The sync-side hold predicate (pure for host testing): would activating
+/// `incoming` strip the last passthrough census from a country whose grace
+/// window is still open?
+pub(crate) fn census_hold_check(
+    census: &std::collections::BTreeMap<String, CensusNote>,
+    incoming: &Snapshot,
+    now_ms: u64,
+) -> bool {
+    for (cc, note) in census {
+        if !note.pt_seen || now_ms >= note.grace_until_ms {
+            continue;
+        }
+        let pt = incoming
+            .capability_counts
+            .get(cc)
+            .and_then(|c| c.get("passthrough"))
+            .copied()
+            .unwrap_or(0);
+        if pt == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Update the census memory for one country from a snapshot being activated.
+pub(crate) fn note_census(
+    prior: Option<&CensusNote>,
+    snapshot: &Snapshot,
+    cc: &str,
+    now_ms: u64,
+) -> CensusNote {
+    let pt_seen = snapshot
+        .capability_counts
+        .get(cc)
+        .and_then(|c| c.get("passthrough"))
+        .copied()
+        .unwrap_or(0)
+        > 0;
+    CensusNote {
+        pt_seen,
+        // A positive census re-arms the window; a negative one keeps whatever
+        // memory existed (it never extends past the last positive revision).
+        grace_until_ms: if pt_seen {
+            now_ms + CENSUS_GRACE_MS
+        } else {
+            prior.map(|p| p.grace_until_ms).unwrap_or(0)
+        },
+    }
+}
+
 /// One catalog candidate. `host` is a bare address (IPv4, IPv6 without
 /// brackets, or hostname); the port is always separate.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -339,9 +411,51 @@ async fn sync_inner(env: &worker::Env) -> (Option<u16>, SyncReport, String, Stri
             Some(format!("feed rejected: {rejection}; previous snapshot kept")),
         ),
     };
+    // Verdict hysteresis (paste 21-36): hold a feed whose activation would
+    // strip the last passthrough census from a country inside its grace
+    // window. The previous snapshot keeps serving; the held feed is re-decided
+    // on the next pull. Trinity-vantage quarantine evidence is NOT part of
+    // this gate and never held.
+    let previous_snapshot: Option<Snapshot> = previous
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| serde_json::from_value(v.get("snapshot")?.clone()).ok());
+    let prior_census: std::collections::BTreeMap<String, CensusNote> = previous
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| serde_json::from_value(v.get("census")?.clone()).ok())
+        .unwrap_or_default();
+    if changed && census_hold_check(&prior_census, &snapshot, fetched_at) {
+        return (status, SyncReport {
+            ok: true,
+            changed: false,
+            content_revision: snapshot.content_revision,
+            upstream_revision: snapshot.upstream_revision,
+            generated_at: snapshot.generated_at,
+            fetched_at: now_iso(fetched_at),
+            country_count: previous_snapshot.as_ref().map_or(0, |s| s.countries.len()),
+            endpoint_count: previous_snapshot
+                .as_ref()
+                .map(|s| s.countries.values().map(Vec::len).sum::<usize>())
+                .unwrap_or(0),
+            error: Some(
+                "held: census flip inside grace window; previous snapshot serving".into(),
+            ),
+        }, "census hold active; previous snapshot kept".to_string(), active);
+    }
     if changed {
+        let notes: std::collections::BTreeMap<String, CensusNote> = snapshot
+            .capability_counts
+            .keys()
+            .chain(prior_census.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|cc| (cc.clone(), note_census(prior_census.get(&cc), &snapshot, &cc, fetched_at)))
+            .collect();
         let document = serde_json::json!({
             "snapshot": snapshot,
+            "census": notes,
             "fetchedAt": now_iso(fetched_at),
         })
         .to_string();
@@ -1409,6 +1523,63 @@ mod fallback_tests {
         };
         assert!(real.quarantined());
         assert!(!real.is_runtime_error());
+    }
+
+    #[test]
+    fn census_hold_ignores_unseen_and_expired_windows() {
+        let incoming = snap_with_capabilities(&[("US", 2, &[("cf-relay", 2)])]);
+        // No positive observation on record: no hold.
+        let empty = std::collections::BTreeMap::new();
+        assert!(!census_hold_check(&empty, &incoming, 1_000));
+        // Positive observation but window expired: no hold.
+        let expired = BTreeMap::from([(
+            "US".to_owned(),
+            CensusNote { pt_seen: true, grace_until_ms: 500 },
+        )]);
+        assert!(!census_hold_check(&expired, &incoming, 1_000));
+    }
+
+    #[test]
+    fn census_hold_triggers_on_pt_loss_inside_window() {
+        let incoming = snap_with_capabilities(&[("US", 2, &[("cf-relay", 2)])]);
+        let held = BTreeMap::from([(
+            "US".to_owned(),
+            CensusNote { pt_seen: true, grace_until_ms: 2_000 },
+        )]);
+        assert!(census_hold_check(&held, &incoming, 1_000));
+        // A country VANISHING from the feed is the most destructive census
+        // flip of all (pool emptied): it must hold too.
+        let vanished = BTreeMap::from([(
+            "DE".to_owned(),
+            CensusNote { pt_seen: true, grace_until_ms: 2_000 },
+        )]);
+        assert!(census_hold_check(&vanished, &incoming, 1_000));
+        // No observation recorded for any country: no hold.
+        assert!(!census_hold_check(&std::collections::BTreeMap::new(), &incoming, 1_000));
+    }
+
+    #[test]
+    fn census_recovery_is_instant_and_notes_rearm() {
+        let with_pt = snap_with_capabilities(&[
+            ("US", 2, &[("passthrough", 1), ("cf-relay", 1)]),
+            ("DE", 1, &[("cf-relay", 1)]),
+        ]);
+        // Incoming still has passthrough: no hold (recovery path).
+        let held = BTreeMap::from([(
+            "US".to_owned(),
+            CensusNote { pt_seen: true, grace_until_ms: 2_000 },
+        )]);
+        assert!(!census_hold_check(&held, &with_pt, 1_000));
+        // Note from a positive census: pt_seen true, window re-armed.
+        let note = note_census(None, &with_pt, "US", 1_000);
+        assert!(note.pt_seen && note.grace_until_ms == 1_000 + CENSUS_GRACE_MS);
+        // Note from a negative census keeps the prior window, never extends.
+        let prior = CensusNote { pt_seen: true, grace_until_ms: 5_000 };
+        let note = note_census(Some(&prior), &snap_with_capabilities(&[("US", 2, &[("cf-relay", 2)])]), "US", 6_000);
+        assert!(!note.pt_seen && note.grace_until_ms == 5_000);
+        // Negative census with no prior memory: zero window.
+        let note = note_census(None, &snap_with_capabilities(&[("US", 2, &[("cf-relay", 2)])]), "US", 1_000);
+        assert!(!note.pt_seen && note.grace_until_ms == 0);
     }
 
     #[test]

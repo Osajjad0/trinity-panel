@@ -23,16 +23,18 @@ use crate::transport::xhttp::wire::Class;
 const UPGRADE: &str = "Upgrade";
 
 /// Scheduled handler (V24.8 decoupling, spec §4/§5/§10): Trinity pulls the
-/// published catalog itself every 2 hours — no GitHub push, no OIDC, no
-/// Trinity secrets in the catalog repo. The catalog repo publishes and stops.
+/// published catalog itself every 6 hours (paste 21-36 §12: was 2 h) — no
+/// GitHub push, no OIDC, no Trinity secrets in the catalog repo. The catalog
+/// repo publishes and stops.
 ///
 /// One cycle, fail-closed at every step:
 ///   1. `catalog::sync` fetch → parse → integrity-check → revision-gate →
-///      activate atomically. Any failure keeps the previous snapshot.
+///      census-hold gate → activate atomically. Any failure or census hold
+///      keeps the previous snapshot.
 ///   2. On a fresh revision, run worker-vantage verify passes until the cron
 ///      wall-clock guard; the pass writes KV only when a verdict changed.
 ///   3. On an unchanged revision, skip verify entirely: geo verdicts are
-///      already ≤2 h old, far inside the 48 h freshness TTL.
+///      already ≤6 h old, far inside the 48 h freshness TTL.
 /// Cursor always restarts at 0: `verify_order` is stale-first (oldest verdict
 /// first, current country first), so each cycle re-measures exactly the
 /// candidates that most need it — a fixed cursor would measure a moving feed
