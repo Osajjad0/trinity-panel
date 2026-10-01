@@ -115,14 +115,17 @@ try {
    slow loop; text stays readable throughout. No layout shift. */
 .shimmer{
   color:var(--text);
+  /* base = ink, one electric-blue band sweeping across. The gradient image is
+     200% wide and animates position 0% -> 100%, so the image always fully
+     covers the glyphs: base text is ALWAYS visible, only the highlight moves. */
   background-image:linear-gradient(100deg, var(--text) 42%, #60a5fa 50%, var(--text) 58%);
-  background-size:240% 100%;
+  background-size:200% 100%;
   background-repeat:no-repeat;
   -webkit-background-clip:text;background-clip:text;
   -webkit-text-fill-color:transparent;
-  animation:shimmer 3.4s linear infinite;
+  animation:shimmer 6.5s linear infinite;
 }
-@keyframes shimmer{from{background-position:130% 0}to{background-position:-130% 0}}
+@keyframes shimmer{from{background-position:0% 0}to{background-position:100% 0}}
 @media (prefers-reduced-motion: reduce){
   .shimmer{animation:none;background:none;-webkit-text-fill-color:currentColor}
 }
@@ -535,24 +538,45 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
    #070d1d}
 #trinity-field{position:fixed;inset:0;z-index:-1;width:100vw;height:100vh;
   display:block;pointer-events:none}
-/* Sign-in transition (uiverse.io/mobinkakei/grumpy-turtle-41 motion, adapted):
-   three bouncing triangles on a glass veil. Shown only while the post-login
-   state load actually runs; never on failure; never on authed reloads.
-   pointer-events:none always — the veil can never block input. */
+/* Sign-in transition — Trinity formation: three triangles arranged at 120°
+   around a center, pointing radially outward (TRINITY = THREE). The group
+   rotates slowly, triangles pulse brightness in a staggered ring, and a faint
+   large triangle fades in/out behind them (the Trinity symbol). Glass veil,
+   shown only while the post-login state load actually runs; never on failure;
+   never on authed reloads. pointer-events:none always. */
 #signin-veil{position:fixed;inset:0;z-index:2000;display:flex;align-items:center;justify-content:center;
   background:color-mix(in srgb, var(--bg) 78%, transparent);
   -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
   opacity:0;visibility:hidden;pointer-events:none;
   transition:opacity 200ms var(--ease-standard), visibility 0s linear 200ms}
 #signin-veil.show{opacity:1;visibility:visible;transition:opacity 200ms var(--ease-standard)}
-.tri{position:relative;width:18px;height:22px;flex:none;
+.tri-orbit{position:relative;width:120px;height:120px;flex:none;
+  animation:tri-rotate 7s linear infinite}
+.tri-glow{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
   clip-path:polygon(50% 0,100% 100%,0 100%);
   background:linear-gradient(180deg, var(--accent), var(--accent-hover));
-  animation:tri-bounce .5s var(--ease-standard) alternate infinite}
-.tri.t2{animation-delay:.14s}
-.tri.t3{animation-delay:.26s}
-@keyframes tri-bounce{0%{transform:translateY(12px) scaleY(.55)}100%{transform:translateY(-9px)}}
-@media (prefers-reduced-motion: reduce){.tri{animation:none;transform:none}}
+  opacity:.14;animation:tri-breathe 3.2s var(--ease-standard) ease-in-out infinite}
+.tri{position:absolute;width:16px;height:20px;flex:none;
+  clip-path:polygon(50% 0,100% 100%,0 100%);
+  background:linear-gradient(180deg, var(--accent), var(--accent-hover));
+  filter:drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 55%, transparent));
+  animation:tri-pulse 1.6s var(--ease-standard) ease-in-out infinite}
+.tri.t1{top:0;left:50%;transform:translateX(-50%)}
+.tri.t2{bottom:14px;left:12px;transform:rotate(120deg)}
+.tri.t3{bottom:14px;right:12px;transform:rotate(240deg)}
+.tri.t2{animation-delay:.53s}
+.tri.t3{animation-delay:1.06s}
+@keyframes tri-rotate{to{transform:rotate(360deg)}}
+@keyframes tri-pulse{0%,100%{opacity:.5;filter:drop-shadow(0 0 2px transparent)}
+  50%{opacity:1;filter:drop-shadow(0 0 7px color-mix(in srgb, var(--accent) 60%, transparent))}}
+@keyframes tri-breathe{0%,100%{opacity:.06}50%{opacity:.2}}
+@media (prefers-reduced-motion: reduce){
+  #signin-veil .tri-orbit{animation:none}
+  #signin-veil .tri{animation:none;opacity:.85;transform:none}
+  #signin-veil .tri.t2{transform:rotate(120deg)}
+  #signin-veil .tri.t3{transform:rotate(240deg)}
+  #signin-veil .tri-glow{animation:none;opacity:.12}
+}
 @keyframes sheen-opacity{0%{opacity:0}18%{opacity:.55}82%{opacity:.55}100%{opacity:0}}
 .signin-card{
   position:relative;z-index:1;width:100%;max-width:376px;text-align:center;
@@ -683,7 +707,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 
 
 <div id="trinity-field" aria-hidden="true"><div id="field-fallback"></div></div>
-<div id="signin-veil" aria-hidden="true"><span class="tri"></span><span class="tri t2"></span><span class="tri t3"></span></div>
+<div id="signin-veil" aria-hidden="true"><div class="tri-orbit"><div class="tri-glow"></div><span class="tri t1"></span><span class="tri t2"></span><span class="tri t3"></span></div></div>
 
 <div class="wrap">
 
@@ -714,7 +738,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
    (MIT, Galahhad), BEM prefix .theme-switch -> .tsq; checkbox kept
    focusable (visually hidden, not display:none) + focus ring added. */
 .tsq {
-  --toggle-size: 30px;
+  --toggle-size: 15px;
   /* the size is adjusted using font-size,
      this is not transform scale,
      so you can choose any size */
@@ -1436,10 +1460,6 @@ async function boot() {
   } catch {
     $("app").classList.add("hidden");
     $("signin").classList.remove("hidden");
-    // §19: the initial state fetch is the slow step — say so, quietly.
-    // ( signin becomes the loading surface; no spinner, no layout jump. )
-    const se = $("signin-error");
-    if (se && !se.textContent) se.textContent = "Connecting…";
     $("password").focus();
     return;
   }
