@@ -110,36 +110,21 @@ try {
   --ease-emphasis:cubic-bezier(.785,.135,.15,.86); /* ObsidianUI Arrow Fill easing */
   --ease-reveal:cubic-bezier(.4,0,.2,1); /* ObsidianUI Rectangular Text Reveal easing */
 }
-/* ObsidianUI Rectangular Text Reveal -> Trinity page title, v2 (V24.5.3).
-   v1 (accent cover + text pop) read as a flash. v2 keeps the text visible at
-   all times: a slim blue bar sweeps left-to-right beneath the title (the
-   pattern's directional wipe), then fades out. Geometric, ~0.9s, plays once
-   per load, no layout shift. */
-#app h1#panel-title{position:relative}
-#app h1#panel-title::after{
-  content:""; position:absolute; left:0; bottom:-0.28rem;
-  width:var(--reveal-w, 100%); height:3px; border-radius:2px;
-  background:var(--accent); opacity:0; pointer-events:none;
-  transform-origin:0 50%;
+/* Shimmering text (animate-ui Shimmering Text, blue variant) -> the two
+   Trinity titles. Base = ink; one soft electric-blue band sweeps across on a
+   slow loop; text stays readable throughout. No layout shift. */
+.shimmer{
+  color:var(--text);
+  background-image:linear-gradient(100deg, var(--text) 42%, #60a5fa 50%, var(--text) 58%);
+  background-size:240% 100%;
+  background-repeat:no-repeat;
+  -webkit-background-clip:text;background-clip:text;
+  -webkit-text-fill-color:transparent;
+  animation:shimmer 3.4s linear infinite;
 }
-#app h1#panel-title.title-reveal::after,
-.signin-title.title-reveal::after{
-  animation:title-bar 0.45s var(--ease-reveal) forwards;
-}
-.signin-title{position:relative;display:inline-block}
-.signin-title::after{
-  content:""; position:absolute; left:50%; bottom:-0.28rem;
-  width:calc(100% - 2px); height:3px; border-radius:2px;
-  background:var(--accent); opacity:0; pointer-events:none;
-  transform:translateX(-50%) scaleX(0); transform-origin:0 50%;
-}
+@keyframes shimmer{from{background-position:130% 0}to{background-position:-130% 0}}
 @media (prefers-reduced-motion: reduce){
-  .signin-title::after{display:none}
-}
-@keyframes title-bar{from{transform:scaleX(0)}to{transform:scaleX(1)}}
-/* Reduced motion: title appears immediately, no bar. */
-@media (prefers-reduced-motion: reduce){
-  #app h1#panel-title::after{display:none}
+  .shimmer{animation:none;background:none;-webkit-text-fill-color:currentColor}
 }
 *{box-sizing:border-box}
 body{
@@ -274,17 +259,37 @@ td,th{overflow-wrap:anywhere}
 .seg button:focus-visible{outline:2px solid var(--focus-ring);outline-offset:-2px;z-index:1}
 .seg button.on:hover{background:var(--accent-soft)}
 
-.switch{position:relative;display:inline-block;width:44px;height:26px;flex:none}
-.switch input{position:absolute;opacity:0;width:44px;height:26px;margin:0;cursor:pointer}
-.switch .track{position:absolute;inset:0;border-radius:999px;background:var(--border-strong);
-  transition:background var(--motion-fast) var(--ease-standard);pointer-events:none}
-.switch .track::before{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;
-  border-radius:50%;background:#fff;box-shadow:var(--shadow-sm);
-  transition:transform var(--motion-fast) var(--ease-standard)}
-.switch input:checked+.track{background:var(--accent)}
-.switch input:checked+.track::before{transform:translateX(18px)}
+/* ON/OFF switches — liquid glass (detail.design/detail/liquid-glass-switcher):
+   translucent tinted track the background reads through, glossy glass thumb
+   with soft depth, event-driven motion only. Same markup/classes as before
+   (label.switch > input + .track) so every control keeps working. */
+.switch{position:relative;display:inline-block;width:46px;height:27px;flex:none}
+.switch input{position:absolute;opacity:0;width:46px;height:27px;margin:0;cursor:pointer}
+.switch .track{position:absolute;inset:0;border-radius:999px;
+  background:color-mix(in srgb, var(--border-strong) 55%, transparent);
+  box-shadow:inset 0 1px 3px rgba(0,0,0,.16), inset 0 -1px 0 rgba(255,255,255,.08), 0 1px 2px rgba(0,0,0,.08);
+  -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);
+  transition:background var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard);
+  pointer-events:none}
+.switch .track::before{content:"";position:absolute;top:3px;left:3px;width:21px;height:21px;border-radius:50%;
+  background:radial-gradient(circle at 30% 26%, rgba(255,255,255,.95), rgba(255,255,255,.66) 55%, rgba(233,238,246,.55));
+  box-shadow:0 2px 5px rgba(0,0,0,.28), inset 0 1px 1px rgba(255,255,255,.9);
+  transition:transform var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard)}
+.switch input:checked+.track{background:color-mix(in srgb, var(--accent) 34%, transparent);
+  box-shadow:inset 0 1px 3px rgba(37,99,235,.30), 0 0 0 1px var(--accent-border), 0 1px 2px rgba(0,0,0,.08)}
+.switch input:checked+.track::before{transform:translateX(19px)}
+.switch input:hover+.track::before{box-shadow:0 3px 8px rgba(0,0,0,.32), inset 0 1px 1px rgba(255,255,255,.95)}
 .switch input:focus-visible+.track{outline:2px solid var(--focus-ring);outline-offset:2px}
 .switch input:disabled+.track{opacity:.5}
+/* Custom scrollbar (detail.design/detail/custom-scrollbar): thin, theme-
+   integrated, transparent track; Chromium + Firefox; no layout shift. */
+*{scrollbar-width:thin;scrollbar-color:var(--border-strong) transparent}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:999px;
+  border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:var(--text-subtle);
+  border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
 /* Real app icons inside the dropdown (24px, contained). */
 .esel-ic{width:24px;height:24px;flex:none;border-radius:6px;background:var(--surface-raised)}
 .esel{position:relative;min-width:0}
@@ -510,35 +515,44 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 }
 
 /* Sign in. The one screen seen before anything else: a full-page Trinity
-   grain gradient — an actual fragment shader (fbm-warped field, Domain-Warp
-   style; same visual language as paper.design/grain-gradient, our own GLSL),
-   scaled by DPR, paused off-screen/hidden, static premium frame under
-   prefers-reduced-motion. The sign-in card is the liquid material layer:
-   translucent glass with a moving specular sweep and edge highlight, so the
-   field reads through it (paper.design/liquid-metal, native recreation). */
+   Day/Night gradient field (precomposed CSS — no shader loop; fast, calm,
+   production-safe). The sign-in card is the liquid material layer:
+   translucent glass with a pointer-tracked specular and edge highlight. */
 .signin{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
   padding:1.5rem;overflow:auto} /* fixed full-page layer; field is a fixed body layer behind it */
 .signin.hidden{display:none !important}
 #field-fallback{position:absolute;inset:0;
   background:
+   radial-gradient(60% 50% at 26% 24%, rgba(37,99,235,.16), transparent 70%),
+   radial-gradient(52% 46% at 76% 68%, rgba(34,211,238,.12), transparent 72%),
+   radial-gradient(70% 60% at 64% 18%, rgba(30,58,138,.14), transparent 74%),
+   #f2f5fa}
+[data-theme="dark"] #field-fallback{
+  background:
    radial-gradient(60% 50% at 26% 24%, rgba(37,99,235,.42), transparent 70%),
    radial-gradient(52% 46% at 76% 68%, rgba(34,211,238,.20), transparent 72%),
    radial-gradient(70% 60% at 64% 18%, rgba(30,58,138,.42), transparent 74%),
    #070d1d}
-#trinity-field.has-shader #field-fallback{display:none}
 #trinity-field{position:fixed;inset:0;z-index:-1;width:100vw;height:100vh;
   display:block;pointer-events:none}
-#trinity-field.hidden{display:none}
-/* Background preset picker: compact live thumbnails under the card. */
-#field-picker{position:fixed;bottom:1.1rem;left:50%;transform:translateX(-50%);z-index:2;
-  display:flex;gap:.45rem;padding:.4rem .5rem;border-radius:14px;
-  background:rgba(10,16,32,.42);border:1px solid rgba(255,255,255,.14);
-  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
-#field-picker button{padding:0;border:1px solid rgba(255,255,255,.2);border-radius:8px;
-  min-height:0;min-width:0;background:none;cursor:pointer;overflow:hidden;line-height:0}
-#field-picker button[aria-pressed="true"]{outline:2px solid var(--accent);outline-offset:1px}
-#field-picker canvas{width:56px;height:36px;display:block}
-@media (max-width:540px){ #field-picker{gap:.3rem;padding:.3rem .35rem} #field-picker canvas{width:44px;height:28px} }
+/* Sign-in transition (uiverse.io/mobinkakei/grumpy-turtle-41 motion, adapted):
+   three bouncing triangles on a glass veil. Shown only while the post-login
+   state load actually runs; never on failure; never on authed reloads.
+   pointer-events:none always — the veil can never block input. */
+#signin-veil{position:fixed;inset:0;z-index:2000;display:flex;align-items:center;justify-content:center;
+  background:color-mix(in srgb, var(--bg) 78%, transparent);
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity 200ms var(--ease-standard), visibility 0s linear 200ms}
+#signin-veil.show{opacity:1;visibility:visible;transition:opacity 200ms var(--ease-standard)}
+.tri{position:relative;width:18px;height:22px;flex:none;
+  clip-path:polygon(50% 0,100% 100%,0 100%);
+  background:linear-gradient(180deg, var(--accent), var(--accent-hover));
+  animation:tri-bounce .5s var(--ease-standard) alternate infinite}
+.tri.t2{animation-delay:.14s}
+.tri.t3{animation-delay:.26s}
+@keyframes tri-bounce{0%{transform:translateY(12px) scaleY(.55)}100%{transform:translateY(-9px)}}
+@media (prefers-reduced-motion: reduce){.tri{animation:none;transform:none}}
 @keyframes sheen-opacity{0%{opacity:0}18%{opacity:.55}82%{opacity:.55}100%{opacity:0}}
 .signin-card{
   position:relative;z-index:1;width:100%;max-width:376px;text-align:center;
@@ -634,7 +648,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 </style>
 </head>
 <body>
-<section id="signin" class="signin hidden" data-fullscreen-field="1">
+<section id="signin" class="signin hidden">
       <div class="signin-card">
         <div class="signin-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
@@ -643,7 +657,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
             <path d="m8.8 11.9 2.3 2.3 4.4-4.6"/>
           </svg>
         </div>
-        <h1 class="signin-title">Trinity Panel</h1>
+<h1 class="signin-title"><span class="shimmer">Trinity Panel</span></h1>
         <p class="signin-sub">Sign in to your panel</p>
         <form id="signin-form" novalidate>
           <div class="field">
@@ -669,7 +683,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 
 
 <div id="trinity-field" aria-hidden="true"><div id="field-fallback"></div></div>
-<div id="field-picker" class="hidden" role="group" aria-label="Login background"></div>
+<div id="signin-veil" aria-hidden="true"><span class="tri"></span><span class="tri t2"></span><span class="tri t3"></span></div>
 
 <div class="wrap">
 
@@ -687,7 +701,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
           </svg>
         </span>
         <div>
-          <h1 id="panel-title">Trinity Panel</h1>
+<h1 id="panel-title"><span class="shimmer">Trinity Panel</span></h1>
           <div class="muted mono" id="panel-version">1.9.7</div>
           <div class="muted mono" id="host"></div>
         </div>
@@ -695,7 +709,233 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
       <div class="row">
         <span id="save-note" aria-live="polite"></span>
         <button type="button" id="save" class="primary" disabled>Save</button>
-        <button id="theme-toggle" type="button" aria-label="Switch to dark theme" title="Theme">◐</button>
+<style>
+/* Day/Night toggle — verbatim port of uiverse.io/Galahhad/strong-squid-82
+   (MIT, Galahhad), BEM prefix .theme-switch -> .tsq; checkbox kept
+   focusable (visually hidden, not display:none) + focus ring added. */
+.tsq {
+  --toggle-size: 30px;
+  /* the size is adjusted using font-size,
+     this is not transform scale,
+     so you can choose any size */
+  --container-width: 5.625em;
+  --container-height: 2.5em;
+  --container-radius: 6.25em;
+  /* radius 0 - minecraft mode :) */
+  --container-light-bg: #3D7EAE;
+  --container-night-bg: #1D1F2C;
+  --circle-container-diameter: 3.375em;
+  --sun-moon-diameter: 2.125em;
+  --sun-bg: #ECCA2F;
+  --moon-bg: #C4C9D1;
+  --spot-color: #959DB1;
+  --circle-container-offset: calc((var(--circle-container-diameter) - var(--container-height)) / 2 * -1);
+  --stars-color: #fff;
+  --clouds-color: #F3FDFF;
+  --back-clouds-color: #AACADF;
+  --transition: .5s cubic-bezier(0, -0.02, 0.4, 1.25);
+  --circle-transition: .3s cubic-bezier(0, -0.02, 0.35, 1.17);
+}
+
+.tsq, .tsq *, .tsq *::before, .tsq *::after {
+  -webkit-box-sizing: border-box;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  font-size: var(--toggle-size);
+}
+
+.tsq__container {
+  width: var(--container-width);
+  height: var(--container-height);
+  background-color: var(--container-light-bg);
+  border-radius: var(--container-radius);
+  overflow: hidden;
+  cursor: pointer;
+  -webkit-box-shadow: 0em -0.062em 0.062em rgba(0, 0, 0, 0.25), 0em 0.062em 0.125em rgba(255, 255, 255, 0.94);
+  box-shadow: 0em -0.062em 0.062em rgba(0, 0, 0, 0.25), 0em 0.062em 0.125em rgba(255, 255, 255, 0.94);
+  -webkit-transition: var(--transition);
+  -o-transition: var(--transition);
+  transition: var(--transition);
+  position: relative;
+}
+
+.tsq__container::before {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  -webkit-box-shadow: 0em 0.05em 0.187em rgba(0, 0, 0, 0.25) inset, 0em 0.05em 0.187em rgba(0, 0, 0, 0.25) inset;
+  box-shadow: 0em 0.05em 0.187em rgba(0, 0, 0, 0.25) inset, 0em 0.05em 0.187em rgba(0, 0, 0, 0.25) inset;
+  border-radius: var(--container-radius)
+}
+
+.tsq__checkbox {
+  display: none;
+}
+
+.tsq__circle-container {
+  width: var(--circle-container-diameter);
+  height: var(--circle-container-diameter);
+  background-color: rgba(255, 255, 255, 0.1);
+  position: absolute;
+  left: var(--circle-container-offset);
+  top: var(--circle-container-offset);
+  border-radius: var(--container-radius);
+  -webkit-box-shadow: inset 0 0 0 3.375em rgba(255, 255, 255, 0.1), inset 0 0 0 3.375em rgba(255, 255, 255, 0.1), 0 0 0 0.625em rgba(255, 255, 255, 0.1), 0 0 0 1.25em rgba(255, 255, 255, 0.1);
+  box-shadow: inset 0 0 0 3.375em rgba(255, 255, 255, 0.1), inset 0 0 0 3.375em rgba(255, 255, 255, 0.1), 0 0 0 0.625em rgba(255, 255, 255, 0.1), 0 0 0 1.25em rgba(255, 255, 255, 0.1);
+  display: -webkit-box;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-transition: var(--circle-transition);
+  -o-transition: var(--circle-transition);
+  transition: var(--circle-transition);
+  pointer-events: none;
+}
+
+.tsq__sun-moon-container {
+  pointer-events: auto;
+  position: relative;
+  z-index: 2;
+  width: var(--sun-moon-diameter);
+  height: var(--sun-moon-diameter);
+  margin: auto;
+  border-radius: var(--container-radius);
+  background-color: var(--sun-bg);
+  -webkit-box-shadow: 0.062em 0.062em 0.062em 0em rgba(254, 255, 239, 0.61) inset, 0em -0.062em 0.062em 0em #a1872a inset;
+  box-shadow: 0.062em 0.062em 0.062em 0em rgba(254, 255, 239, 0.61) inset, 0em -0.062em 0.062em 0em #a1872a inset;
+  -webkit-filter: drop-shadow(0.062em 0.125em 0.125em rgba(0, 0, 0, 0.25)) drop-shadow(0em 0.062em 0.125em rgba(0, 0, 0, 0.25));
+  filter: drop-shadow(0.062em 0.125em 0.125em rgba(0, 0, 0, 0.25)) drop-shadow(0em 0.062em 0.125em rgba(0, 0, 0, 0.25));
+  overflow: hidden;
+  -webkit-transition: var(--transition);
+  -o-transition: var(--transition);
+  transition: var(--transition);
+}
+
+.tsq__moon {
+  -webkit-transform: translateX(100%);
+  -ms-transform: translateX(100%);
+  transform: translateX(100%);
+  width: 100%;
+  height: 100%;
+  background-color: var(--moon-bg);
+  border-radius: inherit;
+  -webkit-box-shadow: 0.062em 0.062em 0.062em 0em rgba(254, 255, 239, 0.61) inset, 0em -0.062em 0.062em 0em #969696 inset;
+  box-shadow: 0.062em 0.062em 0.062em 0em rgba(254, 255, 239, 0.61) inset, 0em -0.062em 0.062em 0em #969696 inset;
+  -webkit-transition: var(--transition);
+  -o-transition: var(--transition);
+  transition: var(--transition);
+  position: relative;
+}
+
+.tsq__spot {
+  position: absolute;
+  top: 0.75em;
+  left: 0.312em;
+  width: 0.75em;
+  height: 0.75em;
+  border-radius: var(--container-radius);
+  background-color: var(--spot-color);
+  -webkit-box-shadow: 0em 0.0312em 0.062em rgba(0, 0, 0, 0.25) inset;
+  box-shadow: 0em 0.0312em 0.062em rgba(0, 0, 0, 0.25) inset;
+}
+
+.tsq__spot:nth-of-type(2) {
+  width: 0.375em;
+  height: 0.375em;
+  top: 0.937em;
+  left: 1.375em;
+}
+
+.tsq__spot:nth-last-of-type(3) {
+  width: 0.25em;
+  height: 0.25em;
+  top: 0.312em;
+  left: 0.812em;
+}
+
+.tsq__clouds {
+  width: 1.25em;
+  height: 1.25em;
+  background-color: var(--clouds-color);
+  border-radius: var(--container-radius);
+  position: absolute;
+  bottom: -0.625em;
+  left: 0.312em;
+  -webkit-box-shadow: 0.937em 0.312em var(--clouds-color), -0.312em -0.312em var(--back-clouds-color), 1.437em 0.375em var(--clouds-color), 0.5em -0.125em var(--back-clouds-color), 2.187em 0 var(--clouds-color), 1.25em -0.062em var(--back-clouds-color), 2.937em 0.312em var(--clouds-color), 2em -0.312em var(--back-clouds-color), 3.625em -0.062em var(--clouds-color), 2.625em 0em var(--back-clouds-color), 4.5em -0.312em var(--clouds-color), 3.375em -0.437em var(--back-clouds-color), 4.625em -1.75em 0 0.437em var(--clouds-color), 4em -0.625em var(--back-clouds-color), 4.125em -2.125em 0 0.437em var(--back-clouds-color);
+  box-shadow: 0.937em 0.312em var(--clouds-color), -0.312em -0.312em var(--back-clouds-color), 1.437em 0.375em var(--clouds-color), 0.5em -0.125em var(--back-clouds-color), 2.187em 0 var(--clouds-color), 1.25em -0.062em var(--back-clouds-color), 2.937em 0.312em var(--clouds-color), 2em -0.312em var(--back-clouds-color), 3.625em -0.062em var(--clouds-color), 2.625em 0em var(--back-clouds-color), 4.5em -0.312em var(--clouds-color), 3.375em -0.437em var(--back-clouds-color), 4.625em -1.75em 0 0.437em var(--clouds-color), 4em -0.625em var(--back-clouds-color), 4.125em -2.125em 0 0.437em var(--back-clouds-color);
+  -webkit-transition: 0.5s cubic-bezier(0, -0.02, 0.4, 1.25);
+  -o-transition: 0.5s cubic-bezier(0, -0.02, 0.4, 1.25);
+  transition: 0.5s cubic-bezier(0, -0.02, 0.4, 1.25);
+}
+
+.tsq__stars-container {
+  position: absolute;
+  color: var(--stars-color);
+  top: -100%;
+  left: 0.312em;
+  width: 2.75em;
+  height: auto;
+  -webkit-transition: var(--transition);
+  -o-transition: var(--transition);
+  transition: var(--transition);
+}
+
+/* actions */
+
+.tsq__checkbox:checked + .tsq__container {
+  background-color: var(--container-night-bg);
+}
+
+.tsq__checkbox:checked + .tsq__container .tsq__circle-container {
+  left: calc(100% - var(--circle-container-offset) - var(--circle-container-diameter));
+}
+
+.tsq__checkbox:checked + .tsq__container .tsq__circle-container:hover {
+  left: calc(100% - var(--circle-container-offset) - var(--circle-container-diameter) - 0.187em)
+}
+
+.tsq__circle-container:hover {
+  left: calc(var(--circle-container-offset) + 0.187em);
+}
+
+.tsq__checkbox:checked + .tsq__container .tsq__moon {
+  -webkit-transform: translate(0);
+  -ms-transform: translate(0);
+  transform: translate(0);
+}
+
+.tsq__checkbox:checked + .tsq__container .tsq__clouds {
+  bottom: -4.062em;
+}
+
+.tsq__checkbox:checked + .tsq__container .tsq__stars-container {
+  top: 50%;
+  -webkit-transform: translateY(-50%);
+  -ms-transform: translateY(-50%);
+  transform: translateY(-50%);
+}
+</style>
+<label class="tsq">
+  <input type="checkbox" class="tsq__checkbox">
+  <div class="tsq__container">
+    <div class="tsq__clouds"></div>
+    <div class="tsq__stars-container">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 144 55" fill="none">
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M135.831 3.00688C135.055 3.85027 134.111 4.29946 133 4.35447C134.111 4.40947 135.055 4.85867 135.831 5.71123C136.607 6.55462 136.996 7.56303 136.996 8.72727C136.996 7.95722 137.172 7.25134 137.525 6.59129C137.886 5.93124 138.372 5.39954 138.98 5.00535C139.598 4.60199 140.268 4.39114 141 4.35447C139.88 4.2903 138.936 3.85027 138.16 3.00688C137.384 2.16348 136.996 1.16425 136.996 0C136.996 1.16425 136.607 2.16348 135.831 3.00688ZM31 23.3545C32.1114 23.2995 33.0551 22.8503 33.8313 22.0069C34.6075 21.1635 34.9956 20.1642 34.9956 19C34.9956 20.1642 35.3837 21.1635 36.1599 22.0069C36.9361 22.8503 37.8798 23.2903 39 23.3545C38.2679 23.3911 37.5976 23.602 36.9802 24.0053C36.3716 24.3995 35.8864 24.9312 35.5248 25.5913C35.172 26.2513 34.9956 26.9572 34.9956 27.7273C34.9956 26.563 34.6075 25.5546 33.8313 24.7112C33.0551 23.8587 32.1114 23.4095 31 23.3545ZM0 36.3545C1.11136 36.2995 2.05513 35.8503 2.83131 35.0069C3.6075 34.1635 3.99559 33.1642 3.99559 32C3.99559 33.1642 4.38368 34.1635 5.15987 35.0069C5.93605 35.8503 6.87982 36.2903 8 36.3545C7.26792 36.3911 6.59757 36.602 5.98015 37.0053C5.37155 37.3995 4.88644 37.9312 4.52481 38.5913C4.172 39.2513 3.99559 39.9572 3.99559 40.7273C3.99559 39.563 3.6075 38.5546 2.83131 37.7112C2.05513 36.8587 1.11136 36.4095 0 36.3545ZM56.8313 24.0069C56.0551 24.8503 55.1114 25.2995 54 25.3545C55.1114 25.4095 56.0551 25.8587 56.8313 26.7112C57.6075 27.5546 57.9956 28.563 57.9956 29.7273C57.9956 28.9572 58.172 28.2513 58.5248 27.5913C58.8864 26.9312 59.3716 26.3995 59.9802 26.0053C60.5976 25.602 61.2679 25.3911 62 25.3545C60.8798 25.2903 59.9361 24.8503 59.1599 24.0069C58.3837 23.1635 57.9956 22.1642 57.9956 21C57.9956 22.1642 57.6075 23.1635 56.8313 24.0069ZM81 25.3545C82.1114 25.2995 83.0551 24.8503 83.8313 24.0069C84.6075 23.1635 84.9956 22.1642 84.9956 21C84.9956 22.1642 85.3837 23.1635 86.1599 24.0069C86.9361 24.8503 87.8798 25.2903 89 25.3545C88.2679 25.3911 87.5976 25.602 86.9802 26.0053C86.3716 26.3995 85.8864 26.9312 85.5248 27.5913C85.172 28.2513 84.9956 28.9572 84.9956 29.7273C84.9956 28.563 84.6075 27.5546 83.8313 26.7112C83.0551 25.8587 82.1114 25.4095 81 25.3545ZM136 36.3545C137.111 36.2995 138.055 35.8503 138.831 35.0069C139.607 34.1635 139.996 33.1642 139.996 32C139.996 33.1642 140.384 34.1635 141.16 35.0069C141.936 35.8503 142.88 36.2903 144 36.3545C143.268 36.3911 142.598 36.602 141.98 37.0053C141.372 37.3995 140.886 37.9312 140.525 38.5913C140.172 39.2513 139.996 39.9572 139.996 40.7273C139.996 39.563 139.607 38.5546 138.831 37.7112C138.055 36.8587 137.111 36.4095 136 36.3545ZM101.831 49.0069C101.055 49.8503 100.111 50.2995 99 50.3545C100.111 50.4095 101.055 50.8587 101.831 51.7112C102.607 52.5546 102.996 53.563 102.996 54.7273C102.996 53.9572 103.172 53.2513 103.525 52.5913C103.886 51.9312 104.372 51.3995 104.98 51.0053C105.598 50.602 106.268 50.3911 107 50.3545C105.88 50.2903 104.936 49.8503 104.16 49.0069C103.384 48.1635 102.996 47.1642 102.996 46C102.996 47.1642 102.607 48.1635 101.831 49.0069Z" fill="currentColor"></path>
+      </svg>
+    </div>
+    <div class="tsq__circle-container">
+      <div class="tsq__sun-moon-container">
+        <div class="tsq__moon">
+          <div class="tsq__spot"></div>
+          <div class="tsq__spot"></div>
+          <div class="tsq__spot"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</label>
         <button type="button" id="signout">Sign out</button>
       </div>
     </div>
@@ -1094,313 +1334,13 @@ async function send(path, options = {}) {
   return body;
 }
 
-// ---- Trinity login background system ---------------------------------------
-// Six generative WebGL presets (visual language researched from paper.design
-// and pixel-perfect.space; all GLSL ours). One fixed body-level canvas, one
-// renderer, one rAF loop; presets swap uniforms/program without new contexts.
-// Theme-bound defaults + persisted explicit choice. Paused when hidden or
-// signed-in; static hand-picked frame under prefers-reduced-motion.
-(() => {
-  const host = document.getElementById("trinity-field");
-  const picker = document.getElementById("field-picker");
-  if (!host) return;
-  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  let canvas = null, gl = null, raf = 0, running = false, t0 = 0, uT = null;
-  let current = null, prog = null, U = {};
-  const Q = { scale: Math.min(devicePixelRatio || 1, 1.75) };
+// ---- Trinity login field (Day/Night) ---------------------------------------
+// Precomposed CSS field (see #field-fallback in the stylesheet); theme
+// switches restyle it via [data-theme] selectors. No WebGL, no rAF loop, no
+// picker — the six-preset experiment was removed.
 
-  // ---- GLSL building blocks (shared prelude) ----
-  const P = [
-    "precision mediump float;",
-    "uniform vec2 R;uniform float T;",
-    "float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}",
-    "float vnoise(vec2 p){vec2 i=floor(p),f=fract(p);vec2 u=f*f*(3.-2.*f);",
-    " float a=h21(i),b=h21(i+vec2(1,0)),c=h21(i+vec2(0,1)),d=h21(i+vec2(1,1));",
-    " return mix(mix(a,b,u.x),mix(c,d,u.x),u.y);}",
-    "float fbm(vec2 p){float v=0.,a=.5;for(int i=0;i<5;i++){v+=a*vnoise(p);p=p*2.03+vec2(19.7,-7.3);a*=.5;}return v;}",
-  ].join("\n");
-
-  // ---- presets: faithful native takes on shaders.paper.design/grain-gradient
-  // [name, lightFragBody, darkFragBody, speed]. uv is centered/min-axis
-  // normalized + t; each body writes vec3 col.
-  const PRESETS = [
-    ["Default",
-     `vec2 w=vec2(fbm(uv*1.5+vec2(0.,t*.8)), fbm(uv*1.5+vec2(4.2,1.3)-t*.7));
-      float f=fbm(uv*1.5+2.2*w);
-      float s=smoothstep(.25,.75,f);
-      vec3 col=mix(vec3(.847,.878,.918),vec3(.529,.678,.847),s);
-      col=mix(col,vec3(.365,.553,.796),smoothstep(.55,.95,f));
-      col*=.97+.05*sin(f*6.2832+t);`,
-     `vec2 w=vec2(fbm(uv*1.5+vec2(0.,t*.8)), fbm(uv*1.5+vec2(4.2,1.3)-t*.7));
-      float f=fbm(uv*1.5+2.2*w);
-      vec3 col=mix(vec3(.020,.036,.086),vec3(.063,.157,.400),smoothstep(.2,.8,f));
-      col=mix(col,vec3(.110,.330,.610),smoothstep(.6,.95,f));
-      col*=.9+.18*sin(f*6.2832+t);`, 1.0],
-    ["Wave",
-     `float bw=fbm(uv*.8+t*.1);
-      float gw=uv.y*1.6+bw*2.6-t*.55;
-      float band=sin(gw*3.14159);
-      float s=smoothstep(-.15,.75,band);
-      vec3 col=mix(vec3(.910,.929,.949),vec3(.427,.576,.749),s);
-      col=mix(col,vec3(.310,.478,.698),smoothstep(.45,.95,band));
-      col*=.98+.04*sin(gw);`,
-     `float bw=fbm(uv*.8+t*.1);
-      float gw=uv.y*1.6+bw*2.6-t*.55;
-      float band=sin(gw*3.14159);
-      vec3 col=mix(vec3(.016,.029,.070),vec3(.055,.125,.310),smoothstep(-.4,.7,band));
-      col=mix(col,vec3(.098,.278,.541),smoothstep(.35,.98,band));
-      col*=.95+.1*sin(gw);`, 1.0],
-    ["Dots",
-     `vec2 gp=uv*7.0+vec2(t*.32,t*.2);
-      vec2 id=floor(gp),f=fract(gp);
-      float r=length(f-.5);
-      float jitter=h21(id);
-      float rad=.16+.12*jitter;
-      float d=smoothstep(rad,rad-.05,r);
-      vec3 base=mix(vec3(.906,.922,.941),vec3(.780,.816,.867),fbm(uv*1.3+t*.2));
-      vec3 col=mix(base,vec3(.365,.553,.796),d*.9);
-      col=mix(col,vec3(.271,.420,.639),d*step(.72,jitter)*.9);`,
-     `vec2 gp=uv*7.0+vec2(t*.32,t*.2);
-      vec2 id=floor(gp),f=fract(gp);
-      float r=length(f-.5);
-      float jitter=h21(id);
-      float rad=.16+.12*jitter;
-      float d=smoothstep(rad,rad-.05,r);
-      vec3 base=mix(vec3(.016,.029,.070),vec3(.055,.098,.196),fbm(uv*1.3+t*.2));
-      vec3 col=mix(base,vec3(.086,.196,.420),d*.9);
-      col=mix(col,vec3(.157,.353,.667),d*step(.72,jitter)*.9);`, 0.8],
-    ["Truchet",
-     `vec2 gp=uv*4.5+vec2(t*.16,t*.1);
-      vec2 id=floor(gp),f=fract(gp);
-      float flip=step(.5,h21(id));
-      if(flip>.5){f.x=1.-f.x;}
-      float d1=abs(f.x-f.y),d2=abs(f.x+f.y-1.);
-      float d=min(d1,d2);
-      float line=smoothstep(.10,.045,d);
-      vec3 base=mix(vec3(.918,.929,.945),vec3(.816,.839,.871),fbm(uv*1.1+t*.15));
-      vec3 col=mix(base,vec3(.373,.541,.749),line*.92);
-      col=mix(col,vec3(.290,.447,.678),line*step(.6,h21(id+3.7))*.85);`,
-     `vec2 gp=uv*4.5+vec2(t*.16,t*.1);
-      vec2 id=floor(gp),f=fract(gp);
-      float flip=step(.5,h21(id));
-      if(flip>.5){f.x=1.-f.x;}
-      float d1=abs(f.x-f.y),d2=abs(f.x+f.y-1.);
-      float d=min(d1,d2);
-      float line=smoothstep(.10,.045,d);
-      vec3 base=mix(vec3(.018,.032,.075),vec3(.047,.086,.165),fbm(uv*1.1+t*.15));
-      vec3 col=mix(base,vec3(.063,.165,.373),line*.92);
-      col=mix(col,vec3(.098,.278,.588),line*step(.6,h21(id+3.7))*.85);`, 0.5],
-    ["Ripple",
-     `vec2 c=uv+vec2(fbm(uv*1.2+t*.2),fbm(uv*1.2+vec2(5.1,9.7)+t*.2))*.35-.175;
-      float w1=sin(6.2832*(length(uv-c)*2.4-t*.5));
-      float w2=sin(6.2832*(length(uv-c)*4.1+t*.35));
-      float s=smoothstep(-.2,.9,w1*.7+w2*.45);
-      vec3 col=mix(vec3(.898,.914,.937),vec3(.373,.549,.769),s);
-      col=mix(col,vec3(.271,.431,.671),smoothstep(.5,.98,w1));
-      col*=.97+.05*w1;`,
-     `vec2 c=uv+vec2(fbm(uv*1.2+t*.2),fbm(uv*1.2+vec2(5.1,9.7)+t*.2))*.35-.175;
-      float w1=sin(6.2832*(length(uv-c)*2.4-t*.5));
-      float w2=sin(6.2832*(length(uv-c)*4.1+t*.35));
-      vec3 col=mix(vec3(.014,.027,.065),vec3(.051,.118,.294),smoothstep(-.3,.8,w1*.7+w2*.45));
-      col=mix(col,vec3(.086,.243,.510),smoothstep(.4,.98,w1));
-      col*=.95+.1*w1;`, 0.9],
-    ["Blob",
-     `vec2 q=uv*1.1;
-      vec3 col=vec3(.906,.918,.937);
-      for(int i=0;i<5;i++){
-        float fi=float(i);
-        vec2 c=vec2(fbm(vec2(fi*1.7,fi*9.1)+q+t*.22), fbm(vec2(fi*3.3,fi*7.7)-q-t*.18));
-        float d=length(q-c*1.6);
-        float blob=smoothstep(.68,.12,d);
-        vec3 bc=mix(vec3(.553,.678,.804),vec3(.290,.443,.686),fi/4.0);
-        col=mix(col,bc,blob*.75);
-      }`,
-     `vec2 q=uv*1.1;
-      vec3 col=vec3(.014,.027,.063);
-      for(int i=0;i<5;i++){
-        float fi=float(i);
-        vec2 c=vec2(fbm(vec2(fi*1.7,fi*9.1)+q+t*.22), fbm(vec2(fi*3.3,fi*7.7)-q-t*.18));
-        float d=length(q-c*1.6);
-        float blob=smoothstep(.68,.12,d);
-        vec3 bc=mix(vec3(.071,.145,.318),vec3(.196,.553,.941),fi/4.0);
-        col=mix(col,bc,blob*.95);
-      }`, 0.9],
-  ];
-  const DEFAULTS = { light: "Default", dark: "Default" };
-
-
-  const MAIN = [
-    "void main(){",
-    " vec2 uv=(gl_FragCoord.xy-.5*R)/min(R.x,R.y);",
-    " float t=T;",
-    "@BODY@",
-    " float g=fract(sin(dot(gl_FragCoord.xy,vec2(12.9898,78.233)))*43758.5453);",
-    " col+=(g-.5)*.028;",
-    " float vg=smoothstep(1.3,.35,length(uv*vec2(1.,1.15)));",
-    " col*=.84+.16*vg;",
-    " col=clamp(col,0.,1.);",
-    " gl_FragColor=vec4(col,1.);}",
-  ].join("\n");
-
-  function compile(type, srcCode) {
-    const s = gl.createShader(type);
-    gl.shaderSource(s, srcCode); gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || "shader");
-    return s;
-  }
-  function makeProgram(body) {
-    const p = gl.createProgram();
-    const vs = compile(gl.VERTEX_SHADER, "attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}");
-    const fs = compile(gl.FRAGMENT_SHADER, P + MAIN.replace("@BODY@", body));
-    gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("link");
-    return p;
-  }
-
-  function init() {
-    if (canvas) return true;
-    canvas = document.createElement("canvas");
-    canvas.id = "trinity-canvas";
-    canvas.setAttribute("aria-hidden", "true");
-    canvas.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;display:block";
-    host.appendChild(canvas);
-    gl = canvas.getContext("webgl", { antialias: false, alpha: false, depth: false, stencil: false, powerPreference: "low-power", preserveDrawingBuffer: false });
-    if (!gl) { canvas.remove(); canvas = null; return false; }
-    const buf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-    addEventListener("resize", () => { if (canvas && gl && current) resize(); }, { passive: true });
-    return true;
-  }
-  function resize() {
-    const w = Math.max(1, Math.round(innerWidth * Q.scale));
-    const h = Math.max(1, Math.round(innerHeight * Q.scale));
-    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-    gl.viewport(0, 0, w, h);
-    if (U.R) gl.uniform2f(U.R, w, h);
-  }
-  function usePreset(name, variant) {
-    const p = PRESETS.find((x) => x[0] === name) || PRESETS[0];
-    const body = variant === "dark" ? p[2] : p[1];
-    const key = name + "/" + variant;
-    if (key === current) return;
-    const newProg = makeProgram(body);
-    current = key;
-    prog = newProg;
-    gl.useProgram(prog);
-    U.R = gl.getUniformLocation(prog, "R"); U.T = gl.getUniformLocation(prog, "T");
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    gl.enableVertexAttribArray(0);
-    resize();
-    t0 = performance.now();
-  }
-  function start() {
-    if (running || !gl || !current) return;
-    running = true; t0 = performance.now();
-    const loop = (now) => {
-      if (!running) return;
-      gl.uniform1f(U.T, (now - t0) / 1000);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
-  }
-  function stop() { running = false; if (raf) { cancelAnimationFrame(raf); raf = 0; } }
-  function drawStatic() { if (gl && U.T) { gl.uniform1f(U.T, 12.0); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); } }
-
-  // ---- choice model: explicit per-theme choice, else theme default ----
-  function load() {
-    try {
-      const c = JSON.parse(localStorage.getItem("trinity-field") || "{}");
-      // legacy preset names (pre grain-gradient set) migrate to Default
-      const KNOWN = PRESETS.map(p => p[0]);
-      for (const k of Object.keys(c)) if (!KNOWN.includes(c[k])) c[k] = "Default";
-      return c;
-    } catch { return {}; }
-  }
-  function save(o) { try { localStorage.setItem("trinity-field", JSON.stringify(o)); } catch { /* private mode */ } }
-  function variant() { return document.documentElement.dataset.theme === "dark" ? "dark" : "light"; }
-  function activeName() {
-    const c = load();
-    return c[variant()] || DEFAULTS[variant()];
-  }
-  function render() {
-    if (!init()) { host.classList.add("hidden"); return; }
-    usePreset(activeName(), variant());
-    if (reduced) drawStatic(); else start();
-  }
-  function stopAll() { stop(); host.classList.add("hidden"); }
-  function show() { host.classList.remove("hidden"); render(); }
-
-  // ---- picker: live GL thumbnails, compact ----
-  function buildPicker() {
-    if (!picker || picker.dataset.built) return;
-    picker.dataset.built = "1";
-    PRESETS.forEach((p) => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.title = p[0];
-      b.setAttribute("aria-label", "Background: " + p[0]);
-      b.setAttribute("aria-pressed", String(p[0] === activeName()));
-      const c = document.createElement("canvas");
-      c.width = 112; c.height = 72;
-      b.appendChild(c);
-      b.onclick = () => {
-        const c2 = load(); c2[variant()] = p[0]; save(c2);
-        render(); syncPicker();
-      };
-      picker.appendChild(b);
-      const g2 = c.getContext("webgl");
-      if (g2) {
-        try {
-          const prog2 = g2.createProgram();
-          const vs = compileWith(g2, g2.VERTEX_SHADER, "attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}");
-          const fs = compileWith(g2, g2.FRAGMENT_SHADER, P + MAIN.replace("@BODY@", variant() === "dark" ? p[2] : p[1]));
-          g2.attachShader(prog2, vs); g2.attachShader(prog2, fs); g2.linkProgram(prog2);
-          g2.useProgram(prog2);
-          const bb = g2.createBuffer(); g2.bindBuffer(g2.ARRAY_BUFFER, bb);
-          g2.bufferData(g2.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), g2.STATIC_DRAW);
-          const lp = g2.getAttribLocation(prog2, "p");
-          g2.enableVertexAttribArray(lp); g2.vertexAttribPointer(lp, 2, g2.FLOAT, false, 0, 0);
-          g2.uniform2f(g2.getUniformLocation(prog2, "R"), 112, 72);
-          g2.uniform1f(g2.getUniformLocation(prog2, "T"), 6.0);
-          g2.drawArrays(g2.TRIANGLE_STRIP, 0, 4);
-        } catch { /* thumbnail fallback: button shows plain */ }
-        const ext = g2.getExtension("WEBGL_lose_context");
-        if (ext) ext.loseContext(); // thumbnails render once, then free the GPU resource
-      }
-    });
-  }
-  function compileWith(ggc, type, srcCode) {
-    const s = ggc.createShader(type);
-    ggc.shaderSource(s, srcCode); ggc.compileShader(s);
-    if (!ggc.getShaderParameter(s, ggc.COMPILE_STATUS)) throw new Error(ggc.getShaderInfoLog(s) || "shader");
-    return s;
-  }
-  function syncPicker() {
-    if (!picker) return;
-    [...picker.children].forEach((b) => b.setAttribute("aria-pressed", String(b.title === activeName())));
-  }
-  function showPicker(v) {
-    if (!picker) return;
-    if (v) { buildPicker(); picker.classList.remove("hidden"); syncPicker(); }
-    else picker.classList.add("hidden");
-  }
-
-  // ---- run only while signin visible + tab visible ----
-  const io = new IntersectionObserver((es) => {
-    es.forEach((e) => { e.isIntersecting ? show() : stopAll(); showPicker(e.isIntersecting); });
-  }, { threshold: 0.02 });
-  io.observe(document.getElementById("signin"));
-
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { stop(); } else if (!document.getElementById("signin").classList.contains("hidden")) { render(); }
-  });
-  document.addEventListener("trinity-theme", () => {
-    if (!document.getElementById("signin").classList.contains("hidden")) { render(); syncPicker(); }
-  });
-
-  // liquid card: specular follows pointer (input-driven, no loop)
+// liquid card: specular follows pointer (input-driven, no loop)
+{
   const card = document.querySelector(".signin-card");
   if (card && matchMedia("(hover:hover) and (pointer:fine)").matches) {
     card.addEventListener("pointermove", (e) => {
@@ -1409,7 +1349,7 @@ async function send(path, options = {}) {
       card.style.setProperty("--my", `${e.clientY - r.top}px`);
     }, { passive: true });
   }
-})();
+}
 
 // ---- sign in ---------------------------------------------------------------
 
@@ -1441,7 +1381,9 @@ $("signin-form").onsubmit = async (e) => {
       body: JSON.stringify({ password: pw }),
     });
     $("password").value = "";
-    await boot();
+    const veil = $("signin-veil");
+    veil.classList.add("show");
+    try { await boot(); } finally { veil.classList.remove("show"); }
   } catch (err) {
     // Spec 16: never surface JS/WASM internals or status codes. Wrong password and
     // network trouble read differently; anything unrecognised reads as the latter.
@@ -1498,15 +1440,6 @@ async function boot() {
     // ( signin becomes the loading surface; no spinner, no layout jump. )
     const se = $("signin-error");
     if (se && !se.textContent) se.textContent = "Connecting…";
-    // Same one-play reveal for the sign-in title (P1-4); reduced-motion skips.
-    if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      const t = document.querySelector(".signin-title");
-      if (t) {
-      t.classList.remove("title-reveal");
-      void t.offsetWidth;
-      t.classList.add("title-reveal");
-      }
-    }
     $("password").focus();
     return;
   }
@@ -1543,15 +1476,6 @@ async function boot() {
   }
   await renderEditor();
   renderLinks();
-  // ObsidianUI Rectangular Text Reveal on the page title: play once per load,
-  // only when motion is welcome (reduced-motion shows the title instantly).
-  if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
-    const t = $("panel-title");
-    t.classList.remove("title-reveal");
-    t.style.setProperty("--reveal-w", `${Math.min(t.offsetWidth, 260)}px`);
-    void t.offsetWidth;
-    t.classList.add("title-reveal");
-  }
 }
 
 // ---- outbound routing ------------------------------------------------------
@@ -3234,23 +3158,28 @@ function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   try { localStorage.setItem("trinity-theme", theme); } catch { /* private mode */ }
   document.dispatchEvent(new CustomEvent("trinity-theme", { detail: theme }));
-  const b = $("theme-toggle");
-  if (b) {
-    b.textContent = theme === "dark" ? "\u2600" : "\u25d0";
-    b.setAttribute("aria-label", theme === "dark" ? "Switch to light theme" : "Switch to dark theme");
-  }
+  syncThemeToggles();
 }
 // ONE dropdown system, no exceptions: every <select> in the panel goes
 // through enhancedSelect (V24.5.8 spec 1). Query live so dynamically
 // rendered selects (cat-country) are covered too.
 for (const sel of document.querySelectorAll("select")) enhancedSelect(sel);
-{
-  const b = $("theme-toggle");
-  if (b) {
-    b.textContent = document.documentElement.dataset.theme === "dark" ? "\u2600" : "\u25d0";
-    b.onclick = () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+// ---- day/night toggle (uiverse strong-squid port): two instances (login,
+// panel header), one state. Checkbox checked = night. applyTheme syncs all
+// instances; a change on any instance calls applyTheme (persistence via
+// trinity-theme storage as before; the head-of-<body> prelude prevents any
+// wrong-theme flash on load).
+function syncThemeToggles() {
+  const night = document.documentElement.dataset.theme === "dark";
+  for (const c of document.querySelectorAll(".tsq__checkbox")) {
+    c.checked = night;
+    c.setAttribute("aria-label", night ? "Switch to day theme" : "Switch to night theme");
   }
 }
+for (const c of document.querySelectorAll(".tsq__checkbox")) {
+  c.addEventListener("change", () => applyTheme(c.checked ? "dark" : "light"));
+}
+syncThemeToggles(); // honor persisted theme on load (prelude set dataset pre-paint)
 </script>
 </body>
 </html>
