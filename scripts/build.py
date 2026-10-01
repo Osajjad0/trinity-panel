@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 TARGET = "wasm32-unknown-unknown"
 
@@ -282,6 +283,30 @@ def check_panel_css() -> None:
         raise SystemExit(f"{path}: duplicate element id(s): {', '.join(dupes)}")
 
 
+def check_panel_js() -> None:
+    """Fail the build when any inline <script> block of the panel page no
+    longer parses. The 1.9.7 GLSL-login bug (an unterminated string literal
+    inside a shader-source array) killed the ENTIRE first script block
+    including boot() — build, tests and screenshots all stayed green because
+    nothing exercises the page's script blocks as JS. node --check catches
+    that bug class statically; missing node skips the gate."""
+    path = os.path.join("public", "panel-beta.html")
+    node = shutil.which("node")
+    if not os.path.isfile(path) or not node:
+        return
+    html = open(path, encoding="utf-8").read()
+    for m in re.finditer(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S):
+        js, line0 = m.group(1), html[: m.start(1)].count("\n") + 1
+        tmp = os.path.join(tempfile.gettempdir(), f"panel-js-{os.getpid()}.js")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(js)
+        r = subprocess.run([node, "--check", tmp], capture_output=True, text=True)
+        if r.returncode != 0:
+            out = (r.stderr or r.stdout).strip().splitlines()
+            why = next((l for l in out if "Error" in l), out[-1] if out else "unknown")
+            raise SystemExit(f"{path}: inline <script> at line {line0} fails JS parse: {why}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the Worker module set.")
     ap.add_argument("--out", default=os.path.join("build", "worker"))
@@ -292,6 +317,7 @@ def main() -> int:
         raise SystemExit("run this from the repository root")
 
     check_panel_css()
+    check_panel_js()
 
     wb = find_wasm_bindgen()
     print(f"Using wasm-bindgen at {wb}")

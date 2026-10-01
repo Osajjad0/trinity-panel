@@ -1462,6 +1462,12 @@ $("egress-btn").onclick = async () => {
 async function boot() {
   try {
     STATE = await send(statePath());
+    // §23 failure-injection guard: a 200 payload missing the core arrays is a
+    // broken/degraded server — treat it like a failed fetch (login + notice)
+    // instead of adopting it and crashing every downstream render loop.
+    // views is display-only: normalise instead of hard-failing.
+    if (!STATE || !Array.isArray(STATE.nodes) || !Array.isArray(STATE.clients)) throw new Error("bad state shape");
+    if (!Array.isArray(STATE.views)) STATE.views = [];
   } catch {
     $("app").classList.add("hidden");
     $("signin").classList.remove("hidden");
