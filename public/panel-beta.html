@@ -332,9 +332,9 @@ td,th{overflow-wrap:anywhere}
   box-shadow:var(--shadow-md);padding:.375rem;
   opacity:0;transform:translateY(-4px)}
 .esel-menu.esel-shown{display:block;
-  animation:esel-in 180ms var(--ease-standard) forwards}
+  animation:esel-in 150ms var(--ease-standard) forwards}
 .esel-menu[data-state="closed"]{display:block;pointer-events:none;
-  animation:esel-out 150ms var(--ease-standard) forwards}
+  animation:esel-out 120ms var(--ease-standard) forwards}
 .esel-main{min-width:0;overflow-wrap:anywhere}
 .esel-col{display:flex;flex-direction:column;gap:.05rem;min-width:0;flex:1}
 .esel-sub{font-size:.72rem;color:var(--dim);font-family:var(--mono)}
@@ -407,11 +407,15 @@ details.acc>summary::-webkit-details-marker{display:none}
   html:has(details.acc){interpolate-size:allow-keywords}
   details.acc::details-content{
     block-size:0; overflow:clip;
-    transition:height var(--motion-slow) var(--ease-standard),
-               content-visibility var(--motion-slow) var(--ease-standard) allow-discrete;
+    transition:height 200ms var(--ease-standard),
+               content-visibility 200ms var(--ease-standard) allow-discrete;
   }
-  details.acc[open]::details-content{block-size:auto}
-  details.acc[open]>.acc-body,details.acc[open]>div{animation:acc-reveal 380ms var(--ease-smooth-out)}
+  details.acc[open]::details-content{
+    block-size:auto;
+    transition:height 260ms var(--ease-smooth-out),
+               content-visibility 260ms var(--ease-smooth-out) allow-discrete;
+  }
+  details.acc[open]>.acc-body,details.acc[open]>div{animation:acc-reveal 280ms var(--ease-smooth-out)}
 }
 @keyframes acc-in{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
 @keyframes acc-reveal{
@@ -480,9 +484,12 @@ details.inner-acc[open]>summary{color:var(--text)}
 .hidden{display:none !important}
 .split{display:grid;gap:1rem;grid-template-columns:220px minmax(0,1fr)}
 @media (max-width:760px){.split{grid-template-columns:1fr}}
-.nodelist button{width:100%;text-align:left;margin-bottom:.3rem;
-  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.nodelist button span{min-width:0}
+.nodelist button{display:flex;align-items:baseline;gap:.45rem;width:100%;text-align:left;
+  margin-bottom:.3rem;min-width:0;padding:.5rem .6rem;line-height:1.3}
+.nl-idx{flex:none;color:var(--text-subtle);font-size:.78rem}
+.nl-main{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.nl-meta{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-family:var(--mono);font-size:.72rem;color:var(--dim)}
 .nodelist button[aria-current=true]{border-color:var(--accent);background:var(--chip)}
 
 /* Section hierarchy, spacing, mobile comfort (carried over from the previous UI). */
@@ -508,6 +515,10 @@ details.card > summary{padding:.15rem 0;font-size:1.02rem}
   .grid{grid-template-columns:1fr}
   .field .help{font-size:.85rem}
   .split{gap:.8rem}
+  /* Phase 1.x mobile scale: compact control, safe wrap, no horizontal escape. */
+  #add-node{min-height:38px;padding:.3rem .7rem;flex:0 1 auto;min-width:0;max-width:100%}
+  .sub .spread{gap:.45rem}
+  .seg{max-width:100%}
 }
 /* ObsidianUI-style toast: slide+fade enter/exit, transform only. */
 .toast{
@@ -2367,7 +2378,17 @@ function renderNodeList() {
   box.textContent = "";
   NODES.forEach((node, i) => {
     const b = el("button", { title: node.tag || "" });
-    b.append(el("span", { textContent: `${i + 1}. ${node.tag || "(unnamed)"}` }));
+    const idx = el("span", { className: "nl-idx", textContent: `${i + 1}.` });
+    const main = el("span", { className: "nl-main", textContent: node.tag || "(unnamed)" });
+    b.append(idx, main);
+    // Metadata = everything after the first " VLESS/Trojan/... " word boundary:
+    // "host VLESS over XHTTP" -> "host" + "VLESS over XHTTP". Wraps nothing,
+    // truncates with ellipsis, keeps protocol info visible on mobile.
+    const m = String(node.tag || "").match(/\s(vless|vmess|trojan|ss|ssr|socks|http|hysteria2?|tuic|wireguard)\b(\s.*)?$/i);
+    if (m && m[1].toUpperCase() !== String(node.tag).trim()) {
+      main.textContent = node.tag.slice(0, m.index).trim() || node.tag;
+      b.append(el("span", { className: "nl-meta", textContent: m[1].toUpperCase() + (m[2] || "") }));
+    }
     b.setAttribute("aria-current", String(i === CURRENT));
     b.onclick = async () => { CURRENT = i; renderNodeList(); await renderEditor(); };
     box.append(b);
@@ -3264,6 +3285,21 @@ for (const c of document.querySelectorAll(".tsq__checkbox")) {
   c.addEventListener("change", () => applyTheme(c.checked ? "dark" : "light"));
 }
 syncThemeToggles(); // honor persisted theme on load (prelude set dataset pre-paint)
+// Phase 1.x perf: the sign-in loader's SMIL animations run even while the veil
+// is hidden — pause them until first show, then keep them alive for replays.
+{
+  const veil = document.getElementById("signin-veil");
+  if (veil) {
+    const anims = veil.querySelectorAll("animateMotion");
+    anims.forEach(a => a.setAttribute("begin", a.getAttribute("begin") + " signin-veil.begin"));
+    anims.forEach(a => { try { a.pauseAnimations(); } catch {} });
+    new MutationObserver(() => {
+      if (veil.classList.contains("show")) {
+        try { veil.unpauseAnimations(); } catch {}
+      }
+    }).observe(veil, { attributes: true, attributeFilter: ["class"] });
+  }
+}
 </script>
 </body>
 </html>
