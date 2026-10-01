@@ -344,6 +344,11 @@ details.acc>details{margin:0 1.1rem 1rem}
 details.acc[open]>summary{border-bottom:1px solid var(--border)}
 .acc-hint{font-size:.85rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   max-width:60%; margin-left:auto; margin-right:.4rem}
+.acc-note{font-size:.78rem; flex:none; padding:.15rem .55rem; border-radius:999px;
+  color:var(--warning-fg, #8a5a00); background:var(--warning-bg, rgba(234,179,8,.15));
+  border:1px solid var(--warning-border, rgba(234,179,8,.4)); font-weight:600}
+.acc-note[hidden]{display:none}
+#save-note{max-width:40ch; text-align:right; overflow-wrap:anywhere}
 .hidden{display:none !important}
 .split{display:grid;gap:1rem;grid-template-columns:220px minmax(0,1fr)}
 @media (max-width:760px){.split{grid-template-columns:1fr}}
@@ -543,6 +548,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
         <div class="muted mono" id="host"></div>
       </div>
       <div class="row">
+        <span id="save-note" class="muted" aria-live="polite"></span>
         <button type="button" id="save" class="primary" disabled>Save</button>
         <button id="theme-toggle" type="button" aria-label="Switch to dark theme" title="Theme">◐</button>
         <button type="button" id="signout">Sign out</button>
@@ -559,7 +565,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 
     <!-- ONE PAGE: four accordions (V24.5.3). Inner ids unchanged. -->
     <details class="acc" id="sec-connection">
-      <summary><h2>Connection</h2><span class="acc-hint muted">Saved connections.</span></summary>
+      <summary><h2>Connection</h2><span class="acc-hint muted">Saved connections.</span><span class="acc-note" data-dirty-for="connection" hidden>Unsaved changes</span></summary>
       <div id="clients" class="grid"></div>
 
       <details class="sub">
@@ -574,7 +580,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
     </details>
 
     <details class="acc" id="sec-outbound">
-      <summary><h2>Routing</h2><span class="acc-hint muted">How Trinity sends traffic.</span><span id="save-note" class="acc-note" aria-live="polite"></span></summary>
+      <summary><h2>Routing</h2><span class="acc-hint muted">How Trinity sends traffic.</span><span class="acc-note" data-dirty-for="routing" hidden>Unsaved changes</span></summary>
 
       <div class="sub">
         <div class="field" style="max-width:320px">
@@ -627,7 +633,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
          zero hot-path cost. -->
     <details class="acc" id="sec-common">
       <summary>
-        <h2>Common</h2><span class="acc-hint muted">Shared client settings</span><span id="common-note" class="acc-note" aria-live="polite"></span></summary>
+        <h2>Common</h2><span class="acc-hint muted">Shared client settings</span><span class="acc-note" data-dirty-for="common" hidden>Unsaved changes</span></summary>
 
       <div class="sub">
         <div class="row" style="flex-wrap:wrap;gap:1rem">
@@ -710,7 +716,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 
 
     <details class="acc" id="sec-proxyip">
-      <summary><h2>Proxy Pool</h2><span class="acc-hint muted">Verified feed.</span></summary>
+      <summary><h2>Proxy Pool</h2><span class="acc-hint muted">Verified feed.</span><span class="acc-note" data-dirty-for="proxyip" hidden>Unsaved changes</span></summary>
       <div class="sub hidden" id="cat-card">
         <div class="spread">
           <h3 style="margin:0">Proxy-IP Pool</h3>
@@ -744,7 +750,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
     </details>
 
     <details class="acc" id="sec-advanced">
-      <summary><h2>Advanced</h2><span class="acc-hint muted">Exports · reachability · diagnostics</span><span class="muted mono" style="font-size:.72rem" id="app-version-badge"></span></summary>
+      <summary><h2>Advanced</h2><span class="acc-hint muted">Exports · reachability · diagnostics</span><span class="muted mono" style="font-size:.72rem" id="app-version-badge"></span><span class="acc-note" data-dirty-for="advanced" hidden>Unsaved changes</span></summary>
 
       <div class="split">
         <aside>
@@ -1996,9 +2002,53 @@ function setVal(id, text) {
   n.classList.add("val-swap");
 }
 
+// ---- Section-scoped dirty model (v1.9.7) --------------------------------
+// Each section owns explicit persisted fields; a badge shows "Unsaved changes"
+// only when THAT section's slice differs from the saved STATE. UI-only state
+// (accordions, focus, scroll) never participates.
+const canon = v => JSON.stringify(v, (_k, val) =>
+  val instanceof Object && !Array.isArray(val)
+    ? Object.keys(val).sort().reduce((o, k) => (o[k] = val[k], o), {})
+    : val);
+const ROUTING_OUT_FIELDS = ["mode","proxyCandidates","nat64Prefixes","maxProxyAttempts","pinnedProxy","catalogPool"];
+function groupCurrent(g){
+  if (g === "common") return commonCollect();
+  if (g === "routing"){
+    const o = collectOutbound();
+    return Object.fromEntries(ROUTING_OUT_FIELDS.map(k => [k, o[k]]));
+  }
+  if (g === "proxyip") return { catalogCountry: collectOutbound().catalogCountry ?? "" };
+  if (g === "advanced"){
+    return { enhanced_reachability: $("enh-reach").checked, nodes: NODES };
+  }
+  return {};
+}
+function groupSaved(g){
+  if (!STATE) return null;
+  if (g === "common") return STATE.common ?? {};
+  if (g === "routing"){
+    const o = STATE.outbound ?? {};
+    return Object.fromEntries(ROUTING_OUT_FIELDS.map(k => [k, o[k]]));
+  }
+  if (g === "proxyip") return { catalogCountry: (STATE.outbound ?? {}).catalogCountry ?? "" };
+  if (g === "advanced"){
+    return { enhanced_reachability: !!STATE.enhancedReachability, nodes: STATE.nodes ?? [] };
+  }
+  return {};
+}
+function refreshDirty(){
+  let any = false;
+  for (const badge of document.querySelectorAll("[data-dirty-for]")) {
+    const g = badge.dataset.dirtyFor;
+    const dirty = !!STATE && canon(groupCurrent(g)) !== canon(groupSaved(g));
+    badge.hidden = !dirty;
+    if (dirty) any = true;
+  }
+  DIRTY = any;
+  if (any) $("save").disabled = false;
+}
 function markDirty() {
-  DIRTY = true;
-  $("save").disabled = false;
+  refreshDirty();
   setSaveState("warning", "Unsaved changes");
 }
 
@@ -2205,6 +2255,7 @@ $("save").onclick = async () => {
     const sameEnh = $("enh-reach").checked === !!STATE.enhancedReachability;
     if (sameNodes && sameOutbound && sameCommon && sameEnh) {
       DIRTY = false;
+      for (const b of document.querySelectorAll("[data-dirty-for]")) b.hidden = true;
       setSaveState("saved", "Already saved — nothing changed.");
       return;
     }
@@ -2237,6 +2288,7 @@ $("save").onclick = async () => {
       setSaveState("saved", `Saved — ${modeLabel} · ${loc}. Apps pick this up the next time they refresh.`);
       toast(`Saved — ${modeLabel} · ${loc}`);
       DIRTY = false;
+      for (const b of document.querySelectorAll("[data-dirty-for]")) b.hidden = true;
     } else {
       // Refusal (validation/rev conflict): keep every edit on screen so the
       // user can fix and retry; nothing is reverted and nothing re-opens.
@@ -2390,6 +2442,71 @@ window.__uxTests = async function(){
     $("c-bypass-dns").dispatchEvent(new Event("change"));
     $("c-lan").querySelector('[data-v="off"]').click();
     await $("save").onclick();
+  });
+  // ---- v1.9.7 section-scoped dirty tests ----
+  const badge = g => document.querySelector(`[data-dirty-for="${g}"]`);
+  const dirtyMap = () => Object.fromEntries(
+    ["connection","routing","common","proxyip","advanced"].map(g => [g, !badge(g).hidden]));
+  // TEST D1: Common → Routing DNS change dirties ONLY common.
+  await t("D1", async ()=>{
+    const before = dirtyMap();
+    $("c-routing-dns").value = "1.1.1.1";
+    $("c-routing-dns").dispatchEvent(new Event("change"));
+    const d = dirtyMap();
+    assert(d.common === true, "common not dirty");
+    assert(d.routing === false, "routing wrongly dirty: " + JSON.stringify(d));
+    assert(d.proxyip === false && d.advanced === false, "unrelated sections dirty");
+    $("c-routing-dns").value = "";
+    $("c-routing-dns").dispatchEvent(new Event("change"));
+    assert(!badge("common").hidden === false, "revert did not clean common");
+  });
+  // TEST D2: Routing change dirties ONLY routing.
+  await t("D2", async ()=>{
+    const savedMode = $("ob-mode").value;
+    $("ob-mode").value = savedMode === "off" ? "nat64" : "off";
+    $("ob-mode").dispatchEvent(new Event("change"));
+    const d = dirtyMap();
+    assert(d.routing === true, "routing not dirty");
+    assert(d.common === false, "common wrongly dirty");
+    $("ob-mode").value = savedMode;
+    $("ob-mode").dispatchEvent(new Event("change"));
+    assert(!badge("routing").hidden === false, "revert did not clean routing");
+  });
+  // (D2 keeps a fixed flip: mode is always a valid option either way.)
+  // TEST D3: Common + Routing → both dirty; save → all clean; then restore.
+  await t("D3", async ()=>{
+    const savedDns = $("c-routing-dns").value;
+    const savedAtt = $("ob-attempts").value;
+    const flipAtt = savedAtt === "2" ? "3" : "2";
+    $("c-routing-dns").value = savedDns === "1.1.1.1" ? "94.140.14.14" : "1.1.1.1";
+    $("c-routing-dns").dispatchEvent(new Event("change"));
+    $("ob-attempts").value = flipAtt;
+    $("ob-attempts").dispatchEvent(new Event("input"));
+    const d = dirtyMap();
+    assert(d.common && d.routing, "both should be dirty");
+    assert(d.proxyip === false && d.advanced === false, "unrelated dirty");
+    await $("save").onclick();
+    await new Promise(r=>setTimeout(r,400));
+    const after = dirtyMap();
+    assert(!after.common && !after.routing, "save did not clean sections");
+    // restore originals
+    $("c-routing-dns").value = savedDns;
+    $("c-routing-dns").dispatchEvent(new Event("change"));
+    $("ob-attempts").value = savedAtt;
+    $("ob-attempts").dispatchEvent(new Event("input"));
+    await $("save").onclick();
+    await new Promise(r=>setTimeout(r,400));
+  });
+  // TEST D4: Common dirty while Advanced open → Advanced stays open AND clean.
+  await t("D4", async ()=>{
+    acc("sec-advanced").open = true;
+    $("c-log-level").value = "debug";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    const d = dirtyMap();
+    assert(d.common === true && d.advanced === false, "advanced wrong: " + JSON.stringify(d));
+    assert(acc("sec-advanced").open === true, "advanced closed");
+    $("c-log-level").value = "";
+    $("c-log-level").dispatchEvent(new Event("change"));
   });
   // TEST H: values persist server-side after save (fresh state doc matches).
   await t("H", async ()=>{
