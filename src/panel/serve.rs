@@ -507,7 +507,7 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
                 .map(|s| s.quality_by_endpoint)
                 .unwrap_or_default(),
         );
-        return json(&state);
+        return json(&SavedResponse { ok: true, state });
     }
     let Ok(document) = settings.to_json() else {
         return refuse("Those settings could not be stored.");
@@ -567,7 +567,6 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
 #[derive(Serialize)]
 struct SavedResponse {
     ok: bool,
-    #[serde(flatten)]
     state: api::State,
 }
 

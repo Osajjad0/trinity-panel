@@ -1052,6 +1052,7 @@ async function boot() {
   // State is camelCase on the way in; the save payload names its fields
   // after the Rust struct, which is snake_case.
   $("enh-reach").checked = !!STATE.enhancedReachability;
+  commonFromState(STATE.common ?? {});
   await renderEditor();
   renderLinks();
   // ObsidianUI Rectangular Text Reveal on the page title: play once per load,
@@ -2128,7 +2129,7 @@ $("delete-node").onclick = async () => {
 };
 
 /* ---- Common section (v1.9.7) ------------------------------------- */
-const COMMON_DEFAULT = { routingDns:"", bypassDns:"", secureDoh:"", fakedns:false, ipv6:"Auto", lanAccess:false, logLevel:"" };
+const COMMON_DEFAULT = { routing_dns:"", bypass_dns:"", secure_doh:"", fakedns:false, ipv6:"Auto", lan_access:false, log_level:"" };
 function commonCollect(){
   const dohPreset = $("c-secure-doh-preset").value;
   const doh = dohPreset === "custom" ? $("c-secure-doh").value.trim() : dohPreset;
@@ -2147,15 +2148,17 @@ function commonFromState(c){
   // Secure DoH: match a preset or flip to custom.
   const sel = $("c-secure-doh-preset");
   const opts = [...sel.options].map(o=>o.value);
-  if (opts.includes(c.secureDoh ?? "")) sel.value = c.secureDoh ?? "";
-  else { sel.value = "custom"; $("c-secure-doh").value = c.secureDoh ?? ""; }
+  // Server wire is snake_case (routing_dns…); accept camelCase too for safety.
+  const sd = c.secure_doh ?? c.secureDoh ?? "";
+  if (opts.includes(sd)) sel.value = sd;
+  else { sel.value = "custom"; $("c-secure-doh").value = sd; }
   $("c-secure-doh").classList.toggle("hidden", sel.value !== "custom");
-  $("c-routing-dns").value = c.routingDns ?? "";
-  $("c-bypass-dns").value = c.bypassDns ?? "";
+  $("c-routing-dns").value = c.routing_dns ?? c.routingDns ?? "";
+  $("c-bypass-dns").value = c.bypass_dns ?? c.bypassDns ?? "";
   segSet($("c-ipv6"), (c.ipv6 ?? "Auto").toLowerCase());
   segSet($("c-fakedns"), (c.fakedns ?? false) ? "on" : "off");
-  segSet($("c-lan"), (c.lanAccess ?? false) ? "on" : "off");
-  $("c-log-level").value = c.logLevel ?? "";
+  segSet($("c-lan"), (c.lan_access ?? c.lanAccess ?? false) ? "on" : "off");
+  $("c-log-level").value = c.log_level ?? c.logLevel ?? "";
 }
 function segSet(group, v){
   for (const b of group.querySelectorAll("button")) b.classList.toggle("on", b.dataset.v === v);
@@ -2175,67 +2178,84 @@ for (const id of ["c-secure-doh","c-routing-dns","c-bypass-dns","c-log-level"]) 
 }
 
 $("save").onclick = async () => {
+  // Non-destructive save (v1.9.7 UX round): the UI keeps every unrelated
+  // state — accordions, scroll, focus, Common field values — exactly as the
+  // user left it. Only data actually changed on the server is reflected back.
   $("save").disabled = true;
   setSaveState("saving", "Saving…");
   const keep = CURRENT;
+  // Snapshot UI state the re-render paths could disturb.
+  const openSections = new Set(
+    [...document.querySelectorAll("details.acc")].filter(d => d.open).map(d => d.id)
+  );
+  const active = document.activeElement;
   try {
-    // Collect outbound routing config from the UI. The server defaults to Off
-    // when the field is absent, so an unchanged panel never wipes a stored
-    // config that was set by another session or a direct KV edit.
     OUTBOUND = collectOutbound();
-    // Send the revision we loaded so a save racing another tab is refused
-    // instead of silently overwriting it. An old backend ignores the field;
-    // a state without rev (older session) omits it via undefined.
+    const common = commonCollect();
+    // No-op guard: when the collected state equals the persisted state, skip
+    // the network entirely — nothing to save, nothing to rebuild.
+    // Canonical comparison: sort object keys so key order never fakes a diff.
+    const canon = v => JSON.stringify(v, (_k, val) =>
+      val instanceof Object && !Array.isArray(val)
+        ? Object.keys(val).sort().reduce((o, k) => (o[k] = val[k], o), {})
+        : val);
+    const sameNodes = canon(NODES) === canon(STATE.nodes ?? []);
+    const sameOutbound = canon(OUTBOUND) === canon(STATE.outbound ?? {});
+    const sameCommon = canon(common) === canon(STATE.common ?? {});
+    const sameEnh = $("enh-reach").checked === !!STATE.enhancedReachability;
+    if (sameNodes && sameOutbound && sameCommon && sameEnh) {
+      DIRTY = false;
+      setSaveState("saved", "Already saved — nothing changed.");
+      return;
+    }
     const expectedRev = typeof STATE?.rev === "number" ? STATE.rev : undefined;
-    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES, outbound: OUTBOUND, enhanced_reachability: $("enh-reach").checked, common: commonCollect(), expected_rev: expectedRev }) });
+    const body = await send("nodes", { method: "PUT", body: JSON.stringify({ nodes: NODES, outbound: OUTBOUND, enhanced_reachability: $("enh-reach").checked, common, expected_rev: expectedRev }) });
     if (body && body.ok && body.state) {
       STATE = body.state;
       NODES = structuredClone(STATE.nodes);
       OUTBOUND = structuredClone(STATE.outbound ?? OUTBOUND);
       HEALTH = structuredClone(STATE.proxyHealth ?? HEALTH);
       $("enh-reach").checked = !!STATE.enhancedReachability;
-      commonFromState(STATE.common ?? {});
+      // Reflect only what changed. Node-editor sections rebuild only when the
+      // node list moved; Common fields only when the server normalized
+      // something the user typed.
+      if (!sameNodes) {
+        CURRENT = Math.min(keep, Math.max(0, NODES.length - 1));
+        renderNodeList();
+        await renderEditor();
+        renderClients();
+      }
+      if (!sameOutbound) renderOutbound();
+      if (!sameCommon) commonFromState(STATE.common ?? {});
       CURRENT = Math.min(keep, Math.max(0, NODES.length - 1));
-      renderNodeList();
-      renderOutbound();
-      renderCatalog();
-      await renderEditor();
-      renderClients();
-      showSection("advanced");
+      // Never touch accordion state here (no showSection): the user's
+      // open/closed layout is UI state and must survive every save.
       const loc = (OUTBOUND.catalogCountry || "AUTO").toUpperCase();
       const modeLabel = OUTBOUND.mode === "pool" ? "Proxy-IP Pool"
         : OUTBOUND.mode === "proxyIp" ? "Proxy IP — Custom"
         : OUTBOUND.mode === "nat64" ? "NAT64" : "Off";
       setSaveState("saved", `Saved — ${modeLabel} · ${loc}. Apps pick this up the next time they refresh.`);
       toast(`Saved — ${modeLabel} · ${loc}`);
-    } else {
       DIRTY = false;
-      await boot();
-      CURRENT = Math.min(keep, Math.max(0, NODES.length - 1));
-      renderNodeList();
-      await renderEditor();
-      showSection("advanced");
-      setSaveState("saved", "Saved. Apps pick this up the next time they refresh.");
-      toast("Saved");
+    } else {
+      // Refusal (validation/rev conflict): keep every edit on screen so the
+      // user can fix and retry; nothing is reverted and nothing re-opens.
+      setSaveState("error", body?.error ? `Couldn't save. ${shortReason(body.error)}` : "Couldn't save. Previous settings kept.");
+      toast(`Couldn't save`);
     }
   } catch (err) {
-    // Real reason, surfaced (spec 7): quota, revision conflict, validation —
-    // whatever the backend reported. Never a fake success, never a raw
-    // wasm/KV trace (errorWithDetails → shortReason + hidden details).
-    // UI reverts to the last persisted config (V24.5.8 spec 6): the panel
-    // re-renders from STATE, which still holds the server-confirmed values.
+    // Network failure: preserve edits + UI state, allow retry.
     setSaveState("error", `Couldn't save. ${shortReason(err.message)} Previous settings kept.`);
-    // Re-render from persisted state so selectors cannot silently keep the
-    // unsaved selection (e.g. UI=US while server=DE).
-    try {
-      OUTBOUND = structuredClone(STATE.outbound ?? {});
-      renderOutbound();
-      renderCatalog();
-    } catch { /* STATE unavailable — leave UI, error is already shown */ }
     toast(`Couldn't save — ${shortReason(err.message)}`);
-    setBusy($("save"), false, "Retry");
+  } finally {
+    // Restore the exact accordion + focus state, whatever the re-render did.
+    for (const d of document.querySelectorAll("details.acc")) d.open = openSections.has(d.id);
+    if (active && document.contains(active)) active.focus({ preventScroll: true });
+    setBusy($("save"), false, DIRTY ? "Retry" : "Save");
+    $("save").disabled = !DIRTY;
   }
 };
+
 
 // ---- export preview --------------------------------------------------------
 
@@ -2259,6 +2279,133 @@ $("export-run").onclick = async () => {
 $("export-copy").onclick = () => {
   const text = $("export-body").value;
   if (text) copy(text, "Export"); else toast("Nothing to copy yet");
+};
+
+
+// TEST HARNESS (v1.9.7 UX round): runs in the panel page context.
+// Returns [{id, pass, note}]. Pure DOM/state checks, no network mocking.
+window.__uxTests = async function(){
+  const results = [];
+  const t = async (id, fn) => {
+    try { await fn(); results.push({id, pass:true}); }
+    catch(e){ results.push({id, pass:false, note:String(e).slice(0,120)}); }
+  };
+  const $ = id => document.getElementById(id);
+  const acc = id => $(id);
+  const assert = (c,m)=>{ if(!c) throw new Error(m||"assert"); };
+
+  // TEST A: Advanced closed → save → stays closed.
+  await t("A", async ()=>{
+    acc("sec-advanced").open = false;
+    $("c-log-level").value = "debug";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    await $("save").onclick();
+    assert(!acc("sec-advanced").open, "advanced opened");
+    $("c-log-level").value = "";
+    $("c-log-level").dispatchEvent(new Event("change"));
+  });
+  // TEST B: Advanced open → save → stays open.
+  await t("B", async ()=>{
+    acc("sec-advanced").open = true;
+    $("c-log-level").value = "debug";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    await $("save").onclick();
+    assert(acc("sec-advanced").open, "advanced closed");
+    $("c-log-level").value = "";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    await $("save").onclick();
+  });
+  // TEST C: failed save — network error must not change accordion state and
+  // must keep the user's edit + dirty state. send() is patched to reject once.
+  await t("C", async ()=>{
+    const realSend = window.send ?? send;
+    window.send = async () => { throw new Error("simulated network failure"); };
+    const old = acc("sec-advanced").open;
+    $("c-log-level").value = "debug";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    try { await $("save").onclick(); } catch(e){}
+    window.send = realSend;
+    assert(acc("sec-advanced").open === old, "advanced state changed");
+    assert($("save-note").className.includes("sev-broken"), "no error shown");
+    assert($("c-log-level").value === "debug", "edit was reset");
+    // restore
+    $("c-log-level").value = "";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    await $("save").onclick();
+  });
+  // TEST D: validation failure — same guarantees (rev conflict simulation).
+  await t("D", async ()=>{
+    const realSend = window.send ?? send;
+    window.send = async () => { throw new Error("Settings changed elsewhere. Reload and try again."); };
+    const old = acc("sec-advanced").open;
+    $("c-routing-dns").value = "1.1.1.1";
+    $("c-routing-dns").dispatchEvent(new Event("change"));
+    try { await $("save").onclick(); } catch(e){}
+    window.send = realSend;
+    assert(acc("sec-advanced").open === old, "advanced state changed");
+    $("c-routing-dns").value = "";
+    $("c-routing-dns").dispatchEvent(new Event("change"));
+    await $("save").onclick();
+  });
+  // TEST E: save twice — accordion + state stable.
+  await t("E", async ()=>{
+    const adv = acc("sec-advanced").open;
+    $("c-log-level").value = "info";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    await $("save").onclick();
+    await $("save").onclick();
+    assert(acc("sec-advanced").open === adv, "accordion corrupted");
+    $("c-log-level").value = "";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    await $("save").onclick();
+  });
+  // TEST F: save with no changes — no network call, no UI rebuild.
+  await t("F", async ()=>{
+    let calls = 0;
+    const realSend = window.send ?? send;
+    window.send = async (...a) => { calls++; return realSend(...a); };
+    const dom = document.querySelector("#nodelist").innerHTML;
+    await $("save").onclick();
+    window.send = realSend;
+    assert(calls === 0, "network call made on no-op save");
+    assert(document.querySelector("#nodelist").innerHTML === dom, "UI rebuilt on no-op");
+  });
+  // TEST G: multiple fields changed → save → values update, UI state preserved.
+  await t("G", async ()=>{
+    $("c-routing-dns").value = "1.1.1.1";
+    $("c-routing-dns").dispatchEvent(new Event("change"));
+    $("c-bypass-dns").value = "178.22.122.100";
+    $("c-bypass-dns").dispatchEvent(new Event("change"));
+    const lanBtn = $("c-lan").querySelector('[data-v="on"]');
+    lanBtn.click();
+    const adv = acc("sec-advanced").open;
+    await $("save").onclick();
+    assert($("c-routing-dns").value === "1.1.1.1", "routing dns lost");
+    assert($("c-bypass-dns").value === "178.22.122.100", "bypass dns lost");
+    assert(acc("sec-advanced").open === adv, "accordion moved");
+    // restore defaults
+    $("c-routing-dns").value = "";
+    $("c-routing-dns").dispatchEvent(new Event("change"));
+    $("c-bypass-dns").value = "";
+    $("c-bypass-dns").dispatchEvent(new Event("change"));
+    $("c-lan").querySelector('[data-v="off"]').click();
+    await $("save").onclick();
+  });
+  // TEST H: values persist server-side after save (fresh state doc matches).
+  await t("H", async ()=>{
+    $("c-log-level").value = "info";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    await $("save").onclick();
+    await new Promise(r => setTimeout(r, 400)); // settle any queued writes
+    const st = await send("state");
+    const c = st.state ? st.state.common : st.common;
+    assert(c.log_level === "info", "not persisted");
+    $("c-log-level").value = "";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    await $("save").onclick();
+    await new Promise(r => setTimeout(r, 400));
+  });
+  return results;
 };
 
 boot();
