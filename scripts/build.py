@@ -276,6 +276,11 @@ def check_panel_css() -> None:
                 f"({css.count('{')} open vs {css.count('}')} close)"
             )
 
+    ids = re.findall(r'\bid="([\w-]+)"', html)
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise SystemExit(f"{path}: duplicate element id(s): {', '.join(dupes)}")
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the Worker module set.")
