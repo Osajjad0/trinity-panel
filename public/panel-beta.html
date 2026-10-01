@@ -174,7 +174,7 @@ p{margin:0 0 .7rem}
     border-color:var(--border-strong);
   }
 }
-.row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+.row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;position:relative}
 .spread{display:flex;justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap}
 button{
   font:inherit; padding:.45rem .8rem; border-radius:8px; cursor:pointer;
@@ -469,12 +469,18 @@ details.inner-acc[open]>summary{color:var(--text)}
 /* In-section grouping labels (UX round §5): quiet small-caps separators. */
 .group-label{font-size:.72rem; letter-spacing:.08em; text-transform:uppercase;
   color:var(--text-muted); font-weight:700; margin:.15rem 0 .55rem}
-/* Save status: a real state chip — color AND word AND glyph (never color alone). */
-#save-note{max-width:40ch; text-align:right; overflow-wrap:anywhere;
+/* Save status: a real state chip — color AND word AND glyph (never color alone).
+   Phase 1.x fix: lives OUT of the action-row flow, anchored under the action
+   group (position:absolute within the row, right-aligned) so appearing/
+   disappearing never pushes Save/Theme/Sign out. Right-edge anchor (not left)
+   so growth extends leftward, never off-screen; wraps within 40ch. */
+#save-note{position:absolute; right:0; top:calc(100% + 4px); max-width:min(40ch,100%);
+  text-align:right; overflow-wrap:anywhere; z-index:30;
   font-size:.82rem; padding:.2rem .6rem; border-radius:999px;
   border:1px solid transparent; transition:color var(--motion-fast) var(--ease-standard),
-  border-color var(--motion-fast) var(--ease-standard), background var(--motion-fast) var(--ease-standard)}
-#save-note:empty{padding:0; border-color:transparent}
+  border-color var(--motion-fast) var(--ease-standard), background var(--motion-fast) var(--ease-standard),
+  opacity 140ms var(--ease-standard), transform 140ms var(--ease-standard)}
+#save-note:empty{padding:0; border-color:transparent; opacity:0; transform:translateY(-3px); pointer-events:none}
 #save-note.sev-warning{color:var(--warning); border-color:color-mix(in srgb, var(--warning) 38%, transparent);
   background:color-mix(in srgb, var(--warning) 10%, transparent)}
 #save-note.sev-error{color:var(--danger); border-color:color-mix(in srgb, var(--danger) 40%, transparent);
