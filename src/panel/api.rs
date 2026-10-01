@@ -126,6 +126,10 @@ pub struct SaveRequest {
     /// from old clients, whose saves behave exactly as they always did.
     #[serde(default)]
     pub expected_rev: Option<u32>,
+    /// Common-section preferences. Absent from pre-1.9.7 clients; defaults
+    /// keep their saves byte-compatible.
+    #[serde(default)]
+    pub common: super::store::CommonSettings,
 }
 
 /// Refusal shown when a save raced another save.
@@ -262,6 +266,8 @@ pub struct State {
     pub country_quality: Option<
         std::collections::BTreeMap<String, crate::catalog::CountryQuality>,
     >,
+    /// Common-section preferences (v1.9.7).
+    pub common: super::store::CommonSettings,
 }
 
 /// Compact fallback view for the panel.
@@ -467,6 +473,7 @@ pub fn state(
         fallback,
         country_quality,
         rev: settings.rev,
+        common: settings.common.clone(),
     }
 }
 
@@ -474,7 +481,13 @@ fn client_view(nodes: &[Node], client: ClientTarget, sub_base: &str, enhanced: b
     let slug = bundle::client_slug(client);
     // The share-link bundle is what a subscription URL returns, so its skip
     // list is the honest answer to "what will this app actually receive".
-    let links = bundle::render(nodes, client, Shape::ShareLinks, enhanced);
+    let links = bundle::render(
+        nodes,
+        client,
+        Shape::ShareLinks,
+        enhanced,
+        &crate::panel::store::CommonSettings::default(),
+    );
     let (included, skipped) = links
         .as_ref()
         .map_or_else(|_| (0, Vec::new()), |b| (b.included, b.skipped.clone()));
@@ -486,7 +499,7 @@ fn client_view(nodes: &[Node], client: ClientTarget, sub_base: &str, enhanced: b
     };
     // Offered only when the emitter really produces a document for this
     // client; a download link that returns the decoy is worse than no link.
-    let config = bundle::render(nodes, client, Shape::FullConfig, enhanced)
+    let config = bundle::render(nodes, client, Shape::FullConfig, enhanced, &crate::panel::store::CommonSettings::default())
         .ok()
         .map(|b| format!("{sub_base}/{slug}.{}", extension(&b.filename)));
 
@@ -808,6 +821,7 @@ mod tests {
             outbound: OutboundConfig::default(),
             enhanced_reachability: false,
             rev: 4,
+            common: Default::default(),
         }
     }
 
@@ -1278,6 +1292,7 @@ mod tests {
             outbound: outbound_with_country("US"),
             enhanced_reachability: false,
             rev: 7,
+            common: Default::default(),
         };
         let back = Settings::parse(&settings.to_json().unwrap()).unwrap();
         assert_eq!(back.outbound.catalog_country, "US");

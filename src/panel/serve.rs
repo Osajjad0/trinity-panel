@@ -170,6 +170,7 @@ pub async fn subscription(req: &Request, env: &Env, rest: &str) -> Result<Respon
         target,
         shape,
         settings.enhanced_reachability,
+        &settings.common,
     ) else {
         // Nothing this client can use. Rendering the decoy keeps the endpoint
         // uninformative; the panel is where a user is told why.
@@ -445,6 +446,11 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
     if let Err(message) = api::validate_outbound(&body.outbound) {
         return refuse(&message);
     }
+    let mut common = body.common.clone();
+    common.normalize();
+    if let Err(message) = common.validate() {
+        return refuse(&message);
+    }
 
     // Optimistic concurrency: compare what the client loaded against what is
     // stored now. A mismatch means another tab or session saved first; their
@@ -462,6 +468,7 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         outbound: body.outbound,
         enhanced_reachability: body.enhanced_reachability,
         rev: new_rev,
+        common,
     };
     // No-op guard: when the incoming content equals the stored content (rev
     // excluded), nothing was changed and no store is written — identical saves
@@ -469,6 +476,7 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
     if stored.nodes == settings.nodes
         && stored.outbound == settings.outbound
         && stored.enhanced_reachability == settings.enhanced_reachability
+        && stored.common == settings.common
     {
         let sub_base = format!("https://{host}{}", var(env, "SUB_PATH"));
         let xhttp_path = var(env, "XHTTP_PATH");
@@ -607,6 +615,7 @@ async fn export(req: &Request, env: &Env) -> Result<Response> {
         target,
         shape,
         settings.enhanced_reachability,
+        &settings.common,
     ) {
         Ok(b) => json(&Export {
             body: b.body,

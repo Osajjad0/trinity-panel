@@ -44,6 +44,57 @@ pub const KEY: &str = "panel:settings";
 /// file that half-loads is worse than one that is recognised as old.
 pub const VERSION: u32 = 1;
 
+/// Shared client-configuration preferences (the panel's "Common" section).
+///
+/// None of this is read by the proxy data path: these fields shape the
+/// *generated client configs* (Xray / sing-box / Mihomo) and nothing else, so
+/// the common case — a relay session — pays zero storage reads for them. They
+/// ride the existing settings document and its save path.
+///
+/// Empty strings mean "use the built-in default", which keeps stored documents
+/// forward- and backward-compatible without migrations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommonSettings {
+    /// Primary resolver written to the generated DNS block (IP, DoH or DoT
+    /// URL, or `localhost`). Empty = the built-in default.
+    #[serde(default)]
+    pub routing_dns: String,
+    /// Second resolver dedicated to sanctioned domains; generated configs add
+    /// a domain-filtered rule for it. Empty = no bypass entry.
+    #[serde(default)]
+    pub bypass_dns: String,
+    /// DNS-over-HTTPS primary (URL). Empty = the built-in AdGuard DoH.
+    #[serde(default)]
+    pub secure_doh: String,
+    /// Xray fakedns (client-side). Off by default: opt-in, can confuse apps
+    /// that pin IPs.
+    #[serde(default)]
+    pub fakedns: bool,
+    /// IPv6 preference for client-side resolution. `Auto` preserves today's
+    /// behaviour.
+    #[serde(default)]
+    pub ipv6: Ipv6Mode,
+    /// Expose the client's inbound to LAN peers (`0.0.0.0` listen). Off keeps
+    /// today's loopback-only inbound.
+    #[serde(default)]
+    pub lan_access: bool,
+    /// Xray/sing-box log level for generated configs. Empty = `warning`.
+    #[serde(default)]
+    pub log_level: String,
+}
+
+/// IPv6 handling in generated client configs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Ipv6Mode {
+    /// Leave the client core's own strategy in place (`AsIs` / untouched).
+    #[default]
+    Auto,
+    /// Client resolves and prefers IPv6 where the system has it.
+    Prefer,
+    /// Force IPv4 resolution only.
+    Off,
+}
+
 /// Everything the panel persists.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -67,11 +118,107 @@ pub struct Settings {
     /// succeeds.
     #[serde(default)]
     pub rev: u32,
+    /// Shared client-config preferences. Absent in pre-1.9.7 documents; serde
+    /// default fills it, so old documents load unchanged.
+    #[serde(default)]
+    pub common: CommonSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { version: VERSION, nodes: Vec::new(), outbound: OutboundConfig::default(), enhanced_reachability: false, rev: 0 }
+        Self {
+            version: VERSION,
+            nodes: Vec::new(),
+            outbound: OutboundConfig::default(),
+            enhanced_reachability: false,
+            rev: 0,
+            common: CommonSettings::default(),
+        }
+    }
+}
+
+impl CommonSettings {
+    /// Built-in DoH primary when none is configured.
+    pub const DEFAULT_DOH: &'static str = "https://dns.adguard-dns.com/dns-query";
+    /// Built-in routing resolver when none is configured.
+    pub const DEFAULT_ROUTING_DNS: &'static str = "8.8.8.8";
+    /// Known-good preset resolvers (plain IP form).
+    pub const PRESETS: &'static [&'static str] = &[
+        "8.8.8.8",
+        "8.8.4.4",
+        "1.1.1.1",
+        "1.0.0.1",
+        "94.140.14.14",
+        "94.140.15.15",
+        "localhost",
+    ];
+    /// Known-good DoH presets.
+    pub const DOH_PRESETS: &'static [&'static str] = &[
+        "https://dns.adguard-dns.com/dns-query",
+        "https://cloudflare-dns.com/dns-query",
+        "https://dns.google/dns-query",
+    ];
+
+    /// Normalise in place: trim whitespace, drop empty strings to "", clamp
+    /// unknown log levels. Idempotent.
+    pub fn normalize(&mut self) {
+        let trim = |s: &mut String| {
+            *s = s.trim().to_owned();
+        };
+        trim(&mut self.routing_dns);
+        trim(&mut self.bypass_dns);
+        trim(&mut self.secure_doh);
+        trim(&mut self.log_level);
+        if !matches!(
+            self.log_level.as_str(),
+            "" | "debug" | "info" | "warning" | "error" | "none"
+        ) {
+            self.log_level.clear();
+        }
+    }
+
+    /// Validate after normalisation. `Err` carries a user-presentable reason
+    /// naming the offending field. Empty values are always valid (defaults).
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.routing_dns.is_empty() {
+            Self::validate_resolver(&self.routing_dns, "Routing DNS")?;
+        }
+        if !self.bypass_dns.is_empty() {
+            Self::validate_resolver(&self.bypass_dns, "Bypass DNS")?;
+        }
+        if !self.secure_doh.is_empty() {
+            Self::validate_doh(&self.secure_doh)?;
+        }
+        Ok(())
+    }
+
+    /// IP literal, `localhost`, or a `dns://`-style URL (DoH/DoT accepted by
+    /// the cores). Rejects anything else with a precise message.
+    fn validate_resolver(value: &str, label: &str) -> Result<(), String> {
+        if value.eq_ignore_ascii_case("localhost") {
+            return Ok(());
+        }
+        if value.parse::<std::net::IpAddr>().is_ok() {
+            return Ok(());
+        }
+        if (value.starts_with("https://") || value.starts_with("hickory://") || value.starts_with("tcp://") || value.starts_with("udp://"))
+            && value.len() > 8
+        {
+            return Ok(());
+        }
+        Err(format!("{label}: not an IP, `localhost`, or a valid DoH/DoT/TCP/UDP DNS URL"))
+    }
+
+    /// DoH URLs must be https and carry a host; cores require both.
+    fn validate_doh(value: &str) -> Result<(), String> {
+        let rest = value
+            .strip_prefix("https://")
+            .ok_or("Secure DNS Upstream: must be an https:// DoH URL")?;
+        let host = rest.split('/').next().unwrap_or_default();
+        if host.is_empty() || host.contains('@') {
+            return Err("Secure DNS Upstream: URL has no usable host".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -179,7 +326,14 @@ impl Settings {
             }
         }
 
-        Self { version: VERSION, nodes, outbound: OutboundConfig::default(), enhanced_reachability: false, rev: 0 }
+        Self {
+            version: VERSION,
+            nodes,
+            outbound: OutboundConfig::default(),
+            enhanced_reachability: false,
+            rev: 0,
+            common: CommonSettings::default(),
+        }
     }
 
     /// Parse a stored document, rejecting one from a future schema.
@@ -362,5 +516,58 @@ mod tests {
         let tag = s.nodes[0].tag.clone();
         assert!(s.node(&tag).is_some());
         assert!(s.node("no such node").is_none());
+    }
+}
+
+#[cfg(test)]
+mod common_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_trims_and_clamps() {
+        let mut c = CommonSettings {
+            routing_dns: "  1.1.1.1  ".into(),
+            secure_doh: " https://example.com/dns-query ".into(),
+            log_level: "verbose".into(), // unknown -> ""
+            ..Default::default()
+        };
+        c.normalize();
+        assert_eq!(c.routing_dns, "1.1.1.1");
+        assert_eq!(c.secure_doh, "https://example.com/dns-query");
+        assert_eq!(c.log_level, "");
+    }
+
+    #[test]
+    fn validation_accepts_every_documented_form() {
+        for good in ["8.8.8.8", "94.140.14.14", "2001:4860:4860::8888", "localhost",
+                     "https://dns.google/dns-query", "tcp://9.9.9.9:53"] {
+            let c = CommonSettings { routing_dns: good.into(), ..Default::default() };
+            assert!(c.validate().is_ok(), "{good} rejected");
+        }
+        for bad in ["dns.example", "8.8.8.8.8", "http://insecure/dns", ""] {
+            if bad.is_empty() { continue; }
+            let c = CommonSettings { routing_dns: bad.into(), ..Default::default() };
+            assert!(c.validate().is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn doh_validation_requires_https_with_host() {
+        let ok = CommonSettings { secure_doh: "https://dns.adguard-dns.com/dns-query".into(), ..Default::default() };
+        assert!(ok.validate().is_ok());
+        let no_host = CommonSettings { secure_doh: "https:///dns-query".into(), ..Default::default() };
+        assert!(no_host.validate().is_err());
+        let plain = CommonSettings { secure_doh: "http://dns.example/query".into(), ..Default::default() };
+        assert!(plain.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_are_production_safe() {
+        let c = CommonSettings::default();
+        assert!(!c.fakedns, "fakedns must stay opt-in");
+        assert!(!c.lan_access, "LAN exposure must stay off by default");
+        assert!(matches!(c.ipv6, Ipv6Mode::Auto));
+        assert_eq!(c.log_level, "");
+        assert_eq!(CommonSettings::DEFAULT_DOH, "https://dns.adguard-dns.com/dns-query");
     }
 }

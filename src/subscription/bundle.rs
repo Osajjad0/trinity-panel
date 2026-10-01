@@ -60,12 +60,18 @@ pub struct Bundle {
 /// # Errors
 /// [`EmitError`] only when the whole bundle cannot be produced — a single node
 /// failing is reported in [`Bundle::skipped`] rather than failing the request.
-pub fn render(nodes: &[Node], target: ClientTarget, shape: Shape, enhanced: bool) -> Result<Bundle, EmitError> {
+pub fn render(
+    nodes: &[Node],
+    target: ClientTarget,
+    shape: Shape,
+    enhanced: bool,
+    common: &crate::panel::store::CommonSettings,
+) -> Result<Bundle, EmitError> {
     match shape {
         Shape::ShareLinks | Shape::ShareLinksPlain => {
             Ok(share_links(nodes, target, shape == Shape::ShareLinks, enhanced))
         }
-        Shape::FullConfig => full_config(nodes, target, enhanced),
+        Shape::FullConfig => full_config(nodes, target, enhanced, common),
     }
 }
 
@@ -96,7 +102,12 @@ fn share_links(nodes: &[Node], target: ClientTarget, encode: bool, enhanced: boo
     }
 }
 
-fn full_config(nodes: &[Node], target: ClientTarget, enhanced: bool) -> Result<Bundle, EmitError> {
+fn full_config(
+    nodes: &[Node],
+    target: ClientTarget,
+    enhanced: bool,
+    common: &crate::panel::store::CommonSettings,
+) -> Result<Bundle, EmitError> {
     let mut skipped = Vec::new();
     let mut usable = Vec::new();
 
@@ -118,9 +129,9 @@ fn full_config(nodes: &[Node], target: ClientTarget, enhanced: bool) -> Result<B
     // concatenation of single-node ones: it needs one outbound list, one
     // selector group, and one route block referring to them.
     let emitted = match target.core() {
-        Core::Xray => xray::emit_nodes(&usable, target, enhanced)?,
-        Core::SingBox => singbox::emit_nodes(&usable, target, enhanced)?,
-        Core::Mihomo => mihomo::emit_nodes(&usable, target, enhanced)?,
+        Core::Xray => xray::emit_nodes(&usable, target, enhanced, common)?,
+        Core::SingBox => singbox::emit_nodes(&usable, target, enhanced, common)?,
+        Core::Mihomo => mihomo::emit_nodes(&usable, target, enhanced, common)?,
     };
 
     let format = emitted.format;
@@ -252,9 +263,9 @@ mod tests {
     #[test]
     fn share_links_are_base64_by_default_and_plain_on_request() {
         let nodes = [xhttp_node("a"), xhttp_node("b")];
-        let encoded = render(&nodes, ClientTarget::V2rayN, Shape::ShareLinks, false).expect("renders");
+        let encoded = render(&nodes, ClientTarget::V2rayN, Shape::ShareLinks, false, &Default::default()).expect("renders");
         let plain =
-            render(&nodes, ClientTarget::V2rayN, Shape::ShareLinksPlain, false).expect("renders");
+            render(&nodes, ClientTarget::V2rayN, Shape::ShareLinksPlain, false, &Default::default()).expect("renders");
 
         assert_eq!(encoded.included, 2);
         assert_eq!(plain.body.lines().count(), 2);
@@ -272,7 +283,7 @@ mod tests {
         // The behaviour that matters: the other nodes still arrive, and the
         // user is told what was left out rather than left guessing.
         let nodes = [xhttp_node("xhttp-one")];
-        let bundle = render(&nodes, ClientTarget::SingBoxUpstream, Shape::ShareLinks, false)
+        let bundle = render(&nodes, ClientTarget::SingBoxUpstream, Shape::ShareLinks, false, &Default::default())
             .expect("renders");
         assert_eq!(bundle.included, 0);
         assert_eq!(bundle.skipped.len(), 1);
@@ -284,7 +295,7 @@ mod tests {
     fn a_client_that_supports_xhttp_gets_the_node() {
         for target in [ClientTarget::V2rayN, ClientTarget::Hiddify, ClientTarget::Mihomo] {
             let bundle =
-                render(&[xhttp_node("n")], target, Shape::ShareLinks, false).expect("renders");
+                render(&[xhttp_node("n")], target, Shape::ShareLinks, false, &Default::default()).expect("renders");
             assert_eq!(bundle.included, 1, "{}", target.name());
             assert!(bundle.skipped.is_empty(), "{}", target.name());
         }
@@ -294,19 +305,19 @@ mod tests {
     fn a_full_config_is_refused_when_nothing_translates() {
         // Distinct from an empty bundle: there is nothing to import, so a
         // client should be told rather than handed an empty document.
-        let err = render(&[xhttp_node("n")], ClientTarget::SingBoxUpstream, Shape::FullConfig, false)
+        let err = render(&[xhttp_node("n")], ClientTarget::SingBoxUpstream, Shape::FullConfig, false, &Default::default())
             .expect_err("must refuse");
         assert!(matches!(err, EmitError::Refused(_)));
     }
 
     #[test]
     fn full_configs_carry_the_right_content_type_and_extension() {
-        let xray = render(&[xhttp_node("n")], ClientTarget::V2rayN, Shape::FullConfig, false)
+        let xray = render(&[xhttp_node("n")], ClientTarget::V2rayN, Shape::FullConfig, false, &Default::default())
             .expect("renders");
         assert_eq!(xray.filename, "v2rayn.json");
         assert!(xray.content_type.contains("json"));
 
-        let clash = render(&[xhttp_node("n")], ClientTarget::Mihomo, Shape::FullConfig, false)
+        let clash = render(&[xhttp_node("n")], ClientTarget::Mihomo, Shape::FullConfig, false, &Default::default())
             .expect("renders");
         assert_eq!(clash.filename, "mihomo--clash-meta.yaml");
     }

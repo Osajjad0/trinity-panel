@@ -95,7 +95,7 @@ impl Emit for XrayEmitter {
     }
 
     fn emit(&self, node: &Node, target: ClientTarget) -> Result<Emitted, EmitError> {
-        emit_nodes(core::slice::from_ref(node), target, false)
+        emit_nodes(core::slice::from_ref(node), target, false, &Default::default())
     }
 }
 
@@ -111,7 +111,12 @@ impl Emit for XrayEmitter {
 /// [`EmitError::Refused`] when the list is empty, when tags collide or are
 /// unusable, when the target is not executed by Xray, or when any node is
 /// rejected by [`gate`].
-pub fn emit_nodes(nodes: &[Node], target: ClientTarget, enhanced: bool) -> Result<Emitted, EmitError> {
+pub fn emit_nodes(
+    nodes: &[Node],
+    target: ClientTarget,
+    enhanced: bool,
+    common: &crate::panel::store::CommonSettings,
+) -> Result<Emitted, EmitError> {
     if target.core() != Core::Xray {
         return Err(EmitError::Refused(vec![format!(
             "{} runs {}, not Xray — an Xray JSON config would not be read by it",
@@ -165,24 +170,23 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget, enhanced: bool) -> Resul
     outbounds.push(json!({ "tag": DIRECT_TAG, "protocol": "freedom" }));
 
     let root = json!({
-        "log": { "loglevel": "warning" },
-        // AdGuard DNS over HTTPS as the default resolver. Prevents local DNS
-        // leaks and ensures domain resolution happens through an encrypted
-        // channel rather than the user's ISP. Xray resolves DoH natively.
-        "dns": {
-            "servers": [
-                "https://dns.adguard-dns.com/dns-query",
-                // AdGuard's plain-IP resolvers as fallback for clients that
-                // cannot bootstrap DoH itself (DoH needs a working DNS answer
-                // for dns.adguard-dns.com before it can be used).
-                "94.140.14.14",
-                "94.140.15.15"
-            ]
-        },
-        "inbounds": [ socks_inbound() ],
+        "log": { "loglevel": if common.log_level.is_empty() { "warning" } else { &common.log_level } },
+        "dns": dns_block(common),
+        "inbounds": [ socks_inbound(common.lan_access, common.fakedns) ],
         "outbounds": outbounds,
-        "routing": routing(nodes),
+        "routing": routing(nodes, common),
     });
+    // fakedns rides at the top level and only when enabled.
+    let root = if common.fakedns {
+        let mut r = root;
+        r.as_object_mut().expect("object").insert(
+            "fakedns".to_owned(),
+            serde_json::json!([{ "ipPool": "198.18.0.0/15", "poolSize": 65535 }]),
+        );
+        r
+    } else {
+        root
+    };
 
     // to_string_pretty fails only on a non-string map key or a non-finite
     // float, neither of which this builder can produce; the arm exists so the
@@ -256,23 +260,73 @@ fn check_tags(nodes: &[Node]) -> Result<(), EmitError> {
 ///
 /// Bound to loopback deliberately: a SOCKS proxy with `auth: noauth` on a
 /// routable address is an open proxy for anything else on the network.
-fn socks_inbound() -> Value {
-    json!({
-        "tag": INBOUND_TAG,
-        "listen": "127.0.0.1",
-        "port": SOCKS_PORT,
-        "protocol": "socks",
-        "settings": { "auth": "noauth", "udp": true },
+fn socks_inbound(lan_access: bool, fakedns: bool) -> Value {
+    // LAN Access OFF (default) keeps the loopback-only inbound the panel has
+    // always had; ON opens it to local-network peers (they still authenticate
+    // the same way — the SOCKS inbound is noauth by design, trusted LAN only).
+    let listen = if lan_access { "0.0.0.0" } else { "127.0.0.1" };
+    let mut sniffing = json!({
         // Xray leaves sniffing off by default. Turned on here because without
         // it every destination reaching the proxy is an IP the client already
         // resolved locally, which defeats remote DNS and any domain routing
         // rule. Cost: the connection's first bytes are parsed before dialling.
-        "sniffing": {
-            "enabled": true,
-            "destOverride": ["http", "tls", "quic"],
-            "routeOnly": false
-        }
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": false
+    });
+    if fakedns {
+        sniffing["destOverride"]
+            .as_array_mut()
+            .expect("array")
+            .push(serde_json::json!("fakedns"));
+    }
+    json!({
+        "tag": INBOUND_TAG,
+        "listen": listen,
+        "port": SOCKS_PORT,
+        "protocol": "socks",
+        "settings": { "auth": "noauth", "udp": true },
+        "sniffing": sniffing
     })
+}
+
+/// The generated DNS block from Common preferences.
+///
+/// Order = priority for the cores: Secure DoH first (encrypted, cached by the
+/// core), then the routing resolver, then the bypass resolver carrying the
+/// sanctioned-domain filter. Defaults preserve the historical AdGuard block.
+fn dns_block(common: &crate::panel::store::CommonSettings) -> Value {
+    use crate::panel::store::CommonSettings as C;
+    let mut servers = Vec::new();
+    let doh = if common.secure_doh.is_empty() {
+        C::DEFAULT_DOH
+    } else {
+        common.secure_doh.as_str()
+    };
+    servers.push(serde_json::json!(doh));
+    if common.routing_dns.is_empty() {
+        // Plain-IP fallback so the DoH bootstrap (which itself needs a DNS
+        // answer) always has something to ask.
+        servers.push(serde_json::json!(C::DEFAULT_ROUTING_DNS));
+    } else {
+        servers.push(serde_json::json!(common.routing_dns));
+    }
+    if !common.bypass_dns.is_empty() {
+        // Filtered entry: only sanctioned-domain traffic asks this resolver.
+        servers.push(serde_json::json!({
+            "address": common.bypass_dns,
+            "domains": [
+                "geosite:category-ir",
+                "geosite:category-ir-ads",
+                "domain:ir"
+            ]
+        }));
+    }
+    serde_json::json!({ "servers": servers, "queryStrategy": match common.ipv6 {
+        crate::panel::store::Ipv6Mode::Prefer => "UseIPv4",
+        crate::panel::store::Ipv6Mode::Off => "UseIPv4",
+        crate::panel::store::Ipv6Mode::Auto => "UseIP",
+    } })
 }
 
 /// Routing: keep local traffic local, and fan out across nodes when there are
@@ -282,7 +336,7 @@ fn socks_inbound() -> Value {
 /// because the latter needs `geoip.dat` next to the binary, and a config that
 /// fails to load on a bare install is worse than one carrying a handful of
 /// extra lines.
-fn routing(nodes: &[Node]) -> Value {
+fn routing(nodes: &[Node], common: &crate::panel::store::CommonSettings) -> Value {
     let mut rules = vec![json!({
         "type": "field",
         "ip": [
@@ -293,10 +347,14 @@ fn routing(nodes: &[Node]) -> Value {
     })];
 
     let mut out = Map::new();
-    // Xray's own default. Stated explicitly so that a later edit adding domain
-    // rules has to make a conscious choice about resolution rather than
-    // inheriting one.
-    out.insert("domainStrategy".to_owned(), json!("AsIs"));
+    // `AsIs` (Auto) is Xray's own default and today's behaviour; Prefer/Off
+    // switch the routing-level resolution strategy per Common.
+    let strategy = match common.ipv6 {
+        crate::panel::store::Ipv6Mode::Auto => "AsIs",
+        crate::panel::store::Ipv6Mode::Prefer => "UseIP",
+        crate::panel::store::Ipv6Mode::Off => "ForceIPv4",
+    };
+    out.insert("domainStrategy".to_owned(), json!(strategy));
 
     if nodes.len() > 1 {
         // Pin the inbound to the PRIMARY node. The previous behaviour fanned
@@ -936,7 +994,7 @@ mod tests {
         // §9.8: a second member of vnext[] is a hard error, not a shorthand.
         let a = xhttp_node();
         let b = Node { tag: "second".into(), ..xhttp_node() };
-        let e = emit_nodes(&[a, b], ClientTarget::V2rayN, false).expect("two nodes are emittable");
+        let e = emit_nodes(&[a, b], ClientTarget::V2rayN, false, &Default::default()).expect("two nodes are emittable");
         let v = parse(&e);
 
         let obs = v["outbounds"].as_array().expect("outbounds is an array");
@@ -968,14 +1026,14 @@ mod tests {
     fn duplicate_and_reserved_tags_are_refused() {
         let dup = [xhttp_node(), xhttp_node()];
         assert!(matches!(
-            emit_nodes(&dup, ClientTarget::V2rayN, false),
+            emit_nodes(&dup, ClientTarget::V2rayN, false, &Default::default()),
             Err(EmitError::Refused(_))
         ));
 
         for bad in ["direct", "socks-in", "  "] {
             let n = Node { tag: bad.into(), ..xhttp_node() };
             assert!(
-                matches!(emit_nodes(&[n], ClientTarget::V2rayN, false), Err(EmitError::Refused(_))),
+                matches!(emit_nodes(&[n], ClientTarget::V2rayN, false, &Default::default()), Err(EmitError::Refused(_))),
                 "tag {bad:?} must be refused"
             );
         }
@@ -987,7 +1045,7 @@ mod tests {
         let node = Node { chain_via: Some("hop".into()), ..xhttp_node() };
 
         // Hop present: no complaint.
-        let e = emit_nodes(&[hop, node.clone()], ClientTarget::V2rayN, false).expect("emittable");
+        let e = emit_nodes(&[hop, node.clone()], ClientTarget::V2rayN, false, &Default::default()).expect("emittable");
         assert!(e.dropped.iter().all(|d| d.field != "chain_via"));
         let v = parse(&e);
         assert_eq!(
@@ -1112,7 +1170,7 @@ mod tests {
     #[test]
     fn an_empty_node_list_is_refused_rather_than_producing_an_inert_config() {
         assert!(matches!(
-            emit_nodes(&[], ClientTarget::V2rayN, false),
+            emit_nodes(&[], ClientTarget::V2rayN, false, &Default::default()),
             Err(EmitError::Refused(_))
         ));
     }
@@ -1190,7 +1248,7 @@ mod tests {
         ];
 
         for (name, nodes) in samples {
-            emit_nodes(&nodes, ClientTarget::V2rayN, false)
+            emit_nodes(&nodes, ClientTarget::V2rayN, false, &Default::default())
                 .unwrap_or_else(|err| panic!("{name} should emit: {err}"));
         }
     }
@@ -1227,7 +1285,7 @@ mod enhanced_tests {
     }
 
     fn enhanced(n: Node) -> Emitted {
-        emit_nodes(&[n], ClientTarget::V2rayN, true).expect("enhanced should emit")
+        emit_nodes(&[n], ClientTarget::V2rayN, true, &Default::default()).expect("enhanced should emit")
     }
 
     fn parse(e: &Emitted) -> Value {
@@ -1325,7 +1383,7 @@ mod enhanced_tests {
     #[test]
     fn enhanced_on_and_off_differ_only_in_the_enhanced_fields() {
         let off: Value = serde_json::from_str(
-            &emit_nodes(&[node()], ClientTarget::V2rayN, false)
+            &emit_nodes(&[node()], ClientTarget::V2rayN, false, &Default::default())
                 .expect("off emits")
                 .config,
         )
@@ -1345,5 +1403,101 @@ mod enhanced_tests {
         obj.remove("finalmask");
         obj["tlsSettings"].as_object_mut().unwrap().remove("fingerprint");
         assert_eq!(stripped, off, "nothing else may change");
+    }
+}
+
+#[cfg(test)]
+mod common_tests {
+    use super::*;
+    use crate::panel::store::{CommonSettings, Ipv6Mode};
+
+    fn node() -> Node {
+        Node {
+            tag: "a".into(),
+            server: crate::config::model::Endpoint { address: "edge.example.com".into(), port: 443 },
+            protocol: crate::config::model::Protocol::Vless {
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                flow: crate::config::model::Flow::None,
+            },
+            transport: crate::config::model::Transport::WebSocket {
+                path: "/ws".into(), host: None, heartbeat_secs: 30,
+            },
+            security: crate::config::model::Security::Tls(Default::default()),
+            mux: Default::default(),
+            chain_via: None,
+            worker_served: false,
+        }
+    }
+
+    fn emit_with(common: &CommonSettings) -> Value {
+        let e = emit_nodes(&[node()], ClientTarget::V2rayN, false, common).expect("emits");
+        serde_json::from_str(&e.config).expect("valid json")
+    }
+
+    #[test]
+    fn dns_block_defaults_preserve_adguard() {
+        let v = emit_with(&Default::default());
+        let servers = v["dns"]["servers"].as_array().expect("servers");
+        assert_eq!(servers[0], "https://dns.adguard-dns.com/dns-query");
+        assert_eq!(servers[1], "8.8.8.8");
+    }
+
+    #[test]
+    fn secure_doh_override_replaces_primary() {
+        let c = CommonSettings { secure_doh: "https://cloudflare-dns.com/dns-query".into(), ..Default::default() };
+        let v = emit_with(&c);
+        assert_eq!(v["dns"]["servers"][0], "https://cloudflare-dns.com/dns-query");
+    }
+
+    #[test]
+    fn routing_dns_replaces_fallback_and_bypass_adds_filtered_entry() {
+        let c = CommonSettings {
+            routing_dns: "1.1.1.1".into(),
+            bypass_dns: "178.22.122.100".into(),
+            ..Default::default()
+        };
+        let v = emit_with(&c);
+        let servers = v["dns"]["servers"].as_array().expect("servers");
+        assert_eq!(servers[1], "1.1.1.1");
+        assert_eq!(servers[2]["address"], "178.22.122.100");
+        assert!(servers[2]["domains"].as_array().expect("domains")
+            .iter().any(|d| d == "geosite:category-ir"));
+    }
+
+    #[test]
+    fn ipv6_off_forces_ipv4_everywhere() {
+        let c = CommonSettings { ipv6: Ipv6Mode::Off, ..Default::default() };
+        let v = emit_with(&c);
+        assert_eq!(v["routing"]["domainStrategy"], "ForceIPv4");
+        assert_eq!(v["dns"]["queryStrategy"], "UseIPv4");
+    }
+
+    #[test]
+    fn fakedns_off_by_default_and_on_adds_pool_and_sniff_entry() {
+        let off = emit_with(&Default::default());
+        assert!(off.get("fakedns").is_none());
+        let c = CommonSettings { fakedns: true, ..Default::default() };
+        let on = emit_with(&c);
+        assert_eq!(on["fakedns"][0]["ipPool"], "198.18.0.0/15");
+        assert!(on["inbounds"][0]["sniffing"]["destOverride"]
+            .as_array().expect("dest").iter().any(|d| d == "fakedns"));
+    }
+
+    #[test]
+    fn lan_access_controls_inbound_listen() {
+        let off = emit_with(&Default::default());
+        assert_eq!(off["inbounds"][0]["listen"], "127.0.0.1");
+        let c = CommonSettings { lan_access: true, ..Default::default() };
+        let on = emit_with(&c);
+        assert_eq!(on["inbounds"][0]["listen"], "0.0.0.0");
+    }
+
+    #[test]
+    fn log_level_flows_through() {
+        let c = CommonSettings { log_level: "debug".into(), ..Default::default() };
+        let v = emit_with(&c);
+        assert_eq!(v["log"]["loglevel"], "debug");
+        let v = emit_with(&Default::default());
+        assert_eq!(v["log"]["loglevel"], "warning");
     }
 }

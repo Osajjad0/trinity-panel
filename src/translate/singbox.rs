@@ -121,7 +121,7 @@ impl Emit for SingBox {
                 // `action` so the tag exists for the user to point a rule at.
                 { "type": "direct", "tag": DIRECT_TAG },
             ],
-            "route": route_block(&tag),
+            "route": route_block(&tag, &Default::default()),
         });
 
         match serde_json::to_string_pretty(&config) {
@@ -163,19 +163,53 @@ fn outbound_tag(node: &Node, dropped: &mut Vec<Dropped>) -> String {
 /// neither of which this emitter can invent for the user. So it emits no
 /// geo-rules at all rather than a broken or half-configured one, and everything
 /// that is not DNS goes to the proxy.
-fn route_block(tag: &str) -> Value {
+fn route_block(tag: &str, common: &crate::panel::store::CommonSettings) -> Value {
+    let mut rules = vec![
+        // Sniffing moved out of the inbound and became a rule action in
+        // 1.11; the inbound `sniff` field is deprecated on 1.13. Without it
+        // domain-based rules the user adds later would only ever see IPs.
+        json!({ "action": "sniff" }),
+        // `type: "dns"` outbounds are deprecated in favour of this action.
+        json!({ "protocol": "dns", "action": "hijack-dns" }),
+    ];
+    if !common.bypass_dns.is_empty() {
+        rules.push(json!({
+            "domain_suffix": [".ir"],
+            "action": "route",
+            "outbound": DIRECT_TAG,
+        }));
+    }
+    let strategy = match common.ipv6 {
+        crate::panel::store::Ipv6Mode::Auto => "prefer_ipv6",
+        crate::panel::store::Ipv6Mode::Prefer => "prefer_ipv6",
+        crate::panel::store::Ipv6Mode::Off => "ipv4_only",
+    };
     json!({
-        "rules": [
-            // Sniffing moved out of the inbound and became a rule action in
-            // 1.11; the inbound `sniff` field is deprecated on 1.13. Without it
-            // domain-based rules the user adds later would only ever see IPs.
-            { "action": "sniff" },
-            // `type: "dns"` outbounds are deprecated in favour of this action.
-            { "protocol": "dns", "action": "hijack-dns" },
-        ],
+        "rules": rules,
         "final": tag,
         "auto_detect_interface": true,
+        "domain_strategy": strategy,
     })
+}
+
+/// DNS servers from Common preferences. sing-box models each server as an
+/// object; the DoH primary keeps its plain-IP bootstrap fallback.
+fn dns_block(common: &crate::panel::store::CommonSettings) -> Value {
+    use crate::panel::store::CommonSettings as C;
+    let doh = if common.secure_doh.is_empty() { C::DEFAULT_DOH } else { common.secure_doh.as_str() };
+    let routing = if common.routing_dns.is_empty() { C::DEFAULT_ROUTING_DNS } else { common.routing_dns.as_str() };
+    let mut servers = vec![
+        json!({ "tag": "secure-doh", "type": "https", "server": doh }),
+        json!({ "tag": "fallback-1", "type": "udp", "server": routing }),
+    ];
+    if !common.bypass_dns.is_empty() {
+        servers.push(json!({ "tag": "bypass", "type": "udp", "server": common.bypass_dns }));
+    }
+    let strategy = match common.ipv6 {
+        crate::panel::store::Ipv6Mode::Off => "ipv4_only",
+        _ => "prefer_ipv6",
+    };
+    json!({ "servers": servers, "strategy": strategy })
 }
 
 /// Build the outbound for the node itself.
@@ -1003,7 +1037,7 @@ const SELECTOR_TAG: &str = "select";
 /// # Errors
 /// [`EmitError::Refused`] when the list is empty, when the target does not run
 /// sing-box, or when every node is rejected by [`gate`].
-pub fn emit_nodes(nodes: &[Node], target: ClientTarget, enhanced: bool) -> Result<Emitted, EmitError> {
+pub fn emit_nodes(nodes: &[Node], target: ClientTarget, enhanced: bool, common: &crate::panel::store::CommonSettings) -> Result<Emitted, EmitError> {
     if target.core() != Core::SingBox {
         return Err(EmitError::Refused(vec![format!(
             "{} runs {}, not sing-box, so a sing-box JSON config would not be read by it",
@@ -1075,25 +1109,16 @@ pub fn emit_nodes(nodes: &[Node], target: ClientTarget, enhanced: bool) -> Resul
     outbounds.push(json!({ "type": "direct", "tag": DIRECT_TAG }));
 
     let config = json!({
-        "log": { "level": "info", "timestamp": true },
-        // AdGuard DNS over HTTPS as the default resolver. Prevents local
-        // DNS leaks; sing-box resolves DoH natively via type "https".
-        "dns": {
-            // Plain-IP fallbacks let sing-box resolve the DoH hostname itself.
-            "servers": [
-                { "tag": "adguard", "type": "https", "server": "https://dns.adguard-dns.com/dns-query" },
-                { "tag": "adguard-fallback-1", "type": "udp", "server": "94.140.14.14" },
-                { "tag": "adguard-fallback-2", "type": "udp", "server": "94.140.15.15" }
-            ]
-        },
+        "log": { "level": if common.log_level.is_empty() { "info" } else { &common.log_level }, "timestamp": true },
+        "dns": dns_block(common),
         "inbounds": [ {
             "type": "mixed",
             "tag": "mixed-in",
-            "listen": LISTEN_ADDRESS,
+            "listen": if common.lan_access { "0.0.0.0" } else { LISTEN_ADDRESS },
             "listen_port": LISTEN_PORT,
         } ],
         "outbounds": outbounds,
-        "route": route_block(SELECTOR_TAG),
+        "route": route_block(SELECTOR_TAG, common),
     });
 
     match serde_json::to_string_pretty(&config) {
@@ -1153,7 +1178,7 @@ mod multi_node_tests {
     }
 
     fn parsed(nodes: &[Node]) -> Value {
-        let e = emit_nodes(nodes, ClientTarget::SingBoxUpstream, false).expect("emits");
+        let e = emit_nodes(nodes, ClientTarget::SingBoxUpstream, false, &Default::default()).expect("emits");
         serde_json::from_str(&e.config).expect("valid json")
     }
 
@@ -1199,7 +1224,7 @@ mod multi_node_tests {
     fn one_untranslatable_node_does_not_lose_the_others() {
         // The property that matters for a subscription: partial success beats
         // refusing everything, as long as the omission is reported.
-        let e = emit_nodes(&[node("good"), xhttp("bad")], ClientTarget::SingBoxUpstream, false)
+        let e = emit_nodes(&[node("good"), xhttp("bad")], ClientTarget::SingBoxUpstream, false, &Default::default())
             .expect("emits");
         let v: Value = serde_json::from_str(&e.config).expect("valid json");
         let selector = v["outbounds"]
@@ -1214,18 +1239,18 @@ mod multi_node_tests {
 
     #[test]
     fn an_empty_list_is_refused_rather_than_emitting_a_useless_config() {
-        assert!(emit_nodes(&[], ClientTarget::SingBoxUpstream, false).is_err());
+        assert!(emit_nodes(&[], ClientTarget::SingBoxUpstream, false, &Default::default()).is_err());
     }
 
     #[test]
     fn a_client_running_another_core_is_refused() {
-        assert!(emit_nodes(&[node("a")], ClientTarget::V2rayN, false).is_err());
-        assert!(emit_nodes(&[node("a")], ClientTarget::Mihomo, false).is_err());
+        assert!(emit_nodes(&[node("a")], ClientTarget::V2rayN, false, &Default::default()).is_err());
+        assert!(emit_nodes(&[node("a")], ClientTarget::Mihomo, false, &Default::default()).is_err());
     }
 
     #[test]
     fn every_node_failing_refuses_the_whole_export() {
-        assert!(emit_nodes(&[xhttp("bad")], ClientTarget::SingBoxUpstream, false).is_err());
+        assert!(emit_nodes(&[xhttp("bad")], ClientTarget::SingBoxUpstream, false, &Default::default()).is_err());
     }
 }
 
@@ -1256,9 +1281,9 @@ mod enhanced_tests {
     /// Reachability must add a browser uTLS fingerprint and nothing else.
     #[test]
     fn enhanced_adds_a_browser_utls_and_nothing_else() {
-        let off = emit_nodes(&[vless_ws()], ClientTarget::SingBoxUpstream, false)
+        let off = emit_nodes(&[vless_ws()], ClientTarget::SingBoxUpstream, false, &Default::default())
             .expect("off emits");
-        let on = emit_nodes(&[vless_ws()], ClientTarget::SingBoxUpstream, true)
+        let on = emit_nodes(&[vless_ws()], ClientTarget::SingBoxUpstream, true, &Default::default())
             .expect("on emits");
 
         // No fragment-shaped field may appear anywhere in the output.
@@ -1285,7 +1310,7 @@ mod enhanced_tests {
             fingerprint: Some("firefox".into()),
             ..Default::default()
         });
-        let e = emit_nodes(&[n], ClientTarget::SingBoxUpstream, true).expect("emits");
+        let e = emit_nodes(&[n], ClientTarget::SingBoxUpstream, true, &Default::default()).expect("emits");
         let v: Value = serde_json::from_str(&e.config).unwrap();
         assert_eq!(
             v["outbounds"][0]["tls"]["utls"],
