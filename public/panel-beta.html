@@ -538,44 +538,36 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
    #070d1d}
 #trinity-field{position:fixed;inset:0;z-index:-1;width:100vw;height:100vh;
   display:block;pointer-events:none}
-/* Sign-in transition — Trinity formation: three triangles arranged at 120°
-   around a center, pointing radially outward (TRINITY = THREE). The group
-   rotates slowly, triangles pulse brightness in a staggered ring, and a faint
-   large triangle fades in/out behind them (the Trinity symbol). Glass veil,
-   shown only while the post-login state load actually runs; never on failure;
-   never on authed reloads. pointer-events:none always. */
+/* Sign-in transition — "three dots, one triangle" (SVG + SMIL):
+   three accent dots (negative begin offsets = exact 120° stagger) ride
+   animateMotion along the shared triangle path while the outline draws itself
+   via stroke-dashoffset, synchronized to the same loop — the classic
+   geometric path-loader (design basis: the widely-circulated Squid-Game-style
+   SVG shape loader; adapted to Trinity's accent system). Compact (56px), one
+   shape, three elements that visibly belong together. SMIL ignores
+   prefers-reduced-motion, so it is hard-disabled here; the veil itself shows
+   the static Trinity mark briefly. Glass veil, shown only while the
+   post-login state load actually runs; never on failure; never on authed
+   reloads. pointer-events:none always. */
 #signin-veil{position:fixed;inset:0;z-index:2000;display:flex;align-items:center;justify-content:center;
   background:color-mix(in srgb, var(--bg) 78%, transparent);
   -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
   opacity:0;visibility:hidden;pointer-events:none;
   transition:opacity 200ms var(--ease-standard), visibility 0s linear 200ms}
 #signin-veil.show{opacity:1;visibility:visible;transition:opacity 200ms var(--ease-standard)}
-.tri-orbit{position:relative;width:120px;height:120px;flex:none;
-  animation:tri-rotate 7s linear infinite}
-.tri-glow{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-  clip-path:polygon(50% 0,100% 100%,0 100%);
-  background:linear-gradient(180deg, var(--accent), var(--accent-hover));
-  opacity:.14;animation:tri-breathe 3.2s var(--ease-standard) ease-in-out infinite}
-.tri{position:absolute;width:16px;height:20px;flex:none;
-  clip-path:polygon(50% 0,100% 100%,0 100%);
-  background:linear-gradient(180deg, var(--accent), var(--accent-hover));
-  filter:drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 55%, transparent));
-  animation:tri-pulse 1.6s var(--ease-standard) ease-in-out infinite}
-.tri.t1{top:0;left:50%;transform:translateX(-50%)}
-.tri.t2{bottom:14px;left:12px;transform:rotate(120deg)}
-.tri.t3{bottom:14px;right:12px;transform:rotate(240deg)}
-.tri.t2{animation-delay:.53s}
-.tri.t3{animation-delay:1.06s}
-@keyframes tri-rotate{to{transform:rotate(360deg)}}
-@keyframes tri-pulse{0%,100%{opacity:.5;filter:drop-shadow(0 0 2px transparent)}
-  50%{opacity:1;filter:drop-shadow(0 0 7px color-mix(in srgb, var(--accent) 60%, transparent))}}
-@keyframes tri-breathe{0%,100%{opacity:.06}50%{opacity:.2}}
+#signin-veil svg{width:56px;height:56px;display:block}
+#signin-veil .tri-path{fill:none;stroke:color-mix(in srgb, var(--accent) 28%, transparent);
+  stroke-width:3;stroke-linejoin:round;stroke-linecap:round;
+  stroke-dasharray:75.4;stroke-dashoffset:75.4;
+  animation:tri-draw 2.2s var(--ease-standard) infinite}
+#signin-veil .tri-dot{fill:var(--accent)}
+#signin-veil .tri-dot:nth-of-type(2){fill:color-mix(in srgb, var(--accent) 72%, #fff 10%)}
+#signin-veil .tri-dot:nth-of-type(3){fill:color-mix(in srgb, var(--accent) 85%, #fff 18%)}
+@keyframes tri-draw{0%{stroke-dashoffset:75.4}55%{stroke-dashoffset:0}
+  100%{stroke-dashoffset:-75.4}}
 @media (prefers-reduced-motion: reduce){
-  #signin-veil .tri-orbit{animation:none}
-  #signin-veil .tri{animation:none;opacity:.85;transform:none}
-  #signin-veil .tri.t2{transform:rotate(120deg)}
-  #signin-veil .tri.t3{transform:rotate(240deg)}
-  #signin-veil .tri-glow{animation:none;opacity:.12}
+  #signin-veil .tri-path{animation:none;stroke-dashoffset:0}
+  #signin-veil .tri-dot{display:none}
 }
 @keyframes sheen-opacity{0%{opacity:0}18%{opacity:.55}82%{opacity:.55}100%{opacity:0}}
 .signin-card{
@@ -707,7 +699,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 
 
 <div id="trinity-field" aria-hidden="true"><div id="field-fallback"></div></div>
-<div id="signin-veil" aria-hidden="true"><div class="tri-orbit"><div class="tri-glow"></div><span class="tri t1"></span><span class="tri t2"></span><span class="tri t3"></span></div></div>
+<div id="signin-veil" aria-hidden="true"><svg viewBox="0 0 36 34" xmlns="http://www.w3.org/2000/svg"><path class="tri-path" d="M4 29 L18 4 L32 29 Z"/><circle class="tri-dot" r="2.6"><animateMotion dur="2.2s" repeatCount="indefinite" begin="0s" path="M4 29 L18 4 L32 29 Z"/></circle><circle class="tri-dot" r="2.6"><animateMotion dur="2.2s" repeatCount="indefinite" begin="-0.733s" path="M4 29 L18 4 L32 29 Z"/></circle><circle class="tri-dot" r="2.6"><animateMotion dur="2.2s" repeatCount="indefinite" begin="-1.466s" path="M4 29 L18 4 L32 29 Z"/></circle></svg></div>
 
 <div class="wrap">
 
