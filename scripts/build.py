@@ -229,6 +229,54 @@ def generate_shim(out_dir: str) -> None:
         )
 
 
+def check_panel_css() -> None:
+    """Fail the build on CSS tokenization corruption in the panel page.
+
+    The 1.9.7 'Advanced renders as a viewport-sized solid block' bug was a
+    comment split in half around an inserted ruleset: the orphan tail glued
+    itself to the next rule and swallowed `.switch{position:relative}`, so an
+    `inset:0` absolute child filled the viewport. Global `/*` vs `*/` counts
+    stay balanced when a split re-pairs like that, so this walks tokens the
+    way the CSS parser does: an unterminated `/*` or a `*/` outside any
+    comment is a hard error, and selectors/rules ending in garbage are caught
+    by the brace balance below.
+    """
+    path = os.path.join("public", "panel-beta.html")
+    if not os.path.isfile(path):
+        return
+    html = open(path, encoding="utf-8").read()
+    for m in re.finditer(r"<style[^>]*>(.*?)</style>", html, re.S):
+        css, line0 = m.group(1), html[: m.start(1)].count("\n") + 1
+        # CSS comments do NOT nest: once inside a comment, the next `*/` ends
+        # it and any `/*` before that is comment text (this is exactly how the
+        # 1.9.7 split re-paired and hid from naive counting).
+        in_comment = False
+        for ln, line in enumerate(css.split("\n"), line0):
+            k = 0
+            while k < len(line):
+                if in_comment:
+                    end = line.find("*/", k)
+                    if end == -1:
+                        k = len(line)
+                    else:
+                        in_comment = False
+                        k = end + 2
+                elif line.startswith("/*", k):
+                    in_comment = True
+                    k += 2
+                elif line.startswith("*/", k):
+                    raise SystemExit(f"{path}:{ln}: `*/` outside any comment")
+                else:
+                    k += 1
+        if in_comment:
+            raise SystemExit(f"{path}: unterminated `/*` comment in <style>")
+        if css.count("{") != css.count("}"):
+            raise SystemExit(
+                f"{path}: unbalanced braces in <style> "
+                f"({css.count('{')} open vs {css.count('}')} close)"
+            )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the Worker module set.")
     ap.add_argument("--out", default=os.path.join("build", "worker"))
@@ -237,6 +285,8 @@ def main() -> int:
 
     if not os.path.isfile("Cargo.toml"):
         raise SystemExit("run this from the repository root")
+
+    check_panel_css()
 
     wb = find_wasm_bindgen()
     print(f"Using wasm-bindgen at {wb}")
