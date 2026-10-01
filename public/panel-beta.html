@@ -517,8 +517,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
    translucent glass with a moving specular sweep and edge highlight, so the
    field reads through it (paper.design/liquid-metal, native recreation). */
 .signin{position:relative;display:flex;align-items:center;justify-content:center;
-  min-height:calc(100vh - 4rem);padding:1.5rem;overflow:hidden;
-  background:#070d1d; /* pre-paint base so first frame is never white */ }
+  min-height:calc(100vh - 4rem);padding:1.5rem} /* field is a fixed body layer now */
 #field-fallback{position:absolute;inset:0;
   background:
    radial-gradient(60% 50% at 26% 24%, rgba(37,99,235,.42), transparent 70%),
@@ -526,8 +525,19 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
    radial-gradient(70% 60% at 64% 18%, rgba(30,58,138,.42), transparent 74%),
    #070d1d}
 #trinity-field.has-shader #field-fallback{display:none}
-#trinity-field{position:absolute;inset:0;z-index:0;width:100%;height:100%;
+#trinity-field{position:fixed;inset:0;z-index:-1;width:100vw;height:100vh;
   display:block;pointer-events:none}
+#trinity-field.hidden{display:none}
+/* Background preset picker: compact live thumbnails under the card. */
+#field-picker{position:fixed;bottom:1.1rem;left:50%;transform:translateX(-50%);z-index:2;
+  display:flex;gap:.45rem;padding:.4rem .5rem;border-radius:14px;
+  background:rgba(10,16,32,.42);border:1px solid rgba(255,255,255,.14);
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+#field-picker button{padding:0;border:1px solid rgba(255,255,255,.2);border-radius:8px;
+  min-height:0;min-width:0;background:none;cursor:pointer;overflow:hidden;line-height:0}
+#field-picker button[aria-pressed="true"]{outline:2px solid var(--accent);outline-offset:1px}
+#field-picker canvas{width:56px;height:36px;display:block}
+@media (max-width:540px){ #field-picker{gap:.3rem;padding:.3rem .35rem} #field-picker canvas{width:44px;height:28px} }
 @keyframes sheen-opacity{0%{opacity:0}18%{opacity:.55}82%{opacity:.55}100%{opacity:0}}
 .signin-card{
   position:relative;z-index:1;width:100%;max-width:376px;text-align:center;
@@ -629,12 +639,13 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 </style>
 </head>
 <body>
+<div id="trinity-field" aria-hidden="true"><div id="field-fallback"></div></div>
+<div id="field-picker" class="hidden" role="group" aria-label="Login background"></div>
 
 <div class="wrap">
 
   <!-- Sign in ------------------------------------------------------------- -->
   <section id="signin" class="signin hidden">
-      <div id="trinity-field" aria-hidden="true"><div id="field-fallback"></div></div>
       <div class="signin-card">
         <div class="signin-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
@@ -1087,56 +1098,130 @@ async function send(path, options = {}) {
   return body;
 }
 
-// ---- Trinity grain-gradient field (login background) -----------------------
-// Full-page fragment-shader field: fbm-warped blue bands + film grain.
-// Visual language: paper.design/grain-gradient. Self-contained, ~2KB, no deps.
+// ---- Trinity login background system ---------------------------------------
+// Six generative WebGL presets (visual language researched from paper.design
+// and pixel-perfect.space; all GLSL ours). One fixed body-level canvas, one
+// renderer, one rAF loop; presets swap uniforms/program without new contexts.
+// Theme-bound defaults + persisted explicit choice. Paused when hidden or
+// signed-in; static hand-picked frame under prefers-reduced-motion.
 (() => {
   const host = document.getElementById("trinity-field");
+  const picker = document.getElementById("field-picker");
   if (!host) return;
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  let canvas = null, gl = null, raf = 0, running = false, t0 = 0;
-  const Q = { // device-aware quality: resolution scale + fps cap
-    scale: Math.min(devicePixelRatio || 1, 1.75),
-    frameMs: 1000 / 45 };
+  let canvas = null, gl = null, raf = 0, running = false, t0 = 0, uT = null;
+  let current = null, prog = null, U = {};
+  const Q = { scale: Math.min(devicePixelRatio || 1, 1.75) };
 
-  const VERT = "attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}";
-  const FRAG = [
+  // ---- GLSL building blocks (shared prelude) ----
+  const P = [
     "precision mediump float;",
     "uniform vec2 R;uniform float T;",
-    // hash / value noise / fbm (compact)
     "float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}",
     "float vnoise(vec2 p){vec2 i=floor(p),f=fract(p);vec2 u=f*f*(3.-2.*f);",
     " float a=h21(i),b=h21(i+vec2(1,0)),c=h21(i+vec2(0,1)),d=h21(i+vec2(1,1));",
     " return mix(mix(a,b,u.x),mix(c,d,u.x),u.y);}",
     "float fbm(vec2 p){float v=0.,a=.5;for(int i=0;i<5;i++){v+=a*vnoise(p);p=p*2.03+vec2(19.7,-7.3);a*=.5;}return v;}",
-    // palette: midnight navy -> royal blue -> electric blue -> cyan
-    "vec3 pal(float t){",
-    " vec3 c0=vec3(.016,.031,.078);",   // deep midnight
-    " vec3 c1=vec3(.055,.121,.294);",   // dark blue
-    " vec3 c2=vec3(.125,.318,.784);",   // royal blue
-    " vec3 c3=vec3(.220,.596,.937);",   // electric blue
-    " vec3 c4=vec3(.420,.815,.937);",   // subtle cyan
-    " vec3 col=mix(c0,c1,smoothstep(0.,.35,t));",
-    " col=mix(col,c2,smoothstep(.30,.62,t));",
-    " col=mix(col,c3,smoothstep(.58,.82,t));",
-    " col=mix(col,c4,smoothstep(.80,.96,t));",
-    " return col;}",
+  ].join("\n");
+
+  // ---- presets: [name, lightFragBody, darkFragBody, speed] ----
+  // Each body receives uv (centered, min-axis-normalized) + t and writes col.
+  const PRESETS = [
+    ["Aurora Flow",
+     // LIGHT: pearl/sky field, soft flowing silk bands
+     `vec2 w=vec2(fbm(uv*1.5+vec2(0.,t*.8)), fbm(uv*1.5+vec2(4.2,1.3)-t*.7));
+      float f=fbm(uv*1.5+2.2*w);
+      vec3 col=mix(vec3(.878,.906,.933),vec3(.639,.780,.882),smoothstep(.25,.75,f));
+      col=mix(col,vec3(.760,.878,.902),smoothstep(.55,.9,f*.85+.15));
+      col*=.97+.06*sin(f*6.2832+t);`,
+     // DARK: midnight silk
+     `vec2 w=vec2(fbm(uv*1.5+vec2(0.,t*.8)), fbm(uv*1.5+vec2(4.2,1.3)-t*.7));
+      float f=fbm(uv*1.5+2.2*w);
+      vec3 col=mix(vec3(.020,.036,.086),vec3(.063,.157,.400),smoothstep(.2,.8,f));
+      col=mix(col,vec3(.110,.330,.610),smoothstep(.6,.95,f));
+      col*=.9+.18*sin(f*6.2832+t);`, 1.0],
+    ["Deep Grain",
+     // LIGHT: silver paper with warm pearl pools
+     `float f=fbm(uv*1.9+vec2(t*.5,-t*.4));
+      float band=smoothstep(.35,.65,fbm(uv*1.2+vec2(t*.35,0.)));
+      vec3 col=mix(vec3(.900,.906,.916),vec3(.788,.816,.851),f);
+      col=mix(col,vec3(.702,.769,.847),band*.5);`,
+     // DARK: graphite-blue paper, the classic grain-gradient character
+     `float f=fbm(uv*1.9+vec2(t*.5,-t*.4));
+      float band=smoothstep(.35,.65,fbm(uv*1.2+vec2(t*.35,0.)));
+      vec3 col=mix(vec3(.024,.031,.055),vec3(.071,.086,.125),f);
+      col=mix(col,vec3(.086,.153,.294),band*.6);`, 0.8],
+    ["Ember Drift",
+     // LIGHT: warm pearl to soft apricot haze (the one warm preset)
+     `vec2 w=vec2(fbm(uv*1.25+vec2(t*.6,t*.3)), 0.);
+      float f=fbm(uv*1.25+2.4*w);
+      vec3 col=mix(vec3(.949,.937,.914),vec3(.957,.835,.702),smoothstep(.3,.85,f));
+      col=mix(col,vec3(.898,.702,.541),smoothstep(.65,.98,f));`,
+     // DARK: ember-black (charcoal with deep amber currents)
+     `vec2 w=vec2(fbm(uv*1.25+vec2(t*.6,t*.3)), 0.);
+      float f=fbm(uv*1.25+2.4*w);
+      vec3 col=mix(vec3(.020,.018,.020),vec3(.173,.082,.031),smoothstep(.25,.8,f));
+      col=mix(col,vec3(.286,.137,.047),smoothstep(.65,.98,f));`, 0.9],
+    ["Violet Tide",
+     // LIGHT: pearl with subtle lavender mesh
+     `vec2 q=vec2(fbm(uv*1.4+vec2(0.,t*.55)), fbm(uv*1.4+vec2(7.3,3.1)+t*.45));
+      float f=fbm(uv*1.4+2.8*q);
+      vec3 col=mix(vec3(.906,.906,.929),vec3(.760,.741,.878),smoothstep(.25,.8,f));
+      col=mix(col,vec3(.678,.655,.847),smoothstep(.6,.95,f));`,
+     // DARK: cosmic violet-black
+     `vec2 q=vec2(fbm(uv*1.4+vec2(0.,t*.55)), fbm(uv*1.4+vec2(7.3,3.1)+t*.45));
+      float f=fbm(uv*1.4+2.8*q);
+      vec3 col=mix(vec3(.016,.018,.047),vec3(.129,.075,.251),smoothstep(.2,.8,f));
+      col=mix(col,vec3(.196,.106,.373),smoothstep(.62,.96,f));`, 0.9],
+    ["Contour",
+     // LIGHT: warm-white field, thin graphite topo lines
+     `float f=fbm(uv*1.7+vec2(t*.3,t*.2));
+      float line=abs(fract(f*14.)-.5);
+      float ink=smoothstep(.06,.02,line);
+      vec3 col=mix(vec3(.941,.941,.949),vec3(.180,.208,.243),ink*.8);
+      col=mix(col,vec3(.847,.867,.894),smoothstep(.4,.9,f)*.35);`,
+     // DARK: blue-black field, thin cyan-blue topo lines
+     `float f=fbm(uv*1.7+vec2(t*.3,t*.2));
+      float line=abs(fract(f*14.)-.5);
+      float ink=smoothstep(.06,.02,line);
+      vec3 col=mix(vec3(.012,.018,.039),vec3(.063,.169,.337),ink*.85);
+      col=mix(col,vec3(.110,.290,.478),smoothstep(.4,.9,f)*.3);`, 0.7],
+    ["Particle Drift",
+     // LIGHT: ice field with soft light motes
+     `float f=fbm(uv*1.3+vec2(0.,t*.4));
+      vec3 col=mix(vec3(.914,.925,.941),vec3(.784,.847,.898),f);
+      for(int i=0;i<14;i++){
+        float fi=float(i);
+        vec2 c=vec2(h21(vec2(fi,1.7))+t*.05*(mod(fi,3.)-1.),
+                    h21(vec2(fi,9.3))+t*.04*(mod(fi,2.)-.5));
+        c=(c-.5)*1.6;
+        float d=length(uv-c);
+        col+=vec3(.9,.95,1.)*smoothstep(.045,.0,d)*.85;
+      }`,
+     // DARK: blue-black space with drifting light motes
+     `float f=fbm(uv*1.3+vec2(0.,t*.4));
+      vec3 col=mix(vec3(.012,.020,.047),vec3(.047,.094,.208),f);
+      for(int i=0;i<14;i++){
+        float fi=float(i);
+        vec2 c=vec2(h21(vec2(fi,1.7))+t*.05*(mod(fi,3.)-1.),
+                    h21(vec2(fi,9.3))+t*.04*(mod(fi,2.)-.5));
+        c=(c-.5)*1.6;
+        float d=length(uv-c);
+        col+=vec3(.75,.85,1.)*smoothstep(.045,.0,d)*.9;
+      }`, 1.0],
+  ];
+  const DEFAULTS = { light: "Aurora Flow", dark: "Deep Grain" };
+
+  const MAIN = [
     "void main(){",
     " vec2 uv=(gl_FragCoord.xy-.5*R)/min(R.x,R.y);",
-    " float t=T*.055;",                       // slow master clock (speed)
-    " vec2 q=vec2(fbm(uv*1.35+vec2(0.,t*.7)), fbm(uv*1.35+vec2(5.2,1.3)-t*.6));",
-    " vec2 r=vec2(fbm(uv*1.35+3.1*q+vec2(1.7,9.2)+t*.42),",
-    "             fbm(uv*1.35+3.1*q+vec2(8.3,2.8)-t*.38));",
-    " float f=fbm(uv*1.35+3.1*r);",           // double domain warp = flowing bands
-    " vec3 col=pal(clamp(f*1.22,.0,1.));",
-    " // vertical luminance shaping: cinematic depth, brighter upper third",
-    " col*=1.12-.28*uv.y*.5;",
-    " // refined grain: fine blue-noise-ish film grain, subtle",
+    " float t=T;",
+    "@BODY@",
     " float g=fract(sin(dot(gl_FragCoord.xy,vec2(12.9898,78.233)))*43758.5453);",
     " col+=(g-.5)*.028;",
-    " // vignette to seat the card",
-    " float vg=smoothstep(1.25,.35,length(uv*vec2(1.,1.15)));",
-    " col*=.82+.18*vg;",
+    " float vg=smoothstep(1.3,.35,length(uv*vec2(1.,1.15)));",
+    " col*=.84+.16*vg;",
+    " col=clamp(col,0.,1.);",
     " gl_FragColor=vec4(col,1.);}",
   ].join("\n");
 
@@ -1146,76 +1231,153 @@ async function send(path, options = {}) {
     if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || "shader");
     return s;
   }
-  function start() {
-    if (running || !gl) return;
-    running = true; t0 = performance.now();
-    const loop = (now) => {
-      if (!running) return;
-      gl.uniform1f(uT, (now - t0) / 1000);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
+  function makeProgram(body) {
+    const p = gl.createProgram();
+    const vs = compile(gl.VERTEX_SHADER, "attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}");
+    const fs = compile(gl.FRAGMENT_SHADER, P + MAIN.replace("@BODY@", body));
+    gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("link");
+    return p;
   }
-  function stop() { running = false; if (raf) cancelAnimationFrame(raf); }
 
-  let uT = null;
   function init() {
     if (canvas) return true;
     canvas = document.createElement("canvas");
     canvas.id = "trinity-canvas";
     canvas.setAttribute("aria-hidden", "true");
-    canvas.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block";
+    canvas.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;display:block";
     host.appendChild(canvas);
     gl = canvas.getContext("webgl", { antialias: false, alpha: false, depth: false, stencil: false, powerPreference: "low-power", preserveDrawingBuffer: false });
-    if (!gl) return false;
-    try {
-      const vs = compile(gl.VERTEX_SHADER, VERT);
-      const fs = compile(gl.FRAGMENT_SHADER, FRAG);
-      const prog = gl.createProgram();
-      gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
-      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error("link");
-      gl.useProgram(prog);
-      const buf = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-      const loc = gl.getAttribLocation(prog, "p");
-      gl.enableVertexAttribArray(loc);
-      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-      const uR = gl.getUniformLocation(prog, "R");
-      uT = gl.getUniformLocation(prog, "T");
-      const resize = () => {
-        const w = Math.max(1, Math.round(host.clientWidth * Q.scale));
-        const h = Math.max(1, Math.round(host.clientHeight * Q.scale));
-        if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); }
-        gl.uniform2f(uR, w, h);
+    if (!gl) { canvas.remove(); canvas = null; return false; }
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    addEventListener("resize", () => { if (canvas && gl && current) resize(); }, { passive: true });
+    return true;
+  }
+  function resize() {
+    const w = Math.max(1, Math.round(innerWidth * Q.scale));
+    const h = Math.max(1, Math.round(innerHeight * Q.scale));
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    gl.viewport(0, 0, w, h);
+    if (U.R) gl.uniform2f(U.R, w, h);
+  }
+  function usePreset(name, variant) {
+    const p = PRESETS.find((x) => x[0] === name) || PRESETS[0];
+    const body = variant === "dark" ? p[2] : p[1];
+    const key = name + "/" + variant;
+    if (key === current) return;
+    const newProg = makeProgram(body);
+    current = key;
+    prog = newProg;
+    gl.useProgram(prog);
+    U.R = gl.getUniformLocation(prog, "R"); U.T = gl.getUniformLocation(prog, "T");
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(0);
+    resize();
+    t0 = performance.now();
+  }
+  function start() {
+    if (running || !gl || !current) return;
+    running = true; t0 = performance.now();
+    const loop = (now) => {
+      if (!running) return;
+      gl.uniform1f(U.T, (now - t0) / 1000);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+  }
+  function stop() { running = false; if (raf) { cancelAnimationFrame(raf); raf = 0; } }
+  function drawStatic() { if (gl && U.T) { gl.uniform1f(U.T, 12.0); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); } }
+
+  // ---- choice model: explicit per-theme choice, else theme default ----
+  function load() {
+    try { return JSON.parse(localStorage.getItem("trinity-field") || "{}"); } catch { return {}; }
+    }
+  function save(o) { try { localStorage.setItem("trinity-field", JSON.stringify(o)); } catch { /* private mode */ } }
+  function variant() { return document.documentElement.dataset.theme === "dark" ? "dark" : "light"; }
+  function activeName() {
+    const c = load();
+    return c[variant()] || DEFAULTS[variant()];
+  }
+  function render() {
+    if (!init()) { host.classList.add("hidden"); return; }
+    usePreset(activeName(), variant());
+    if (reduced) drawStatic(); else start();
+  }
+  function stopAll() { stop(); host.classList.add("hidden"); }
+  function show() { host.classList.remove("hidden"); render(); }
+
+  // ---- picker: live GL thumbnails, compact ----
+  function buildPicker() {
+    if (!picker || picker.dataset.built) return;
+    picker.dataset.built = "1";
+    PRESETS.forEach((p) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.title = p[0];
+      b.setAttribute("aria-label", "Background: " + p[0]);
+      b.setAttribute("aria-pressed", String(p[0] === activeName()));
+      const c = document.createElement("canvas");
+      c.width = 112; c.height = 72;
+      b.appendChild(c);
+      b.onclick = () => {
+        const c2 = load(); c2[variant()] = p[0]; save(c2);
+        render(); syncPicker();
       };
-      resize();
-      addEventListener("resize", resize, { passive: true });
-      return true;
-    } catch (e) { gl = null; return false; }
+      picker.appendChild(b);
+      const g2 = c.getContext("webgl");
+      if (g2) {
+        try {
+          const prog2 = g2.createProgram();
+          const vs = compileWith(g2, g2.VERTEX_SHADER, "attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}");
+          const fs = compileWith(g2, g2.FRAGMENT_SHADER, P + MAIN.replace("@BODY@", variant() === "dark" ? p[2] : p[1]));
+          g2.attachShader(prog2, vs); g2.attachShader(prog2, fs); g2.linkProgram(prog2);
+          g2.useProgram(prog2);
+          const bb = g2.createBuffer(); g2.bindBuffer(g2.ARRAY_BUFFER, bb);
+          g2.bufferData(g2.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), g2.STATIC_DRAW);
+          const lp = g2.getAttribLocation(prog2, "p");
+          g2.enableVertexAttribArray(lp); g2.vertexAttribPointer(lp, 2, g2.FLOAT, false, 0, 0);
+          g2.uniform2f(g2.getUniformLocation(prog2, "R"), 112, 72);
+          g2.uniform1f(g2.getUniformLocation(prog2, "T"), 6.0);
+          g2.drawArrays(g2.TRIANGLE_STRIP, 0, 4);
+        } catch { /* thumbnail fallback: button shows plain */ }
+        const ext = g2.getExtension("WEBGL_lose_context");
+        if (ext) ext.loseContext(); // thumbnails render once, then free the GPU resource
+      }
+    });
+  }
+  function compileWith(ggc, type, srcCode) {
+    const s = ggc.createShader(type);
+    ggc.shaderSource(s, srcCode); ggc.compileShader(s);
+    if (!ggc.getShaderParameter(s, ggc.COMPILE_STATUS)) throw new Error(ggc.getShaderInfoLog(s) || "shader");
+    return s;
+  }
+  function syncPicker() {
+    if (!picker) return;
+    [...picker.children].forEach((b) => b.setAttribute("aria-pressed", String(b.title === activeName())));
+  }
+  function showPicker(v) {
+    if (!picker) return;
+    if (v) { buildPicker(); picker.classList.remove("hidden"); syncPicker(); }
+    else picker.classList.add("hidden");
   }
 
-  function setRunning(on) {
-    if (on) {
-      if (init()) { host.classList.add("has-shader"); if (reduced) { drawStatic(); } else { start(); } }
-    } else stop();
-  }
-  function drawStatic() { // reduced motion: one beautiful frame, no loop
-    gl.uniform1f(uT, 12.0); // hand-picked frame
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  }
-
-  // run only while signin is visible + tab visible
+  // ---- run only while signin visible + tab visible ----
   const io = new IntersectionObserver((es) => {
-    es.forEach((e) => setRunning(e.isIntersecting && !document.hidden));
+    es.forEach((e) => { e.isIntersecting ? show() : stopAll(); showPicker(e.isIntersecting); });
   }, { threshold: 0.02 });
-  io.observe(host);
+  io.observe(document.getElementById("signin"));
+
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) stop(); else io.takeRecords().forEach(() => {}); // re-eval via IO
-    if (!document.hidden) { const r = host.getBoundingClientRect(); setRunning(r.bottom > 0 && r.top < innerHeight && !document.hidden); }
+    if (document.hidden) { stop(); } else if (!document.getElementById("signin").classList.contains("hidden")) { render(); }
   });
-  // liquid card: specular highlight follows the pointer (input-driven, no loop)
+  document.addEventListener("trinity-theme", () => {
+    if (!document.getElementById("signin").classList.contains("hidden")) { render(); syncPicker(); }
+  });
+
+  // liquid card: specular follows pointer (input-driven, no loop)
   const card = document.querySelector(".signin-card");
   if (card && matchMedia("(hover:hover) and (pointer:fine)").matches) {
     card.addEventListener("pointermove", (e) => {
@@ -3042,6 +3204,7 @@ function enhancedSelect(sel) {
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   try { localStorage.setItem("trinity-theme", theme); } catch { /* private mode */ }
+  document.dispatchEvent(new CustomEvent("trinity-theme", { detail: theme }));
   const b = $("theme-toggle");
   if (b) {
     b.textContent = theme === "dark" ? "\u2600" : "\u25d0";
