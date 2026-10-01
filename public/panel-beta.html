@@ -56,10 +56,15 @@ try {
   --radius-sm:7px; --radius-md:10px; --radius-lg:14px;
   --shadow-sm:0 1px 2px rgba(16,24,40,.06);
   --shadow-md:0 4px 16px rgba(16,24,40,.08);
-  --motion-fast:150ms; --motion-base:240ms; --motion-slow:380ms;
+  /* Motion system (Phase 1): two families only. MICRO = state feedback
+     (tints, chevrons, highlights). STANDARD = structure (accordions, menus,
+     reveals). Easing: smooth-out for micro, standard ease for structure. */
+  --motion-fast:120ms; --motion-base:240ms; --motion-slow:380ms;
   --ease-standard:cubic-bezier(.2,0,0,1);
+  --ease-smooth-out:cubic-bezier(.22,1,.36,1);
   --ease-emphasis:cubic-bezier(.785,.135,.15,.86);
   --ease-reveal:cubic-bezier(.4,0,.2,1);
+  --radius-ctl:10px;
   --radius:var(--radius-md);
   --shadow:var(--shadow-md);
   /* Alias tokens (old vocabulary, kept for existing rules). */
@@ -148,7 +153,7 @@ body::before{
 [data-theme="dark"] body::before{--dot:rgba(255,255,255,.04)}
 a{color:var(--accent)}
 h1,h2,h3{line-height:1.25;margin:0 0 .4rem;letter-spacing:-.02em;text-wrap:balance}
-h1{font-size:1.45rem;font-weight:700} h2{font-size:1.08rem;font-weight:600} h3{font-size:.95rem;font-weight:600}
+h1{font-size:1.45rem;font-weight:700} h2{font-size:1.08rem;font-weight:700} h3{font-size:.95rem;font-weight:600}
 p{margin:0 0 .7rem}
 .wrap{max-width:960px;margin:0 auto;padding:1rem}
 .card{
@@ -239,6 +244,12 @@ td,th{overflow-wrap:anywhere}
   box-shadow:none;padding:.7rem 1rem .8rem;margin:0 0 .8rem}
 .sub>:first-child{margin-top:0}
 .sub>h3:first-child,.sub .spread>h3{margin-top:0}
+/* Sub-card heading language (Phase 1): small caps label, hairline separation
+   from body, consistent rhythm inside Advanced/flow areas. */
+.sub>h3:first-child,.sub .spread>h3{
+  font-size:.8rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--text-muted);padding-bottom:.45rem;margin-bottom:.55rem;
+  border-bottom:1px solid var(--border)}
 .cand-list{display:flex;flex-direction:column;gap:.3rem;min-width:0}
 .cand-row{display:flex;align-items:center;gap:.55rem;padding:.42rem .6rem;
   background:var(--surface-raised);border:1px solid var(--border);
@@ -252,15 +263,22 @@ td,th{overflow-wrap:anywhere}
 .err-details code{display:block;margin-top:.3rem;padding:.5rem .6rem;white-space:pre-wrap;
   background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-sm)}
 /* Switch (liq-toggle principle, native checkbox): track+knob, 44px target. */
-/* Common segmented control (v1.9.7): compact radio group, keyboard focusable. */
-.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+/* Common segmented control (v1.9.7 Phase 1): sliding accent glider.
+   transform+width only; labels crossfade color over it (transitions.dev spec). */
+.seg{display:inline-flex;position:relative;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.seg::before{content:"";position:absolute;z-index:0;left:4px;top:4px;bottom:4px;
+  width:var(--seg-w,0px);transform:translateX(var(--seg-x,0px));
+  background:var(--accent);border-radius:6px;opacity:0;
+  transition:transform var(--motion-base) var(--ease-smooth-out),width var(--motion-base) var(--ease-smooth-out),opacity var(--motion-fast) var(--ease-standard)}
 .seg button{appearance:none;border:0;background:transparent;color:var(--text-muted);
-  padding:.35rem .8rem;font:inherit;font-size:.85rem;cursor:pointer;
-  transition:background var(--motion-fast) var(--ease-standard),color var(--motion-fast) var(--ease-standard)}
+  position:relative;z-index:1;padding:.35rem .8rem;font:inherit;font-size:.85rem;cursor:pointer;
+  min-height:38px;min-width:56px;
+  transition:color var(--motion-fast) var(--ease-standard),background var(--motion-fast) var(--ease-standard)}
 .seg button+button{border-left:1px solid var(--border)}
-.seg button.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
-.seg button:focus-visible{outline:2px solid var(--focus-ring);outline-offset:-2px;z-index:1}
-.seg button.on:hover{background:var(--accent-soft)}
+.seg button.on{color:var(--accent-ink);font-weight:600}
+.seg button:focus-visible{outline:2px solid var(--focus-ring);outline-offset:-2px;z-index:2}
+.seg button.on:hover{background:transparent}
+.seg.seg-ready::before{opacity:1}
 
 /* ON/OFF switches — liquid glass (detail.design/detail/liquid-glass-switcher):
    translucent tinted track the background reads through, glossy glass thumb
@@ -312,9 +330,11 @@ td,th{overflow-wrap:anywhere}
   max-height:280px;overflow:auto;background:var(--surface);
   border:1px solid var(--border-strong);border-radius:var(--radius-md);
   box-shadow:var(--shadow-md);padding:.375rem;
-  opacity:0;transform:translateY(-2px) scale(.985)}
+  opacity:0;transform:translateY(-4px)}
 .esel-menu.esel-shown{display:block;
-  animation:esel-in 150ms var(--ease-standard) forwards}
+  animation:esel-in 180ms var(--ease-standard) forwards}
+.esel-menu[data-state="closed"]{display:block;pointer-events:none;
+  animation:esel-out 150ms var(--ease-standard) forwards}
 .esel-main{min-width:0;overflow-wrap:anywhere}
 .esel-col{display:flex;flex-direction:column;gap:.05rem;min-width:0;flex:1}
 .esel-sub{font-size:.72rem;color:var(--dim);font-family:var(--mono)}
@@ -338,6 +358,7 @@ td,th{overflow-wrap:anywhere}
 .esel-opt[aria-selected=true]:hover{background:var(--accent-soft)}
 
 @keyframes esel-in{to{opacity:1;transform:none}}
+@keyframes esel-out{to{opacity:0;transform:translateY(-4px)}}
 .esel-opt{padding:.5rem .6rem;border-radius:var(--radius-sm);cursor:pointer;
   display:flex;align-items:center;gap:.5rem;min-height:42px;overflow-wrap:anywhere}
 .esel-opt:hover,.esel-opt.esel-active:not([aria-selected=true]){background:var(--surface-hover)}
@@ -378,10 +399,25 @@ details.acc>summary{
 }
 details.acc>summary::-webkit-details-marker{display:none}
 /* Detail "Smooth Highlight Block Transition" language: content settles, not flashes. */
+/* Height-animated accordions (Phase 1, transitions.dev spec): ::details-content
+   grid-rows 0fr→1fr via interpolate-size, blur-fade on the body, chevron flips
+   with scaleY(-1) to keep stroke weight. Chromium 131+; older browsers get the
+   previous entry-fade fallback. */
 @media (prefers-reduced-motion: no-preference){
-  details.acc>.acc-body,details.acc>div{animation:acc-in 200ms var(--ease-standard)}
+  html:has(details.acc){interpolate-size:allow-keywords}
+  details.acc::details-content{
+    block-size:0; overflow:clip;
+    transition:height var(--motion-slow) var(--ease-standard),
+               content-visibility var(--motion-slow) var(--ease-standard) allow-discrete;
+  }
+  details.acc[open]::details-content{block-size:auto}
+  details.acc[open]>.acc-body,details.acc[open]>div{animation:acc-reveal 380ms var(--ease-smooth-out)}
 }
 @keyframes acc-in{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+@keyframes acc-reveal{
+  from{opacity:0;transform:translateY(-4px);filter:blur(3px)}
+  to{opacity:1;transform:none;filter:blur(0)}
+}
 .shake-x{animation:shake-x 220ms var(--ease-standard)}
 @keyframes shake-x{0%,100%{transform:none}25%{transform:translateX(-2px)}60%{transform:translateX(2px)}80%{transform:translateX(-1px)}}
 details.acc>summary h2{margin:0; font-size:.95rem; letter-spacing:.05em; text-transform:uppercase; color:var(--text-muted); font-weight:600}
@@ -706,7 +742,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
   <!-- Sign in ------------------------------------------------------------- -->
     <!-- Panel ---------------------------------------------------------------- -->
   <main id="app" class="hidden">
-    <div class="spread" style="margin-bottom:1rem">
+    <div class="spread" style="margin-bottom:var(--header-gap,1rem)">
       <div class="row" style="gap:.75rem">
         <span aria-hidden="true" style="display:inline-flex;width:38px;height:38px;border-radius:10px;
           background:var(--accent-soft);color:var(--accent);align-items:center;justify-content:center;flex:none">
@@ -1457,6 +1493,12 @@ async function boot() {
   }
   $("signin").classList.add("hidden");
   $("app").classList.remove("hidden");
+  // Seg gliders must measure the visible panel: after reveal, and again next
+  // frame (accordion content reflows as the height animation settles).
+  requestAnimationFrame(() => {
+    segGlideAll();
+    requestAnimationFrame(segGlideAll);
+  });
 
   NODES = structuredClone(STATE.nodes);
   OUTBOUND = structuredClone(STATE.outbound ?? { mode: "off", proxyCandidates: [], nat64Prefixes: [], maxProxyAttempts: 3, catalogPool: false, catalogCountry: "", verifiedCatalogCandidates: [] });
@@ -2652,13 +2694,37 @@ function segSet(group, v){
 for (const g of ["c-ipv6","c-fakedns","c-lan"]) {
   $(g).addEventListener("click", e => {
     const b = e.target.closest("button"); if (!b) return;
-    segSet($(g), b.dataset.v); markDirty();
+    segSet($(g), b.dataset.v); markDirty(); segGlide($(g));
   });
 }
 // Segmented controls are toggle-button groups: expose state to AT (a11y §9).
 for (const g of ["c-ipv6","c-fakedns","c-lan"]) {
   for (const b of $(g).querySelectorAll("button")) b.setAttribute("aria-pressed", String(b.classList.contains("on")));
 }
+// Seg glider (Phase 1): slide the accent pill behind the active button.
+// transform+width only; measures AFTER first reveal (rAF in boot()). A pill
+// whose width is still 0 re-anchors silently; a live pill glides.
+function segGlide(g, forceFirst) {
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const b = g.querySelector("button.on");
+  if (!b) return;
+  const r = b.getBoundingClientRect(), gr = g.getBoundingClientRect();
+  const first = forceFirst || !g.classList.contains("seg-ready")
+    || parseFloat(g.style.getPropertyValue("--seg-w") || "0") === 0;
+  g.style.setProperty("--seg-x", `${r.left - gr.left - 4}px`);
+  g.style.setProperty("--seg-w", `${r.width}px`);
+  if (first) void g.offsetWidth;
+  g.classList.add("seg-ready");
+}
+function segGlideAll(){ for (const g of ["c-ipv6","c-fakedns","c-lan"]) segGlide($(g)); }
+segGlideAll();
+window.addEventListener("resize", segGlideAll);
+// Re-measure after an accordion expands/collapses (closed containers measure 0).
+document.addEventListener("click", (e) => {
+  const s = e.target.closest("details.acc > summary");
+  if (!s) return;
+  requestAnimationFrame(() => s.parentElement.querySelectorAll(".seg").forEach(segGlide));
+}, true);
 $("c-secure-doh-preset").addEventListener("change", () => {
   $("c-secure-doh").classList.toggle("hidden", $("c-secure-doh-preset").value !== "custom");
   markDirty();
@@ -3135,7 +3201,13 @@ function enhancedSelect(sel) {
     btn.setAttribute("aria-expanded", "false");
     btn.removeAttribute("aria-activedescendant");
     menu.classList.remove("esel-shown");
-    void menu.offsetWidth;
+    // Exit motion (Phase 1, SmoothUI dropdown spec): fade+slide-up, 150ms,
+    // pointer-events:none — rows are dead the moment the menu leaves.
+    if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      menu.dataset.state = "closed";
+      setTimeout(() => { delete menu.dataset.state; }, 150);
+      void menu.offsetWidth;
+    }
     window.removeEventListener("scroll", position, true);
     window.removeEventListener("resize", position);
   }
