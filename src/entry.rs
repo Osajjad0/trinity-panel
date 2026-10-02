@@ -54,7 +54,7 @@ async fn scheduled(event: worker::ScheduledEvent, env: Env, _ctx: worker::Schedu
     // missing measurements and re-probes stale verdicts — a change-gated
     // verify would leave a stable catalog's stale quarantines unhealed.
     if report.ok {
-        // Cron guard: stop launching passes at T+4 min (cron fires every 2 h).
+        // Cron guard: stop launching passes at T+4 min (cron fires every 6 h).
         const CRON_GUARD_MS: u64 = 240_000;
         let mut cursor = 0usize;
         loop {

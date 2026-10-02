@@ -1186,8 +1186,8 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
           <span id="cat-countries">—</span> locations ·
           <span id="cat-endpoints">—</span> verified ·
           last sync <span id="cat-sync-time">—</span><br>
-          pulls <span id="cat-source" class="mono">—</span> every 2 h
-          (auto; next pull <span id="cat-next" class="mono">—</span>)</p>
+          pulls <span id="cat-source" class="mono">—</span> every 6 h
+          (auto; next pull + verification <span id="cat-next" class="mono">—</span>)</p>
         <div class="field" style="max-width:340px">
           <label for="cat-country">Location</label>
           <select id="cat-country">
@@ -1945,13 +1945,13 @@ function renderCatalog() {
   const src = c && c.sourceUrl ? c.sourceUrl.replace(/^https:\/\//, "") : null;
   $("cat-source").textContent = src || "public verified feed";
   // §20: next scheduled pull — the deploy-registered cron fires at :23 of
-  // every even UTC hour ("23 0-22/2 * * *"); compute the next fire locally.
+  // every 6th UTC hour ("23 */6 * * *"); compute the next fire locally.
   {
     const now = new Date();
-    const next = new Date(now); // strict: first even-hour :23 strictly after now
+    const next = new Date(now); // strict: first 6th-hour :23 strictly after now
     next.setUTCMinutes(23, 0, 0);
-    if (next <= now) next.setUTCHours(next.getUTCHours() + 1);
-    if (next.getUTCHours() % 2 !== 0) next.setUTCHours(next.getUTCHours() + 1);
+    next.setUTCHours(Math.floor(next.getUTCHours() / 6) * 6);
+    if (next <= now) next.setUTCHours(next.getUTCHours() + 6);
     $("cat-next").textContent = next.toISOString().slice(11, 16) + " UTC";
   }
   setVal("cat-countries", c ? String(c.countryCount ?? "—") : "—");
