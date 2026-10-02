@@ -2818,7 +2818,10 @@ $("save").onclick = async () => {
       const modeLabel = OUTBOUND.mode === "pool" ? "Proxy-IP Pool"
         : OUTBOUND.mode === "proxyIp" ? "Proxy IP — Custom"
         : OUTBOUND.mode === "nat64" ? "NAT64" : "Off";
-      setSaveState("saved", `Saved — ${modeLabel} · ${loc}. Apps pick this up the next time they refresh.`);
+      // Header note stays terse (paste d8e203 §25): what was saved, nothing
+      // more — the long "apps pick this up…" sentence lived in the header and
+      // overflowed on mobile. The toast already carried the short form.
+      setSaveState("saved", `Saved — ${modeLabel} · ${loc}`);
       toast(`Saved — ${modeLabel} · ${loc}`);
       DIRTY = false;
       for (const b of document.querySelectorAll("[data-dirty-for]")) b.hidden = true;
