@@ -786,18 +786,16 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
             Err((e, dial_ip, tcp_ms)) => (prior.observed_fail(e, now), dial_ip, tcp_ms, None),
         };
         // Diversified generic-TCP relay check (3 SNIs: own-origin / Fastly
-        // / generic). Only when the box itself is reachable; None when the
-        // edge probe already failed. Observability only — no demotion from
-        // any single verdict (v1.9.8 §9: repeated evidence required).
-        let relayed = if health.ok {
-            Some([
-                relay_probe_ok(&host, port, &RELAY_GH_HELLO).await,
-                relay_probe_ok(&host, port, &RELAY_ST_HELLO).await,
-                relay_probe_ok(&host, port, &RELAY_GO_HELLO).await,
-            ])
-        } else {
-            None
-        };
+        // / generic), one plain-TCP dial per SNI. Independent of the edge
+        // probe: worker::Socket cannot set SNI for an IP candidate, so the
+        // edge probe legitimately fails there while the relay path (no TLS
+        // at the dial, destination SNI inside the payload) stays fully
+        // testable. Observability only — no demotion from any verdict.
+        let relayed = Some([
+            relay_probe_ok(&host, port, &RELAY_GH_HELLO).await,
+            relay_probe_ok(&host, port, &RELAY_ST_HELLO).await,
+            relay_probe_ok(&host, port, &RELAY_GO_HELLO).await,
+        ]);
         results.push(Row {
             host,
             port,
