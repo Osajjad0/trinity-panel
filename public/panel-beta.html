@@ -1603,7 +1603,7 @@ function renderHealth() {
     tr.append(pinTd);
     const mark = !r.measured ? "·" : r.healthy ? "✓" : "✗";
     const cls = !r.measured ? "muted" : r.healthy ? "" : "sev-degraded";
-    tr.append(el("td", { style: "padding:.25rem .5rem", className: cls, textContent: `${r.host}${r.port ? ":" + r.port : ""}` }));
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: cls, textContent: `${r.host}${r.port ? ":" + r.port : ""}${r.source === "catalog" ? " ·pool" : ""}` }));
     // v1.9.6: feed quality verdict "risk/type/confidence/source". Empty (or a
     // host key with no port suffix) = unmeasured — rendered muted, never bad.
     const qcell = el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: "—" });

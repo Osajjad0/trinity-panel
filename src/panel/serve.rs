@@ -685,9 +685,23 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
     use crate::relay::outbound_state::{self, OutboundState};
 
     let settings = load_settings(env, "").await;
-    // Manual candidates only. Catalog endpoints are verified by the GitHub
-    // scanner; Trinity never probes them (V24.4.1).
+    // Probe scope = manual candidates UNION the runtime pool. The V24.4.1
+    // rule (never probe catalog endpoints) covered only the EDGE identity
+    // check; v1.9.8 §8/§9: the relayed-TCP verdict is meaningless unless it
+    // touches the boxes sessions actually dial, so the runtime pool is
+    // included for the through-probe. Catalog rows are marked source=catalog
+    // and their health records are NOT written (scanner stays authoritative
+    // for geo/capability class; Trinity only adds the worker-vantage relay
+    // verdict it uniquely can measure).
     let mut candidates = settings.outbound.proxy_candidates.clone();
+    let mut scope: Vec<(String, &'static str)> =
+        candidates.iter().map(|h| (h.clone(), "manual")).collect();
+    for h in runtime_candidates_for_state(env, &settings.outbound).await {
+        if !candidates.contains(&h) {
+            scope.push((h.clone(), "catalog"));
+            candidates.push(h);
+        }
+    }
     if candidates.is_empty() {
         return refuse("No Proxy-IP candidates to measure.");
     }
@@ -722,6 +736,10 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         /// the edge probe already failed (no box to probe through). One SNI
         /// is never proof of universal capability (v1.9.8 §9).
         relayed: Option<[bool; 3]>,
+        /// manual = operator-configured; catalog = runtime pool member (its
+        /// geo/capability class stays scanner-authoritative; only the relay
+        /// verdict is Trinity-measured).
+        source: &'static str,
         ok: bool,
         country: String,
         colo: String,
@@ -734,9 +752,8 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         #[serde(skip_serializing_if = "String::is_empty")]
         error: String,
     }
-    candidates.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     let mut results = Vec::new();
-    for host in candidates {
+    for (host, source) in scope {
         let port: u16 = 443;
         // Health key matches `candidate_key` (host:port) so dial-path demotion,
         // LKG and the panel all read and write the same record. Port-443
@@ -798,8 +815,13 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
             success_rate: health.success_rate(),
             score: health.score(&wanted),
             error: health.error.clone(),
+            source,
         });
-        state.geo.insert(key, health);
+        // Catalog rows: relay verdict only. Their geo/health/quarantine state
+        // stays scanner-authoritative (V24.4.1 contract preserved).
+        if source == "manual" {
+            state.geo.insert(key, health);
+        }
     }
     // Best score first: the panel shows the same order the dial path will use.
     results.sort_by(|a, b| {
