@@ -300,7 +300,29 @@ impl Health {
     }
 }
 
-impl OutboundState {
+impl OutboundState {    /// Fold a session-sourced failure into this record: real traffic dialed
+    /// this candidate, connected, and the destination never answered through
+    /// it (the dirty-IP signature — destination TLS never completed). Unlike
+    /// a probe failure this is destination-dependent evidence, so it records
+    /// only the FIRST such fail (one soft demotion, never escalates to a
+    /// quarantine from session traffic alone) and self-heals on the next
+    /// [`Self::observed_ok`] probe.
+    #[must_use]
+    pub fn with_session_fail(mut self, key: &str, now_ms: u64) -> (Self, bool) {
+        let known_ok = self.geo.get(key).is_some_and(|h| h.ok);
+        if known_ok || !self.geo.contains_key(key) {
+            let health = Health::default().observed_fail(
+                "session: destination unreachable via this egress".into(),
+                now_ms,
+            );
+            self.geo.insert(key.to_owned(), health);
+            (self, true)
+        } else {
+            (self, false)
+        }
+    }
+
+
     /// Parse a stored document, falling back to "nothing known" on any
     /// malformed input. A corrupted blob must never cost a session its
     /// default routing behaviour.
@@ -405,6 +427,16 @@ pub fn candidate_key(target: &Target) -> String {
         Host::Ip(ip) => ip.to_string(),
     };
     format!("{host}:{}", target.port)
+}
+
+/// The health record for a candidate: probes and sessions write
+/// [`candidate_key`] (host:port); legacy documents may carry bare
+/// [`host_key`] rows, so both forms are consulted (key match first).
+fn health_of<'a>(state: &'a OutboundState, target: &Target) -> Option<&'a Health> {
+    state
+        .geo
+        .get(&candidate_key(target))
+        .or_else(|| state.geo.get(&host_key(target)))
 }
 
 /// Move the fresh preferred candidate forward in the plan — behind the direct
@@ -535,8 +567,12 @@ fn rank_by_quality(
     // unprobed passthrough still outranks a healthy cf-only box in an
     // enforced pool.
     let health_band = |t: &Target| -> u8 {
-        match state.geo.get(&host_key(t)) {
+        match health_of(state, t) {
             Some(h) if h.quarantined() || h.rotating => 2,
+            // A recorded session failure (real traffic could not reach a
+            // destination through this egress) demotes without quarantining:
+            // the box stays eligible and self-heals on the next probe.
+            Some(h) if !h.ok && !h.is_runtime_error() => 1,
             _ => 0,
         }
     };
@@ -546,7 +582,7 @@ fn rank_by_quality(
         // the selected country, then reputation. Stable sort keeps catalog
         // order inside each band.
         let geo_match = |t: &Target| -> u8 {
-            match state.geo.get(&host_key(t)) {
+            match health_of(state, t) {
                 Some(h) if h.country.eq_ignore_ascii_case(wanted) => 0,
                 _ => 1,
             }
@@ -569,8 +605,8 @@ fn rank_by_quality(
         // Stable sort on the negated score: equal-scoring candidates (including
         // every unmeasured one, all scoring 0) keep the operator's own order.
         tail.sort_by(|a, b| {
-            let sa = state.geo.get(&host_key(a)).map_or(0.0, |h| h.score(country));
-            let sb = state.geo.get(&host_key(b)).map_or(0.0, |h| h.score(country));
+            let sa = health_of(state, a).map_or(0.0, |h| h.score(country));
+            let sb = health_of(state, b).map_or(0.0, |h| h.score(country));
             let ord = sb.partial_cmp(&sa).unwrap_or(core::cmp::Ordering::Equal);
             // Feed reputation (v1.9.6) breaks health ties so the scanner's
             // risk verdict survives to dial time. Only a tie-breaker: health
@@ -1278,9 +1314,45 @@ mod tests {
     }
 
     #[test]
+    fn session_fail_demotes_and_self_heals() {
+        // Real-traffic evidence: a candidate that connected but carried
+        // nothing (dirty-IP signature) demotes behind untried candidates but
+        // never quarantines — a probe's observed_ok clears it again.
+        let p = plan(&["dest.example", "bad.example", "fresh.example"], 443);
+        let (s, changed) = state(None, NOW).with_session_fail("bad.example:443", NOW);
+        assert!(changed, "first session fail must record");
+        let h = s.geo.get("bad.example:443").expect("session fail recorded");
+        assert!(!h.ok);
+        assert!(!h.quarantined(), "session evidence must not quarantine");
+        let out = order_plan_ranked(p, &s, NOW, "US", "", &std::collections::BTreeMap::new(), &std::collections::BTreeMap::new());
+        assert_eq!(out.candidates[1], t("fresh.example", 443), "clean untried outranks session-failed");
+        // Self-heal: a successful probe clears the session-sourced verdict.
+        let bad = s.geo.get("bad.example:443").unwrap().clone();
+        let healed_health = bad.observed_ok("US".into(), "EWR".into(), "203.0.113.7".into(), 50, NOW + 1_000);
+        assert!(healed_health.ok, "probe ok clears the session-sourced verdict");
+    }
+
+    #[test]
+    fn session_fails_do_not_escalate_to_quarantine() {
+        // Repeated dirty sessions on the same candidate must NOT push
+        // fail_count into quarantine territory: the failure is
+        // destination-dependent (gitlab works, speedtest.net may not), and
+        // quarantining would blind the whole pool per destination.
+        let (s0, _) = state(None, NOW).with_session_fail("bad.example:443", NOW);
+        let (s1, again1) = s0.clone().with_session_fail("bad.example:443", NOW + 1);
+        assert!(!again1, "repeat must not re-record");
+        let (s2, again2) = s1.with_session_fail("bad.example:443", NOW + 2);
+        assert!(!again2, "repeat must not re-record");
+        let h = s2.geo.get("bad.example:443").unwrap();
+        assert_eq!(h.fail_count, 1, "session evidence stays a single soft fail");
+        assert!(!h.quarantined());
+    }
+
+    #[test]
     fn feed_health_dominates_risk_never_destroys_usability() {
         // An excellent-health high-risk candidate still outranks a mediocre
         // low-risk one: reputation is a tie-breaker, never a disqualifier.
+
         let p = plan(&["dest.example", "dirty.example", "clean.example"], 443);
         let mut s = state(None, NOW);
         s.geo.insert("dirty.example".into(), healthy("DE", 10));

@@ -569,16 +569,25 @@ async fn serve(
     // traffic" proxy: the coalescing buffer flushed at least once.
     // `ponytail:` XHTTP counts real bytes; add a shared cell only if a
     // tiny-but-alive session is ever observed mis-training the preference.
+    let dirty = !flushed;
+    let winner_key = plan.candidates.get(winner_idx).map(outbound_state::candidate_key);
+    // Session-sourced demotion, the same rule XHTTP's teardown applies: a
+    // connected winner that carried nothing records its first soft fail so
+    // the next plan ranks it behind untried candidates.
+    let (ws_doc, session_fail_recorded) =
+        if dirty && plan.candidates.get(winner_idx) != Some(&plan.logical) {
+            let key = winner_key.clone().unwrap_or_default();
+            let (doc, changed) =
+                known_state.clone().with_session_fail(&key, worker::Date::now().as_millis());
+            (doc, changed)
+        } else {
+            (known_state.clone(), false)
+        };
     match outbound_state::lkg_on_session_result(
         known_state.preferred.as_deref(),
         known_state.updated_at_ms,
         outbound_state::DialVerdict::Won {
-            winner: plan
-                .candidates
-                .get(winner_idx)
-                .map(outbound_state::candidate_key)
-                .unwrap_or_default()
-                .as_str(),
+            winner: winner_key.as_deref().unwrap_or_default(),
             is_direct: plan.candidates.get(winner_idx) == Some(&plan.logical),
             first_failed: failed_first
                 .and_then(|i| plan.candidates.get(i))
@@ -586,12 +595,12 @@ async fn serve(
                 .as_deref(),
         },
         worker::Date::now().as_millis(),
-        !flushed,
+        dirty,
     ) {
         outbound_state::LkgAction::Record(key) => {
             write_lkg(
                 env,
-                &known_state.clone().with_preference(
+                &ws_doc.with_preference(
                     Some(key),
                     worker::Date::now().as_millis(),
                 ),
@@ -599,9 +608,13 @@ async fn serve(
             .await;
         }
         outbound_state::LkgAction::Clear => {
-            write_lkg(env, &known_state.clone().cleared_preference()).await
+            write_lkg(env, &ws_doc.cleared_preference()).await
         }
-        outbound_state::LkgAction::Keep => {}
+        outbound_state::LkgAction::Keep => {
+            if session_fail_recorded {
+                write_lkg(env, &ws_doc).await;
+            }
+        }
     }
 
     Ok(())

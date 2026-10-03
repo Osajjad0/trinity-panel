@@ -351,7 +351,19 @@ pub fn candidate_health(
     let mut rows: Vec<CandidateHealth> = hosts
         .iter()
         .map(|host| {
-            let key = host.trim().to_ascii_lowercase();
+            // Health rows are keyed by candidate_key (host:port); legacy
+            // bare-host rows still resolve (key match first).
+            let lower = host.trim().to_ascii_lowercase();
+            let key = if geo.contains_key(&lower) {
+                lower.clone()
+            } else {
+                let with_port = format!("{lower}:443");
+                if geo.contains_key(&with_port) {
+                    with_port
+                } else {
+                    lower.clone()
+                }
+            };
             match geo.get(&key) {
                 Some(h) => CandidateHealth {
                     host: host.clone(),

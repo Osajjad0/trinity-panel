@@ -1167,6 +1167,23 @@ async fn own_session(ctx: OwnerContext) {
             let is_direct = plan.candidates.get(*winner_idx) == Some(&plan.logical);
             let failed_key =
                 failed_first.and_then(|i| plan.candidates.get(i)).map(outbound_state::candidate_key);
+            // A session that moved almost no downlink bytes through a
+            // connected egress is the dirty-IP signature (destination TLS
+            // never completes). Small non-zero allowance for protocol
+            // headers/refusals so a legitimate tiny response is not
+            // mistaken for one.
+            let dirty = diag.downstream_sent.get() < 1024;
+            // Session-sourced demotion: when the winning proxy candidate
+            // connected but carried nothing, record its first soft fail so
+            // the next plan ranks it behind untried candidates (durable.rs
+            // teardown is the ONE path every session exits through).
+            let (lkg_doc, session_fail_recorded) = if dirty && !is_direct {
+                let key = winner_key.clone().unwrap_or_default();
+                let (doc, changed) = lkg_for_teardown.with_session_fail(&key, now_ms());
+                (doc, changed)
+            } else {
+                (lkg_for_teardown, false)
+            };
             match outbound_state::lkg_on_session_result(
                 preferred.as_deref(),
                 *updated_at,
@@ -1176,20 +1193,23 @@ async fn own_session(ctx: OwnerContext) {
                     first_failed: failed_key.as_deref(),
                 },
                 now_ms(),
-                // A session that moved almost no downlink bytes through a
-                // connected egress is the dirty-IP signature (destination TLS
-                // never completes). Small non-zero allowance for protocol
-                // headers/refusals so a legitimate tiny response is not
-                // mistaken for one.
-                diag.downstream_sent.get() < 1024,
+                dirty,
             ) {
                 outbound_state::LkgAction::Record(key) => {
-                    write_lkg(lkg_for_teardown.clone().with_preference(Some(key), now_ms())).await;
+                    write_lkg(lkg_doc.with_preference(Some(key), now_ms())).await;
                 }
                 outbound_state::LkgAction::Clear => {
-                    write_lkg(lkg_for_teardown.clone().cleared_preference()).await
+                    write_lkg(lkg_doc.cleared_preference()).await
                 }
-                outbound_state::LkgAction::Keep => {}
+                outbound_state::LkgAction::Keep => {
+                    // The preference rules may keep; the health fold still
+                    // deserves its write — but only the fold changed, and
+                    // merged_with_stored dedupes by freshness, so skip when
+                    // nothing was folded.
+                    if session_fail_recorded {
+                        write_lkg(lkg_doc).await;
+                    }
+                }
             }
         }
         OwnerOutcome::DialFailed { preferred, .. } => {
