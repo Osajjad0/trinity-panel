@@ -913,12 +913,15 @@ const RELAY_GO_HELLO: [u8; 162] = [
 async fn relay_probe_ok(host: &str, port: u16, hello: &[u8]) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let dial_addr = probe_dial_address(host);
-    let Ok(mut sock) = worker::Socket::builder()
-        .allow_half_open(true)
-        .secure_transport(worker::SecureTransport::Off)
-        .connect(&dial_addr, port)
-    else {
+    let target = crate::protocol::Target {
+        host: host
+            .parse::<std::net::IpAddr>()
+            .map_or_else(|_| crate::protocol::Host::Domain(host.trim().to_owned().into_boxed_str()), crate::protocol::Host::Ip),
+        port,
+    };
+    // Dial through the SAME code path sessions use (connect::open) so the
+    // probe measures the relay, not a divergent socket recipe.
+    let Ok(mut sock) = crate::relay::connect::open(&target) else {
         return false;
     };
     // The connect is lazy: await the TCP handshake before writing, exactly
