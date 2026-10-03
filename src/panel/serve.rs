@@ -921,6 +921,22 @@ async fn relay_probe_ok(host: &str, port: u16, hello: &[u8]) -> bool {
     else {
         return false;
     };
+    // The connect is lazy: await the TCP handshake before writing, exactly
+    // like the session dial path (open_with_plan_tracked) does. Writing into
+    // a socket whose handshake has not completed silently loses the bytes.
+    let handshook = futures_util::future::select(
+        Box::pin(sock.opened()),
+        Box::pin(gloo_timers::future::TimeoutFuture::new(5_000)),
+    )
+    .await;
+    // `handshook` still owns the losing future (holding the `sock` borrow),
+    // so extract the verdict and drop it before touching `sock` again.
+    let ok_open = matches!(handshook, futures_util::future::Either::Left(_));
+    drop(handshook);
+    if !ok_open {
+        let _ = sock.close().await;
+        return false;
+    }
     if sock.write_all(hello).await.is_err() {
         let _ = sock.close().await;
         return false;
