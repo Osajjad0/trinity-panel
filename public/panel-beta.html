@@ -1617,10 +1617,14 @@ function renderHealth() {
     tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.dialIp ? (r.dialIp.includes(":") ? r.dialIp : `${r.dialIp}:${r.port ?? 443}`) : "—" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: r.tcpMs != null ? "" : "muted", textContent: r.tcpMs != null ? `PASS ${r.tcpMs} ms` : "FAIL" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: r.probeMs != null ? "" : "muted", textContent: r.probeMs != null ? `PASS ${r.probeMs} ms` : "FAIL" }));
-    // v1.9.8: through-the-box generic-TCP relay check (ClientHello -> ServerHello).
-    // null = not probed (edge probe failed); muted, never rendered as bad.
-    const relayCls = r.relayed == null ? "muted" : r.relayed ? "" : "sev-degraded";
-    tr.append(el("td", { style: "padding:.25rem .5rem", className: relayCls, textContent: r.relayed == null ? "—" : r.relayed ? "OK" : "no", title: r.relayed == null ? "not probed" : r.relayed ? "forwards generic TCP" : "box refused a github.com TLS handshake" }));
+    // v1.9.8: through-the-box generic-TCP relay verdicts for a diversified
+    // SNI set [github, speedtest, google]. null = not probed (edge probe
+    // failed); muted, never rendered as bad. Compact render: GH/ST/GO.
+    const rl = r.relayed == null ? null : r.relayed;
+    const relayTxt = rl == null ? "—" : `GH ${rl[0] ? "✓" : "✗"} · ST ${rl[1] ? "✓" : "✗"} · GO ${rl[2] ? "✓" : "✗"}`;
+    const relayCls = rl == null ? "muted" : rl.every(Boolean) ? "" : rl.some(Boolean) ? "" : "sev-degraded";
+    const relayTitle = rl == null ? "not probed" : `github=${rl[0]} speedtest=${rl[1]} google=${rl[2]} — one SNI is not proof of universal relay capability`;
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: relayCls, textContent: relayTxt, title: relayTitle }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.measured ? `${r.latencyMs} ms` : "—" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.ok ? `${r.country || "?"}${r.colo ? " · " + r.colo : ""}` : "—" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: cls, textContent: !r.measured ? "unknown" : r.healthy ? "healthy" : "failed" }));
