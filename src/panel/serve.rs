@@ -717,6 +717,10 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         tcp_ms: Option<u32>,
         /// TLS handshake + HTTP trace RTT after TCP (None when TCP failed).
         probe_ms: Option<u32>,
+        /// Some(true/false): through-the-box generic-TCP probe result
+        /// (ClientHello -> ServerHello). None: the edge probe already failed,
+        /// so there is no box to probe through.
+        relayed: Option<bool>,
         ok: bool,
         country: String,
         colo: String,
@@ -763,12 +767,20 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
             ),
             Err((e, dial_ip, tcp_ms)) => (prior.observed_fail(e, now), dial_ip, tcp_ms, None),
         };
+        // Generic-TCP relay check. Only meaningful when the box itself is
+        // reachable; skipped (None) when probe_one already failed.
+        let relayed = if health.ok {
+            Some(relay_probe_ok(&host, port).await)
+        } else {
+            None
+        };
         results.push(Row {
             host,
             port,
             dial_ip,
             tcp_ms,
             probe_ms,
+            relayed,
             ok: health.ok,
             country: health.country.clone(),
             colo: health.colo.clone(),
@@ -815,6 +827,77 @@ struct Trace {
 /// A failed probe, with whatever dial evidence was gathered first.
 #[cfg(target_arch = "wasm32")]
 type ProbeError = (String, String, Option<u32>);
+
+/// A real TLS 1.2 ClientHello for `github.com` (SNI extension included),
+/// captured from a standard TLS stack and verified live against the origin.
+///
+/// Probing a representative NON-Cloudflare origin *through* a candidate
+/// answers the question the edge handshake cannot: does this box actually
+/// forward generic TCP for CF-source connections, or only terminate TLS for
+/// its own zone? Some candidate boxes SNI-route their upstreams by connection
+/// source, so a residential-vantage scanner verdict can go stale the moment
+/// the relay path runs from Workers. 158 bytes, one record, no payload.
+#[cfg(target_arch = "wasm32")]
+const RELAY_PROBE_CLIENTHELLO: [u8; 158] = [
+    0x16, 0x03, 0x01, 0x00, 0x99, 0x01, 0x00, 0x00, 0x95, 0x03, 0x03, 0x9f, 0x50, 0xce, 0x88,
+    0x75, 0xe4, 0x8e, 0x3a, 0x8c, 0xa0, 0xda, 0xbc, 0xcb, 0xfb, 0xa2, 0x39, 0xd4, 0x1e, 0x34,
+    0xbb, 0x9e, 0x0f, 0x07, 0x72, 0xba, 0xaa, 0x04, 0x48, 0xf9, 0xe2, 0x9d, 0x48, 0x00, 0x00,
+    0x02, 0xc0, 0x2f, 0x01, 0x00, 0x00, 0x6a, 0xff, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0x00, 0x0d, 0x00, 0x00, 0x0a, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f,
+    0x6d, 0x00, 0x0b, 0x00, 0x04, 0x03, 0x00, 0x01, 0x02, 0x00, 0x0a, 0x00, 0x0c, 0x00, 0x0a,
+    0x00, 0x1d, 0x00, 0x17, 0x00, 0x1e, 0x00, 0x18, 0x00, 0x19, 0x00, 0x23, 0x00, 0x00, 0x00,
+    0x16, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x2a, 0x00, 0x28, 0x04, 0x03,
+    0x05, 0x03, 0x06, 0x03, 0x08, 0x07, 0x08, 0x08, 0x08, 0x09, 0x08, 0x0a, 0x08, 0x0b, 0x08,
+    0x04, 0x08, 0x05, 0x08, 0x06, 0x04, 0x01, 0x05, 0x01, 0x06, 0x01, 0x03, 0x03, 0x03, 0x01,
+    0x03, 0x02, 0x04, 0x02, 0x05, 0x02, 0x06, 0x02,
+];
+
+/// Forward-probe one candidate: speak a TLS ClientHello (github.com SNI) to
+/// the candidate and require a ServerHello-class record back.
+///
+/// `Ok(true)`  — the box relays generic TCP for CF-source connections.
+/// `Ok(false)` — the TCP port answered but the handshake was refused/blackholed.
+/// `Err`       — the dial itself failed (already surfaced by `probe_one`).
+///
+/// Budget: one 5 s handshake budget, a single 256-byte read. Bounded by
+/// construction: one socket, one round trip, no payload beyond the constant.
+#[cfg(target_arch = "wasm32")]
+async fn relay_probe_ok(host: &str, port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dial_addr = probe_dial_address(host);
+    let Ok(mut sock) = worker::Socket::builder()
+        .allow_half_open(true)
+        .secure_transport(worker::SecureTransport::Off)
+        .connect(&dial_addr, port)
+    else {
+        return false;
+    };
+    if sock.write_all(&RELAY_PROBE_CLIENTHELLO).await.is_err() {
+        let _ = sock.close().await;
+        return false;
+    }
+    if sock.flush().await.is_err() {
+        let _ = sock.close().await;
+        return false;
+    }
+    let mut buf = [0u8; 256];
+    let read = async {
+        match sock.read(&mut buf).await {
+            Ok(n) if n > 0 => Some(buf[0] == 0x16),
+            _ => None,
+        }
+    };
+    let outcome =
+        futures_util::future::select(Box::pin(read), Box::pin(gloo_timers::future::TimeoutFuture::new(5_000)));
+    let ok = matches!(
+        outcome.await,
+        futures_util::future::Either::Left((Some(true), _))
+    );
+    let _ = sock.close().await;
+    ok
+}
+
 
 /// Measure one candidate: TLS to :443, `GET /cdn-cgi/trace`, read the exit
 /// identity Cloudflare reports back through that egress.

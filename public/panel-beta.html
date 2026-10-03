@@ -1587,7 +1587,7 @@ function renderHealth() {
   // Source-listed is NOT healthy — health comes only from these probes.
   const table = el("table", { style: "width:100%;border-collapse:collapse;font-size:.92rem" });
   const head = el("tr");
-  for (const h of ["", "Candidate", "Quality", "Dial", "TCP", "Probe", "RTT", "Exit country", "Status", "Reason"]) {
+  for (const h of ["", "Candidate", "Quality", "Dial", "TCP", "Probe", "Relay", "RTT", "Exit country", "Status", "Reason"]) {
     head.append(el("th", { style: "text-align:left;padding:.25rem .5rem;border-bottom:1px solid var(--border)", textContent: h }));
   }
   table.append(head);
@@ -1617,6 +1617,10 @@ function renderHealth() {
     tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.dialIp ? (r.dialIp.includes(":") ? r.dialIp : `${r.dialIp}:${r.port ?? 443}`) : "—" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: r.tcpMs != null ? "" : "muted", textContent: r.tcpMs != null ? `PASS ${r.tcpMs} ms` : "FAIL" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: r.probeMs != null ? "" : "muted", textContent: r.probeMs != null ? `PASS ${r.probeMs} ms` : "FAIL" }));
+    // v1.9.8: through-the-box generic-TCP relay check (ClientHello -> ServerHello).
+    // null = not probed (edge probe failed); muted, never rendered as bad.
+    const relayCls = r.relayed == null ? "muted" : r.relayed ? "" : "sev-degraded";
+    tr.append(el("td", { style: "padding:.25rem .5rem", className: relayCls, textContent: r.relayed == null ? "—" : r.relayed ? "OK" : "no", title: r.relayed == null ? "not probed" : r.relayed ? "forwards generic TCP" : "box refused a github.com TLS handshake" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.measured ? `${r.latencyMs} ms` : "—" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.ok ? `${r.country || "?"}${r.colo ? " · " + r.colo : ""}` : "—" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: cls, textContent: !r.measured ? "unknown" : r.healthy ? "healthy" : "failed" }));
