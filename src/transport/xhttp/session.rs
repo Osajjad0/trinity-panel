@@ -57,6 +57,11 @@ pub struct UploadQueue {
     max_buffered: usize,
     max_buffer_bytes: usize,
     max_lookahead: u64,
+    /// Monotonic ms stamped by the last chunk that advanced the stream.
+    last_progress_ms: u64,
+    /// A chunk has been delivered, so a frozen expectation is a real stall
+    /// rather than a session that never uploaded.
+    started: bool,
 }
 
 impl UploadQueue {
@@ -72,6 +77,9 @@ impl UploadQueue {
             // A chunk more than this far ahead cannot be legitimate: the
             // client would have had to send that many POSTs we never saw.
             max_lookahead: max_buffered as u64 * 4,
+            // Both seeded by the first accepted chunk in `push`.
+            last_progress_ms: 0,
+            started: false,
         }
     }
 
@@ -81,19 +89,49 @@ impl UploadQueue {
         self.next_seq
     }
 
+    /// Milliseconds since the last chunk that advanced the stream.
+    #[must_use]
+    pub fn stalled_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.last_progress_ms)
+    }
+
+    /// True when this session has delivered uplink bytes but the expected
+    /// sequence number has not advanced inside one gap window.
+    ///
+    /// Without this a chunk lost in flight -- an HTTP/2 GOAWAY on any client
+    /// older than xray #6632 (which added `Request.GetBody` so the body can
+    /// be replayed), or a reset between the client and here -- leaves every
+    /// later chunk buffered behind a gap the server can never fill. The
+    /// session then holds a live socket and a live download GET while
+    /// forwarding no uplink at all, until the buffer budget eventually
+    /// rejects it. Xray leaves the wait unbounded too (issue #4846 asks for
+    /// exactly this guard).
+    ///
+    /// Monotonic elapsed time only, and gated on having delivered bytes, so
+    /// it cannot fire on an idle-but-healthy session or on a wall-clock jump.
+    #[must_use]
+    pub fn is_stalled(&self, now_ms: u64, limit_ms: u64) -> bool {
+        self.started && self.stalled_ms(now_ms) > limit_ms
+    }
+
     /// Chunks currently held awaiting a predecessor.
     #[must_use]
     pub fn buffered(&self) -> usize {
         self.pending.len()
     }
 
-    /// Accept one uplink chunk.
+    /// Accept one uplink chunk. `now_ms` is monotonic and stamps progress.
     ///
     /// # Errors
     /// [`QueueError`] when the chunk cannot be buffered. The caller should
     /// answer `400` and tear the session down — every variant means the peer
     /// is either broken or hostile, and continuing costs memory.
-    pub fn push(&mut self, seq: u64, data: Bytes) -> Result<Accepted, QueueError> {
+    pub fn push(
+        &mut self,
+        seq: u64,
+        data: Bytes,
+        now_ms: u64,
+    ) -> Result<Accepted, QueueError> {
         // Already delivered. A retry of an acknowledged POST, or the client
         // resending after a timeout it did not need. Drop it silently: this is
         // the case that corrupts the stream if forwarded twice.
@@ -119,6 +157,10 @@ impl UploadQueue {
                 ready.push(chunk);
                 self.next_seq += 1;
             }
+            // Only real progress stamps the clock: a late out-of-order POST
+            // must not keep a genuinely lost gap alive.
+            self.last_progress_ms = now_ms;
+            self.started = true;
             return Ok(Accepted { ready, duplicate: false });
         }
 
@@ -140,6 +182,10 @@ impl UploadQueue {
 mod tests {
     use super::*;
 
+    /// Monotonic stand-in for the runtime clock `push` now stamps. Tests
+    /// that exercise the stall guard advance it explicitly.
+    const T: u64 = 1_000;
+
     const MAX_N: usize = 30;
     const MAX_B: usize = 4 * 1024 * 1024;
 
@@ -159,7 +205,7 @@ mod tests {
     fn in_order_chunks_pass_straight_through() {
         let mut q = q();
         for (i, s) in ["a", "b", "c"].iter().enumerate() {
-            let acc = q.push(i as u64, b(s)).expect("accepted");
+            let acc = q.push(i as u64,  b(s), T).expect("accepted");
             assert_eq!(joined(&acc.ready), *s);
             assert!(!acc.duplicate);
         }
@@ -169,12 +215,12 @@ mod tests {
     #[test]
     fn out_of_order_chunks_are_reassembled_in_order() {
         let mut q = q();
-        assert!(q.push(2, b("c")).expect("accepted").ready.is_empty());
-        assert!(q.push(1, b("b")).expect("accepted").ready.is_empty());
+        assert!(q.push(2, b("c"), T).expect("accepted").ready.is_empty());
+        assert!(q.push(1, b("b"), T).expect("accepted").ready.is_empty());
         assert_eq!(q.buffered(), 2);
 
         // Arrival of 0 releases 0, 1 and 2 as one contiguous run.
-        let acc = q.push(0, b("a")).expect("accepted");
+        let acc = q.push(0, b("a"), T).expect("accepted");
         assert_eq!(joined(&acc.ready), "abc");
         assert_eq!(q.buffered(), 0);
         assert_eq!(q.next_seq(), 3);
@@ -186,7 +232,7 @@ mod tests {
         let order = [7u64, 3, 0, 6, 1, 5, 2, 4];
         let mut out = String::new();
         for seq in order {
-            let acc = q.push(seq, b(&((b'a' + seq as u8) as char).to_string())).expect("accepted");
+            let acc = q.push(seq,  b(&((b'a' + seq as u8) as char).to_string()), T).expect("accepted");
             out.push_str(&joined(&acc.ready));
         }
         assert_eq!(out, "abcdefgh", "delivered stream must be in sequence order");
@@ -196,17 +242,17 @@ mod tests {
     #[test]
     fn duplicates_are_reported_not_forwarded() {
         let mut q = q();
-        q.push(0, b("a")).expect("accepted");
+        q.push(0, b("a"), T).expect("accepted");
 
         // Retransmit of an already-delivered chunk. Forwarding this would
         // corrupt the tunnelled protocol.
-        let again = q.push(0, b("a")).expect("accepted");
+        let again = q.push(0, b("a"), T).expect("accepted");
         assert!(again.duplicate);
         assert!(again.ready.is_empty());
 
         // Retransmit of a buffered-but-undelivered chunk.
-        q.push(2, b("c")).expect("accepted");
-        let dup = q.push(2, b("c")).expect("accepted");
+        q.push(2, b("c"), T).expect("accepted");
+        let dup = q.push(2, b("c"), T).expect("accepted");
         assert!(dup.duplicate);
         assert_eq!(q.buffered(), 1, "duplicate must not double-count the buffer");
     }
@@ -216,9 +262,9 @@ mod tests {
         let mut q = UploadQueue::new(3, MAX_B);
         // Withhold seq 0 and flood the queue with successors.
         for seq in 1..=3u64 {
-            q.push(seq, b("x")).expect("accepted");
+            q.push(seq,  b("x"), T).expect("accepted");
         }
-        assert_eq!(q.push(4, b("x")), Err(QueueError::TooManyBuffered));
+        assert_eq!(q.push(4, b("x"), T), Err(QueueError::TooManyBuffered));
     }
 
     #[test]
@@ -226,39 +272,39 @@ mod tests {
         // Count budget is generous; the byte budget must bind first.
         let mut q = UploadQueue::new(100, 1000);
         let chunk = Bytes::from(vec![0u8; 400]);
-        q.push(1, chunk.clone()).expect("accepted");
-        q.push(2, chunk.clone()).expect("accepted");
-        assert_eq!(q.push(3, chunk), Err(QueueError::BufferBytesExceeded));
+        q.push(1, chunk.clone(), T).expect("accepted");
+        q.push(2, chunk.clone(), T).expect("accepted");
+        assert_eq!(q.push(3, chunk, T), Err(QueueError::BufferBytesExceeded));
     }
 
     #[test]
     fn byte_budget_is_released_as_chunks_drain() {
         let mut q = UploadQueue::new(100, 1000);
         let chunk = Bytes::from(vec![0u8; 400]);
-        q.push(1, chunk.clone()).expect("accepted");
-        q.push(2, chunk.clone()).expect("accepted");
+        q.push(1, chunk.clone(), T).expect("accepted");
+        q.push(2, chunk.clone(), T).expect("accepted");
         // Releasing 0 drains 0,1,2 and frees their bytes.
-        q.push(0, Bytes::from_static(b"")).expect("accepted");
+        q.push(0, Bytes::from_static(b""), T).expect("accepted");
         assert_eq!(q.buffered(), 0);
         // The budget is available again.
-        q.push(4, chunk.clone()).expect("accepted");
-        q.push(5, chunk).expect("accepted");
+        q.push(4, chunk.clone(), T).expect("accepted");
+        q.push(5, chunk, T).expect("accepted");
     }
 
     #[test]
     fn rejects_sequence_numbers_implausibly_far_ahead() {
         let mut q = q();
-        assert_eq!(q.push(u64::MAX, b("x")), Err(QueueError::SeqTooFarAhead));
-        assert_eq!(q.push(1000, b("x")), Err(QueueError::SeqTooFarAhead));
+        assert_eq!(q.push(u64::MAX,  b("x"), T), Err(QueueError::SeqTooFarAhead));
+        assert_eq!(q.push(1000, b("x"), T), Err(QueueError::SeqTooFarAhead));
         // Just inside the window is fine.
-        assert!(q.push(MAX_N as u64 * 4, b("x")).is_ok());
+        assert!(q.push(MAX_N as u64 * 4,  b("x"), T).is_ok());
     }
 
     #[test]
     fn empty_chunks_advance_the_sequence() {
         // A zero-length POST is legal and must not stall the stream.
         let mut q = q();
-        let acc = q.push(0, Bytes::from_static(b"")).expect("accepted");
+        let acc = q.push(0, Bytes::from_static(b""), T).expect("accepted");
         assert_eq!(acc.ready.len(), 1);
         assert_eq!(q.next_seq(), 1);
     }
@@ -275,9 +321,131 @@ mod tests {
                 // Mix plausible sequence numbers with wild ones.
                 let seq = if seed % 4 == 0 { seed } else { seed % 24 };
                 let len = (seed % 300) as usize;
-                let _ = q.push(seq, Bytes::from(vec![0u8; len]));
+                let _ = q.push(seq,  Bytes::from(vec![0u8; len]), T);
             }
         }
+    }
+
+
+    // ---- stall guard (missing-sequence timeout) ----
+    //
+    // A chunk lost in flight -- an HTTP/2 GOAWAY on any client older than
+    // xray #6632, or a reset between client and server -- leaves later chunks
+    // buffered behind a gap that can never be filled. Before the guard the
+    // session relayed downloads forever while forwarding no uplink; these
+    // pin the bounded behaviour that lets a client reconnect instead.
+
+    const GAP_MS: u64 = 12_000;
+
+    /// Mirrors what the request handler sets: a chunk that did not advance the
+    /// expectation leaves the gap open, one that did closes it.
+    fn gap_flag(q: &UploadQueue) -> bool {
+        q.buffered() > 0
+    }
+
+    #[test]
+    fn sequential_upload_never_trips_the_guard() {
+        let mut q = UploadQueue::new(30, 4 << 20);
+        for seq in 0..50 {
+            q.push(seq, b("x"), seq * 10).expect("in order");
+            assert!(
+                !q.is_stalled(seq * 10, GAP_MS),
+                "a stream advancing one chunk per 10ms must never look stalled"
+            );
+        }
+        assert_eq!(q.next_seq(), 50);
+    }
+
+    #[test]
+    fn a_repaired_gap_never_trips_the_guard() {
+        let mut q = UploadQueue::new(30, 4 << 20);
+        q.push(0, b("a"), 0).expect("first");
+        // 2 arrives, 1 is missing: buffered, nothing delivered, gap open.
+        assert!(q.push(2, b("c"), 100).expect("buffered").ready.is_empty());
+        assert!(gap_flag(&q));
+        // Still fine well inside the window.
+        assert!(!q.is_stalled(100, GAP_MS));
+        // 1 fills the gap and drains 2 with it.
+        let acc = q.push(1, b("b"), GAP_MS - 1).expect("gap filled");
+        assert_eq!(joined(&acc.ready), "bc", "the fill and its successor flush together");
+        assert_eq!(q.next_seq(), 3);
+        // Progress restarted the clock.
+        assert!(!q.is_stalled(GAP_MS - 1, GAP_MS));
+        assert_eq!(q.stalled_ms(GAP_MS - 1), 0);
+    }
+
+    #[test]
+    fn an_unrepaired_gap_trips_the_guard_once_the_window_passes() {
+        let mut q = UploadQueue::new(30, 4 << 20);
+        q.push(0, b("a"), 0).expect("first");
+        q.push(2, b("c"), 10).expect("buffered");
+        assert!(!q.is_stalled(GAP_MS, GAP_MS), "the boundary itself is not a stall");
+        assert!(q.is_stalled(GAP_MS + 1, GAP_MS), "one ms past the window is");
+        // Late arrival before the window closes still saves the session.
+        let mut q2 = UploadQueue::new(30, 4 << 20);
+        q2.push(0, b("a"), 0).expect("first");
+        q2.push(2, b("c"), 10).expect("buffered");
+        let acc = q2.push(1, b("b"), GAP_MS - 1).expect("late fill");
+        assert_eq!(joined(&acc.ready), "bc");
+        assert!(!q2.is_stalled(GAP_MS + 1, GAP_MS), "a repaired gap is not a stall");
+    }
+
+    #[test]
+    fn a_session_that_never_uploaded_is_not_stalled() {
+        // Idle-but-healthy: download GET open, no uplink yet. Firing here
+        // would kill healthy one-way sessions.
+        let q = UploadQueue::new(30, 4 << 20);
+        assert!(!q.is_stalled(u64::MAX / 2, GAP_MS));
+        assert_eq!(q.stalled_ms(10_000), 10_000, "reports elapsed, never fires");
+    }
+
+    #[test]
+    fn duplicates_and_late_chunks_cannot_mask_a_lost_one() {
+        // The guard must measure real progress only: a client retrying
+        // buffered or already-delivered chunks must not keep a genuinely lost
+        // gap alive forever.
+        let mut q = UploadQueue::new(30, 4 << 20);
+        q.push(0, b("a"), 0).expect("first");
+        q.push(2, b("c"), 10).expect("buffered");
+        let now = GAP_MS - 1;
+        assert!(q.push(2, b("c"), now).expect("duplicate").duplicate);
+        assert!(q.push(0, b("a"), now).expect("already delivered").duplicate);
+        assert!(!q.is_stalled(now + 1, GAP_MS), "progress still missing");
+        assert!(q.is_stalled(now + 2, GAP_MS));
+    }
+
+    #[test]
+    fn a_wall_clock_jump_cannot_trip_the_guard() {
+        // `is_stalled` saturates, so a clock that goes backwards reads as
+        // zero elapsed rather than as a huge one.
+        let mut q = UploadQueue::new(30, 4 << 20);
+        q.push(0, b("a"), 1_000).expect("first");
+        assert!(!q.is_stalled(900, GAP_MS));
+        assert_eq!(q.stalled_ms(900), 0);
+    }
+
+    #[test]
+    fn the_stall_guard_does_not_disturb_the_queue() {
+        // Purely observational: reading the guard must not drain, drop, or
+        // reorder anything the session is holding.
+        let mut q = UploadQueue::new(30, 4 << 20);
+        q.push(0, b("a"), 0).expect("first");
+        q.push(2, b("c"), 0).expect("buffered");
+        q.push(4, b("e"), 0).expect("buffered");
+        let before = (q.next_seq(), q.buffered(), q.stalled_ms(0));
+        for t in 0..GAP_MS * 2 {
+            let _ = q.is_stalled(t, GAP_MS);
+            let _ = q.stalled_ms(t);
+        }
+        assert_eq!((q.next_seq(), q.buffered(), q.stalled_ms(0)), before);
+        assert!(q.is_stalled(GAP_MS + 1, GAP_MS));
+        assert_eq!(q.next_seq(), 1, "and the fill still works afterwards");
+        // Filling 1 flushes it together with the buffered 2, and stops there:
+        // 3 is still missing, so the buffered 4 stays put. The long stall read
+        // drained and reordered nothing.
+        assert_eq!(joined(&q.push(1, b("b"), 0).expect("fill").ready), "bc");
+        assert_eq!(q.next_seq(), 3);
+        assert_eq!(joined(&q.push(3, b("d"), 0).expect("fill").ready), "de");
     }
 
     #[test]
@@ -299,7 +467,9 @@ mod tests {
             let mut q = UploadQueue::new(n, MAX_B);
             let mut out = String::new();
             for seq in order {
-                let acc = q.push(seq, b(&((b'a' + seq as u8) as char).to_string()))
+                let payload = b(&((b'a' + seq as u8) as char).to_string());
+                let acc = q
+                    .push(seq, payload, T)
                     .expect("buffer is large enough to hold any permutation");
                 out.push_str(&joined(&acc.ready));
             }

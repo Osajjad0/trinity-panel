@@ -110,6 +110,28 @@ const COALESCE_WINDOW_MS: u64 = 3;
 /// this far behind, uplink `POST`s block rather than queueing more memory.
 const UPLINK_DEPTH: usize = 8;
 
+/// How long an established upload may go without its expected sequence
+/// number advancing before the session is terminated.
+///
+/// The failure this bounds is specific and reproducible: a client whose POST
+/// is lost mid-flight (HTTP/2 GOAWAY without `Request.GetBody`, which is
+/// every xray before #6632, or a path-level reset on the way here) leaves its
+/// successors buffered behind a gap the server can never fill. The session
+/// then holds a live socket and a live download GET forever while forwarding
+/// zero uplink bytes — the "connected but upload is zero" symptom. Xray does
+/// not bound this either (issue #4846 requests it).
+///
+/// Twelve seconds is generous next to a healthy client's cadence — at the
+/// production `scMaxEachPostBytes` of 1 MB a POST lands about every 25 ms at
+/// 300 Mbps, and even a 1 Mbps uplink posts four times a second — so only a
+/// genuinely lost chunk can reach it. Counting starts at the first delivered
+/// chunk, so an idle-but-healthy session is never touched.
+///
+/// `ponytail:` monotonic `now_ms`, one timer per stalled session; raise if a
+/// slow-but-alive uplink ever trips it (the queue cap would be the next
+/// lever).
+pub const SEQ_GAP_TIMEOUT_MS: u64 = 12_000;
+
 type DownSender = mpsc::Sender<core::result::Result<Bytes, worker::Error>>;
 type DownReceiver = mpsc::Receiver<core::result::Result<Bytes, worker::Error>>;
 
@@ -120,6 +142,11 @@ struct Inner {
     /// first uplink starts it.
     uplink: Option<mpsc::Sender<Bytes>>,
     down_rx: Option<DownReceiver>,
+    /// Set when a POST arrived that did not advance the expected upload
+    /// sequence, so the owner can tell "gap open" from "queue empty". The
+    /// owner only ever sees already-ordered bytes on its channel, so this is
+    /// the only place the gap is observable.
+    gap_open: Arc<Cell<bool>>,
     /// Current downlink sender, shared with the pump so teardown can close
     /// it from outside. `None` once the session has finished.
     shared_down: Arc<Mutex<Option<DownSender>>>,
@@ -165,6 +192,7 @@ impl DurableObject for XhttpSession {
                 shared_down: Arc::new(Mutex::new(Some(tx))),
                 ended: Arc::new(Cell::new(false)),
                 poisoned: false,
+                gap_open: Arc::new(Cell::new(false)),
             }),
         }
     }
@@ -399,11 +427,19 @@ impl XhttpSession {
         // concurrent requests cannot both decide they are first.
         let (mut sender, ready) = {
             let mut inner = self.inner.borrow_mut();
-            let Ok(accepted) = inner.queue.push(seq, Bytes::from(body)) else {
+            let Ok(accepted) = inner.queue.push(seq, Bytes::from(body), now_ms()) else {
                 inner.poisoned = true;
                 drop(inner);
                 return reply(Status::Rejected);
             };
+
+            // `ready` empty on a non-duplicate means this POST did not reach
+            // the expected sequence: a gap is now open (or still open).
+            if !accepted.ready.is_empty() {
+                inner.gap_open.set(false);
+            } else if !accepted.duplicate {
+                inner.gap_open.set(true);
+            }
 
             if inner.uplink.is_none() {
                 let (tx, rx) = mpsc::channel(UPLINK_DEPTH);
@@ -420,6 +456,7 @@ impl XhttpSession {
                 // loads the config there at no cost.
                 let ctx = OwnerContext {
                     uplink_rx: rx,
+                    gap_open: inner.gap_open.clone(),
                     sid,
                     creds: self.credentials(),
                     env: self.env.clone(),
@@ -487,6 +524,9 @@ fn now_ms() -> u64 {
 /// and so teardown can reach shared handles from outside the task.
 struct OwnerContext {
     uplink_rx: mpsc::Receiver<Bytes>,
+    /// Set by a POST that left a sequence gap open; the pump's stall timer
+    /// reads it to tell a lost chunk from an idle session.
+    gap_open: Arc<Cell<bool>>,
     sid: String,
     creds: Credentials,
     env: Env,
@@ -541,8 +581,9 @@ async fn catalog_snapshot_from_kv(kv: &worker::kv::KvStore) -> Option<crate::cat
 /// marks the session ended, releases the shared sender, completes the diag
 /// record, and settles last-known-good bookkeeping exactly once.
 async fn own_session(ctx: OwnerContext) {
-    let OwnerContext { uplink_rx, sid, creds, env, shared_down, ended, diag } = ctx;
+    let OwnerContext { uplink_rx, gap_open, sid, creds, env, shared_down, ended, diag } = ctx;
     let mut uplink = uplink_rx;
+    let gap_open: &Cell<bool> = &gap_open;
     let sid: &str = &sid;
     let env: &Env = &env;
     let shared_down: &Mutex<Option<DownSender>> = &shared_down;
@@ -897,17 +938,40 @@ async fn own_session(ctx: OwnerContext) {
     let up_events = events_tx;
     let upstream = async move {
         loop {
+            // Three-way race: an ordered chunk, a supervised cancel, or the
+            // gap timer. The timer arm sleeps first and re-checks `gap_open`,
+            // so an idle-but-healthy session wakes it once per window and
+            // goes straight back to waiting -- no polling, no busy loop, and
+            // the only way it terminates the session is a gap that stayed open
+            // for the whole window.
+            let gap_deadline = gloo_timers::future::sleep(core::time::Duration::from_millis(
+                SEQ_GAP_TIMEOUT_MS,
+            ));
             let chunk = {
                 match futures_util::future::select(
-                    Box::pin(uplink.next()),
-                    Box::pin(cancel_rx.next()),
+                    Box::pin(futures_util::future::select(
+                        Box::pin(uplink.next()),
+                        Box::pin(cancel_rx.next()),
+                    )),
+                    Box::pin(gap_deadline),
                 )
                 .await
                 {
-                    futures_util::future::Either::Left((chunk, _)) => chunk,
-                    // Supervised close: stop feeding the destination and fall
-                    // through to the shutdown that signals it EOF.
-                    futures_util::future::Either::Right(_) => break,
+                    futures_util::future::Either::Left((inner, _)) => match inner {
+                        futures_util::future::Either::Left((chunk, _)) => chunk,
+                        // Supervised close: stop feeding the destination and
+                        // fall through to the shutdown that signals it EOF.
+                        futures_util::future::Either::Right(_) => break,
+                    },
+                    // Window elapsed. A gap that is still open means the chunk
+                    // carrying the missing sequence was lost; the heap can
+                    // never drain, so terminate and let the client reconnect.
+                    futures_util::future::Either::Right(_) => {
+                        if gap_open.get() {
+                            break;
+                        }
+                        continue;
+                    }
                 }
             };
             let Some(chunk) = chunk else {
