@@ -35,6 +35,9 @@
 //! subscription config determines transport). Trojan gets a WebSocket path
 //! so clients that cannot speak XHTTP can still reach the server.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use bytes::{Bytes, BytesMut};
 use futures_util::{FutureExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,6 +49,7 @@ use worker::{
 use crate::config::{credentials_from_env, UserLists};
 use crate::relay::outbound_state::{self, OutboundState};
 use crate::protocol::{detect, ProtocolError};
+use crate::relay::dirty_downlink;
 use crate::relay::{self, connect};
 
 /// Downlink read buffer. Large enough that a coalesced train leaves room to
@@ -395,7 +399,14 @@ async fn serve(
     let (mut read_half, mut write_half) = tokio::io::split(socket);
     let who = server.clone();
     let mut ready: Vec<Bytes> = Vec::new();
-    let mut flushed = false;
+    // Downlink bytes actually handed to the client, shared with the pump.
+    //
+    // This was a plain `bool` set inside the `async move` downlink closure and
+    // read here afterwards -- and `bool` is `Copy`, so `async move` captured a
+    // copy and the outer binding stayed `false` forever, making the dirty
+    // predicate below constantly true. Verified with a standalone reproduction
+    // of the exact shape. A shared counter cannot be copied out of reach.
+    let down_bytes: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
     // Send protocol-specific prologue (e.g., VLESS response header or SS session
     // header) before data relay begins.
@@ -426,7 +437,12 @@ async fn serve(
         }
     }
 
+    // The pump gets its own handle: an `Arc<Cell<_>>` is deliberately not
+    // `Copy`, so this cannot silently diverge from the counter read after the
+    // join the way the old `bool` did.
+    let down_bytes_pump = down_bytes.clone();
     let downlink = async move {
+        let down_bytes = &down_bytes_pump;
         // workerd caps each `read_buf` at one 4 KiB segment, so forwarding per
         // read costs a WS frame, a codec call and a JS boundary crossing per
         // 4 KiB -- measured at ~389 frames/MB. Reads that arrive close together
@@ -473,7 +489,8 @@ async fn serve(
                 let chunk: Bytes = buf.split().freeze();
                 match encoder.encode(chunk) {
                     Ok(encoded) => {
-                        flushed = true;
+                        let n = encoded.len() as u64;
+                        down_bytes.set(down_bytes.get().saturating_add(n));
                         if who.send_with_bytes(&encoded).is_err() {
                             break;
                         }
@@ -487,7 +504,6 @@ async fn serve(
             }
         }
         let _ = who.close(Some(1000), Some("eof"));
-        flushed
     };
 
     // Uplink coalescing, mirroring the downlink pump: xray hands us one small
@@ -565,11 +581,12 @@ async fn serve(
     // may update the stored preference (proxy win, debounced); a direct win
     // keeps nothing unless the preferred candidate is the one that failed
     // first (demotion); a session that connected but relayed nothing is the
-    // dirty-IP signature and clears the preference. Downlink "carried
-    // traffic" proxy: the coalescing buffer flushed at least once.
-    // `ponytail:` XHTTP counts real bytes; add a shared cell only if a
-    // tiny-but-alive session is ever observed mis-training the preference.
-    let dirty = !flushed;
+    // dirty-IP signature and clears the preference. The predicate is the same
+    // one XHTTP applies to the same signal, against the same floor, so the two
+    // transports cannot disagree about whether an egress carried traffic: a
+    // destination that answers a ClientHello with a TLS alert and a reset
+    // (7-16 bytes) is NOT a working egress, and must not be recorded as one.
+    let dirty = dirty_downlink(down_bytes.get());
     let winner_key = plan.candidates.get(winner_idx).map(outbound_state::candidate_key);
     // Session-sourced demotion, the same rule XHTTP's teardown applies: a
     // connected winner that carried nothing records its first soft fail so

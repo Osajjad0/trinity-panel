@@ -1235,8 +1235,9 @@ async fn own_session(ctx: OwnerContext) {
             // connected egress is the dirty-IP signature (destination TLS
             // never completes). Small non-zero allowance for protocol
             // headers/refusals so a legitimate tiny response is not
-            // mistaken for one.
-            let dirty = diag.downstream_sent.get() < 1024;
+            // mistaken for one. The rule is shared with the WebSocket relay so
+            // the two transports cannot disagree about a given session.
+            let dirty = crate::relay::dirty_downlink(diag.downstream_sent.get());
             // Session-sourced demotion: when the winning proxy candidate
             // connected but carried nothing, record its first soft fail so
             // the next plan ranks it behind untried candidates (durable.rs

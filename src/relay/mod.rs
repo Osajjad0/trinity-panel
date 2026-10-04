@@ -30,6 +30,30 @@ pub mod outbound_state;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Downlink bytes below which a session that won through a proxy candidate
+/// counts as having carried nothing useful.
+///
+/// This is one rule for both transports, and it lives here rather than in
+/// either relay because the two disagreed. XHTTP compared a byte count against
+/// 1024; WebSocket compared `!flushed`, a `bool` that an `async move` closure
+/// had copied, so it read `false` forever and judged *every* successful session
+/// dirty -- recording a session-sourced demotion against healthy candidates.
+///
+/// The floor sits between the two real cases: an egress that answers a
+/// ClientHello with a TLS alert and a reset moves 7-16 bytes, while one that
+/// completes a handshake and serves a response moves kilobytes at minimum.
+pub const DIRTY_DOWNLINK_FLOOR: u64 = 1024;
+
+/// True when a session moved too few downlink bytes to count as working.
+///
+/// Pure and host-testable: this decides whether a candidate takes a
+/// session-sourced demotion, so it must not depend on transport-local state
+/// that can be copied out from under the reader.
+#[must_use]
+pub const fn dirty_downlink(downstream_bytes: u64) -> bool {
+    downstream_bytes < DIRTY_DOWNLINK_FLOOR
+}
+
 /// Initial read buffer size.
 ///
 /// Sized to hold a full TLS record (16 KB plus framing) so the common case of
@@ -364,5 +388,39 @@ mod tests {
         }
         assert!(!is_disconnect(&Error::new(ErrorKind::PermissionDenied, "x")));
         assert!(!is_disconnect(&Error::new(ErrorKind::InvalidData, "x")));
+    }
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::{dirty_downlink, DIRTY_DOWNLINK_FLOOR};
+
+    /// An egress that answers with a TLS alert and a reset moved 7-16 bytes.
+    /// That is the failure the demotion exists to catch, and it must never be
+    /// mistaken for a session that carried traffic.
+    #[test]
+    fn a_tls_alert_is_not_working_traffic() {
+        assert!(dirty_downlink(0), "nothing carried at all");
+        assert!(dirty_downlink(7));
+        assert!(dirty_downlink(16));
+        assert!(dirty_downlink(DIRTY_DOWNLINK_FLOOR - 1), "one byte under");
+    }
+
+    /// A completed handshake plus any response is kilobytes at minimum.
+    #[test]
+    fn a_served_response_is_working_traffic() {
+        assert!(!dirty_downlink(DIRTY_DOWNLINK_FLOOR), "the floor is clean");
+        assert!(!dirty_downlink(4096));
+        assert!(!dirty_downlink(1 << 20));
+    }
+
+    /// The regression that motivated this rule: the WebSocket side used to
+    /// read a `Copy` signal that no closure could ever have updated, so
+    /// `dirty` was constantly true and healthy candidates took a demotion on
+    /// every successful session. The predicate must now be a function of bytes
+    /// observed, and the floor is the same constant the XHTTP relay uses.
+    #[test]
+    fn both_transports_share_one_floor() {
+        assert_eq!(DIRTY_DOWNLINK_FLOOR, 1024, "XHTTP's historical value");
     }
 }
