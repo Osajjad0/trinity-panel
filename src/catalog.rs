@@ -819,7 +819,7 @@ pub fn choose_fallback_country(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CountryQuality {
-    /// `full` | `degraded` | `limited` | `unavailable`.
+    /// `full` | `degraded` | `limited` | `cfOnly` | `unavailable`.
     pub state: String,
     /// 0–100. Orders countries inside a state; the state orders between.
     /// `None` when nothing was measured: quality unknown, never a fake 0.
@@ -828,6 +828,10 @@ pub struct CountryQuality {
     pub cf_relay: u32,
     pub sni_terminate: u32,
     pub healthy: u32,
+    /// Subset of `healthy` that can carry GENERIC Internet traffic. Equal to
+    /// `healthy` when the feed classifies nothing; strictly lower for a
+    /// country whose reachable boxes are all Cloudflare-fronted-only.
+    pub generic: u32,
     pub discovered: u32,
     /// Mean worker-vantage success rate over measured candidates, percent.
     pub success_rate_pct: u32,
@@ -862,6 +866,10 @@ pub fn country_quality(
         let mut measured = 0u32;
         let mut healthy = 0u32;
         let mut fresh = 0u32;
+        // Candidates proven to carry GENERIC Internet traffic (not
+        // cf-relay-only, not TLS-terminating). Compared against `healthy`
+        // above, which counts any TCP-open box.
+        let mut generic = 0u32;
         // 09-28 hardening: concrete degradation evidence — repeated/hard probe
         // failures, the same predicate the dial path quarantines on. Counted
         // inside this loop so the freshness TTL above applies too: an old
@@ -900,6 +908,19 @@ pub fn country_quality(
                 if h.ok && !h.quarantined() {
                     healthy += 1;
                     healthy_hosts.insert(e.host.to_ascii_lowercase());
+                    // Same capability predicate `bounded` gates pools on, read
+                    // from the same per-endpoint key so host and port match
+                    // exactly. Anything unclassified counts as generic: it is
+                    // unmeasured, not proven restricted.
+                    if !matches!(
+                        snapshot
+                            .capability_by_endpoint
+                            .get(&key)
+                            .map(String::as_str),
+                        Some("cf-relay") | Some("sni-terminate")
+                    ) {
+                        generic += 1;
+                    }
                 }
                 if now_ms.saturating_sub(h.updated_at_ms) < FRESH_MS {
                     fresh += 1;
@@ -919,6 +940,14 @@ pub fn country_quality(
             "degraded"
         } else if discovered == 0 || (healthy == 0 && measured > 0) {
             "unavailable"
+        } else if healthy > 0 && generic == 0 {
+            // PRACTICAL capability: every reachable candidate in this country
+            // is Cloudflare-fronted-only (or TLS-terminating), so none of them
+            // can carry generic Internet traffic. Reporting this as `full` is
+            // exactly the false health that let a 25-candidate cf-relay pool
+            // look usable while failing every real destination. The candidates
+            // are still RETAINED — the state only stops over-claiming.
+            "cfOnly"
         } else {
             "limited"
         };
@@ -949,6 +978,7 @@ pub fn country_quality(
                 cf_relay: cf,
                 sni_terminate: sni,
                 healthy,
+                generic,
                 discovered,
                 success_rate_pct: (success * 100.0).round() as u32,
             },
@@ -1067,6 +1097,31 @@ fn bounded(
     quality: &std::collections::BTreeMap<String, String>,
     capability_first: bool,
 ) -> Vec<Endpoint> {
+    // Capability ELIGIBILITY, not just ranking. A Stage-C `cf-relay` only
+    // forwards to Cloudflare-fronted destinations, and this hop is TLS
+    // passthrough (`relay::connect::open`, SecureTransport::Off), so a
+    // client's TLS to any other origin cannot survive it. `sni-terminate`
+    // terminates the destination TLS with its OWN certificate, which a
+    // verifying client also rejects. Ranking those above a genuine
+    // passthrough therefore produced pools that report healthy (TCP opens)
+    // and then fail every real destination — the KZ pool: 25/25 cf-relay,
+    // 0 generic relay, 0 bytes to example.com.
+    //
+    // Only `passthrough` is verified generic TCP forwarding, by two
+    // independent certificate-verified destinations (scanner Stage C, whose
+    // own note reads "Only 'passthrough' proves generic TCP forwarding"). An
+    // unclassified endpoint is UNMEASURED, not bad: it stays eligible, so a
+    // country is never silently emptied by a feed that stopped carrying the
+    // map. Restricted classes are retained where they are the only thing a
+    // country has — the gate is "prefer generic", not "ban cf-relay".
+    let generic = |e: &Endpoint| -> bool {
+        !matches!(
+            capability
+                .get(&format!("{}:{}", e.host.to_ascii_lowercase(), e.port))
+                .map(String::as_str),
+            Some("cf-relay") | Some("sni-terminate")
+        )
+    };
     // Capability band: a Stage-C `passthrough` is strictly more capable than
     // cf-relay (it forwards any SNI, including a CF edge's), so it outranks
     // everything; unclassified and cf-relay share a band; sni-terminate (it
@@ -1107,6 +1162,12 @@ fn bounded(
         }
     };
     let mut deduped: Vec<Endpoint> = Vec::new();
+    // Generic-capable candidates are admitted first and the cap is applied to
+    // them; cf-relay-only boxes then fill whatever slots remain. A country
+    // with any generic relay therefore never spends a pool slot on a CF-only
+    // box, while a country with none still gets a working (CF-fronted) pool
+    // instead of an empty plan that fails every session.
+    let mut cf_only: Vec<Endpoint> = Vec::new();
     for e in candidates {
         // Trinity-vantage quarantine (see `Health::quarantined`): a candidate
         // the worker itself could not reach — or that failed repeatedly —
@@ -1117,23 +1178,37 @@ fn bounded(
         if health.get(&key).is_some_and(|h| h.quarantined()) {
             continue;
         }
-        if !deduped.iter().any(|d| d.host.eq_ignore_ascii_case(&e.host) && d.port == e.port) {
-            deduped.push(e);
+        if !deduped.iter().chain(cf_only.iter()).any(|d| {
+            d.host.eq_ignore_ascii_case(&e.host) && d.port == e.port
+        }) {
+            if generic(&e) {
+                deduped.push(e);
+            } else {
+                cf_only.push(e);
+            }
         }
     }
     // Stable sort keeps catalog order inside each band. Then enforce host
     // diversity: one IP with many port variants must not occupy the whole
     // pool (the US feed had 2 IPs x 4 ports filling all 8 slots — every dial
     // failed while 42 other US IPs sat lower in the feed).
-    deduped.sort_by_key(|e| rank(e));
-    let mut seen_hosts = std::collections::HashSet::new();
-    let mut diversified: Vec<Endpoint> = Vec::new();
-    for e in deduped {
-        if seen_hosts.insert(e.host.to_ascii_lowercase()) {
-            diversified.push(e);
-        }
-    }
-    diversified.into_iter().take(MAX_POOL_CANDIDATES).collect()
+    //
+    // Ranking and diversity run per group so the generic-capable candidates
+    // are ranked, diversified and capped among THEMSELVES. Merging the two
+    // groups before the cap would let CF-only boxes outrank by rank() and
+    // re-consume the slots the gate just protected.
+    let diversify = |list: Vec<Endpoint>| -> Vec<Endpoint> {
+        let mut list = list;
+        list.sort_by_key(|e| rank(e));
+        let mut seen_hosts = std::collections::HashSet::new();
+        list.into_iter()
+            .filter(|e| seen_hosts.insert(e.host.to_ascii_lowercase()))
+            .collect()
+    };
+    let mut out = diversify(deduped);
+    out.extend(diversify(cf_only));
+    out.truncate(MAX_POOL_CANDIDATES);
+    out
 }
 
 /// Deterministic worker-vantage verification order over every catalog
@@ -2058,11 +2133,208 @@ mod tests {
         );
     }
 
+    /// The production failure this whole change exists for: a country whose
+    /// candidates are ALL cf-relay. Every one passes the TCP probe (so all of
+    /// them read `ok=true`, healthy, quarantined=false) and none of them can
+    /// reach a non-Cloudflare origin, because the hop is TLS passthrough and a
+    /// cf-relay only forwards to Cloudflare-fronted destinations.
+    ///
+    /// Before: the pool was these 8 boxes, and the country reported `limited`
+    /// with 25 reachable. Every real session failed at the inner TLS.
+    #[test]
+    fn tcp_open_cf_relay_only_country_does_not_look_generic_healthy() {
+        let mk = |host: &str, port: u16| Endpoint { host: host.into(), port };
+        let mut capability = std::collections::BTreeMap::new();
+        let mut health = std::collections::BTreeMap::new();
+        let list: Vec<Endpoint> = (0..25)
+            .map(|i| {
+                let e = mk(&format!("cf{i}.kz.example"), 443);
+                let key = format!("{}:{}", e.host, e.port);
+                capability.insert(key.clone(), "cf-relay".to_string());
+                // Exactly what probe_tcp_one records: socket opened, ~330 ms.
+                health.insert(
+                    key,
+                    crate::relay::outbound_state::Health {
+                        ok: true,
+                        latency_ms: 330,
+                        country: "KZ".into(),
+                        updated_at_ms: 1_000,
+                        ..Default::default()
+                    },
+                );
+                e
+            })
+            .collect();
+        let quality = std::collections::BTreeMap::new();
+
+        // 1. COUNTRY QUALITY: reachable but zero generic, never `full`.
+        let snapshot = Snapshot {
+            schema_version: 1,
+            upstream_revision: String::new(),
+            content_revision: String::new(),
+            generated_at: String::new(),
+            countries: [("KZ".to_string(), list.clone())].into_iter().collect(),
+            unassigned: Vec::new(),
+            auto: Vec::new(),
+            capability_counts: std::collections::BTreeMap::new(),
+            capability_by_endpoint: capability.clone(),
+            quality_by_endpoint: std::collections::BTreeMap::new(),
+        };
+        let cq = country_quality(&snapshot, &health, 1_000 + FRESH_MS);
+        let kz = &cq["KZ"];
+        assert_eq!(kz.healthy, 25, "TCP-open evidence is still recorded");
+        assert_eq!(kz.generic, 0, "but none of them can carry generic traffic");
+        assert_ne!(kz.state, "full", "a cf-relay-only country must not read full");
+        assert_eq!(kz.state, "cfOnly");
+
+        // 2. POOL: candidates are retained (a country is never emptied) but
+        // every one is cf-relay, so the pool admits them only as filler.
+        let pool = bounded(list.clone().into_iter(), &health, &capability, &quality, true);
+        assert_eq!(pool.len(), MAX_POOL_CANDIDATES, "pool still populated");
+        for e in &pool {
+            assert_eq!(capability[&format!("{}:{}", e.host, e.port)], "cf-relay");
+        }
+    }
+
+    /// A genuine passthrough must take the slot even when the cf-relay boxes
+    /// have better measured latency and a health record, and the cf-relay must
+    /// still be retained behind it rather than dropped.
+    #[test]
+    fn generic_candidate_takes_the_slot_a_faster_cf_relay_cannot_have() {
+        let mk = |host: &str, port: u16| Endpoint { host: host.into(), port };
+        let mut capability = std::collections::BTreeMap::new();
+        capability.insert("cf1.example:443".into(), "cf-relay".into());
+        capability.insert("cf2.example:443".into(), "cf-relay".into());
+        capability.insert("cf3.example:443".into(), "cf-relay".into());
+        capability.insert("cf4.example:443".into(), "cf-relay".into());
+        capability.insert("cf5.example:443".into(), "cf-relay".into());
+        capability.insert("cf6.example:443".into(), "cf-relay".into());
+        capability.insert("cf7.example:443".into(), "cf-relay".into());
+        capability.insert("cf8.example:443".into(), "cf-relay".into());
+        capability.insert("pass.example:443".into(), "passthrough".into());
+        let mut health = std::collections::BTreeMap::new();
+        for i in 1..=8 {
+            health.insert(
+                format!("cf{i}.example:443"),
+                crate::relay::outbound_state::Health {
+                    ok: true,
+                    latency_ms: 20, // much faster than the passthrough
+                    country: "KZ".into(),
+                    updated_at_ms: 1_000,
+                    ..Default::default()
+                },
+            );
+        }
+        // The passthrough has NO health record at all: unmeasured, not bad.
+        let pool = bounded(
+            [
+                mk("cf1.example", 443), mk("cf2.example", 443), mk("cf3.example", 443),
+                mk("cf4.example", 443), mk("cf5.example", 443), mk("cf6.example", 443),
+                mk("cf7.example", 443), mk("cf8.example", 443), mk("pass.example", 443),
+            ]
+            .into_iter(),
+            &health,
+            &capability,
+            &std::collections::BTreeMap::new(),
+            true,
+        );
+        assert_eq!(pool.len(), MAX_POOL_CANDIDATES);
+        assert_eq!(
+            pool[0].host, "pass.example",
+            "the only generic relay must take a slot despite 8 faster cf-relays"
+        );
+        // Retention: 7 cf-relays still eligible behind it.
+        assert_eq!(
+            pool.iter().filter(|e| e.host.starts_with("cf")).count(),
+            MAX_POOL_CANDIDATES - 1,
+            "cf-relay candidates must be retained as filler, not banned"
+        );
+    }
+
+    /// An unclassified endpoint is UNMEASURED, not bad: it must stay eligible
+    /// so a feed that stops carrying capability_by_endpoint cannot silently
+    /// empty every pool.
+    #[test]
+    fn unclassified_candidates_stay_eligible() {
+        let mk = |h: &str| Endpoint { host: h.into(), port: 443 };
+        let capability = std::collections::BTreeMap::new();
+        let pool = bounded(
+            [mk("unknown1.example"), mk("unknown2.example")].into_iter(),
+            &std::collections::BTreeMap::new(),
+            &capability,
+            &std::collections::BTreeMap::new(),
+            true,
+        );
+        assert_eq!(pool.len(), 2, "absent capability evidence must not exclude");
+    }
+
+    /// Quarantine still wins over the capability gate: a proven-good
+    /// passthrough that failed repeatedly leaves the pool.
+    #[test]
+    fn quarantine_beats_capability_preference() {
+        let mk = |h: &str| Endpoint { host: h.into(), port: 443 };
+        let mut capability = std::collections::BTreeMap::new();
+        capability.insert("pass.example:443".to_string(), "passthrough".to_string());
+        capability.insert("cf.example:443".to_string(), "cf-relay".to_string());
+        let mut health = std::collections::BTreeMap::new();
+        health.insert(
+            "pass.example:443".to_string(),
+            crate::relay::outbound_state::Health {
+                ok: false,
+                fail_count: 2,
+                error: "tcp connect: refused".into(),
+                updated_at_ms: 1_000,
+                ..Default::default()
+            },
+        );
+        let pool = bounded(
+            [mk("pass.example"), mk("cf.example")].into_iter(),
+            &health,
+            &capability,
+            &std::collections::BTreeMap::new(),
+            true,
+        );
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].host, "cf.example");
+    }
+
+    /// Platform failures are not candidate evidence and must not demote a
+    /// country — the free-plan subrequest cap tripping must never look like a
+    /// dead candidate.
+    #[test]
+    fn quota_failure_is_not_candidate_failure() {
+        let mk = |h: &str| Endpoint { host: h.into(), port: 443 };
+        let mut capability = std::collections::BTreeMap::new();
+        capability.insert("pass.example:443".to_string(), "passthrough".to_string());
+        let mut health = std::collections::BTreeMap::new();
+        health.insert(
+            "pass.example:443".to_string(),
+            crate::relay::outbound_state::Health {
+                ok: false,
+                fail_count: 3,
+                error: "Too many subrequests".into(),
+                updated_at_ms: 1_000,
+                ..Default::default()
+            },
+        );
+        let pool = bounded(
+            [mk("pass.example")].into_iter(),
+            &health,
+            &capability,
+            &std::collections::BTreeMap::new(),
+            true,
+        );
+        assert_eq!(pool.len(), 1, "a quota error must not evict the candidate");
+    }
+
     #[test]
     fn passthrough_outranks_cf_relay_at_equal_health() {
         // Capability-aware ranking (spec PHASE 5): with identical health
-        // bands, a Stage-C passthrough candidate sorts before cf-relay and
-        // sni-terminate sinks below both. All unmeasured here (band 1).
+        // bands, a Stage-C passthrough candidate is ELIGIBLE FIRST; the
+        // classes that cannot carry generic TLS-passthrough traffic
+        // (cf-relay is Cloudflare-fronted-only, sni-terminate terminates the
+        // destination TLS with its own certificate) fill remaining slots
+        // behind it. All unmeasured here (band 1).
         let mk = |h: &str| Endpoint { host: h.into(), port: 443 };
         let mut capability = std::collections::BTreeMap::new();
         capability.insert("relay.example:443".to_string(), "cf-relay".to_string());
@@ -2076,7 +2348,12 @@ mod tests {
             false,
         );
         let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
-        assert_eq!(hosts, vec!["pass.example", "relay.example", "terminating.example"]);
+        assert_eq!(hosts[0], "pass.example", "passthrough must be admitted first");
+        // The restricted classes are retained (not banned) when a country has
+        // nothing else, ordered by their existing band: cf-relay then sni.
+        assert!(hosts.contains(&"relay.example"), "cf-relay must be retained as filler");
+        assert!(hosts.contains(&"terminating.example"), "sni must be retained as filler");
+        assert!(hosts[1..].contains(&"relay.example"), "cf-relay fills before sni");
     }
 
     #[test]
@@ -2176,12 +2453,18 @@ mod tests {
         );
         assert_eq!(enforced[0].host, "pass.example",
             "enforced pool must not let a healthy cf-relay crowd out passthrough");
-        // Auto (non-enforced) selection keeps the legacy health-first ordering.
+        // Auto is subject to the same capability ELIGIBILITY: a cf-relay is
+        // Cloudflare-fronted-only, so it cannot carry generic traffic no
+        // matter how healthy its TCP connect is. Auto previously preferred a
+        // measured cf-relay over an unmeasured passthrough, which is how a
+        // pool of boxes that pass every TCP check and fail every real
+        // destination got selected.
         let auto = bounded(
             [mk("relay.example", 2053), mk("pass.example", 2053)].into_iter(),
             &health, &capability, &quality, false,
         );
-        assert_eq!(auto[0].host, "relay.example");
+        assert_eq!(auto[0].host, "pass.example",
+            "auto must not prefer a cf-relay over a passthrough");
 
     }
 
