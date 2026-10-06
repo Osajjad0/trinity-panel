@@ -52,6 +52,9 @@ COMPATIBILITY_DATE = "2026-07-01"
 # The Durable Object class exported by the Worker. Must match the Rust type
 # name annotated with #[durable_object].
 DO_CLASS = "XhttpSession"
+# Migration tag of the live script. Kept configurable because a redeploy
+# without a tag (--no-do) leaves the script at "", and a mismatch is rejected.
+DO_MIGRATION_TAG = os.environ.get("TRINITY_DO_TAG", "v1")
 
 
 class DeployError(RuntimeError):
@@ -70,6 +73,64 @@ def _request(method: str, path: str, token: str, *, body=None, content_type=None
     """
     import time as _time
     _REQUEST_DEADLINE = 300  # seconds; hard cap per API call
+    url = f"{API}{path}"
+    headers = {"Authorization": f"Bearer {token}"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    last = None
+    payload = None
+    deadline = _time.monotonic() + _REQUEST_DEADLINE
+    # Python's TLS cannot handshake with api.cloudflare.com from this host
+    # (SSLEOFError on every attempt) even though curl's schannel stack does.
+    # Rather than let a transport quirk abort every deploy, run the same
+    # retry/backoff contract over curl, which this host can actually use.
+    for attempt in range(6):
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            raise DeployError(
+                f"{method} {path} timed out after {_REQUEST_DEADLINE}s "
+                f"(attempt {attempt + 1}/6)."
+            )
+        sock_timeout = min(120, remaining)
+        print(f"  [{method} {path}] curl attempt {attempt + 1}/6 (timeout {sock_timeout:.0f}s)")
+        try:
+            status, curl_payload = _curl_request(method, path, token, body, content_type)
+        except DeployError as exc:
+            last = exc
+            wait = min(2 * (attempt + 1), deadline - _time.monotonic())
+            if wait <= 0:
+                break
+            print(f"  [{method} {path}] {exc}; retrying in {wait:.0f}s")
+            _time.sleep(wait)
+            continue
+        if status == 0 or status >= 500:
+            # transport-level or server-side: retry, same as before
+            last = DeployError(f"HTTP {status or 'no response'}")
+            wait = min(2 * (attempt + 1), deadline - _time.monotonic())
+            if wait <= 0:
+                break
+            print(f"  [{method} {path}] HTTP {status}; retrying in {wait:.0f}s")
+            _time.sleep(wait)
+            continue
+        payload = curl_payload
+        last = None
+        break
+    if last is not None or payload is None:
+        raise DeployError(
+            f"could not reach the Cloudflare API after retries ({last}). "
+            "Check your network, and if you are behind a proxy set HTTPS_PROXY."
+        ) from (last if isinstance(last, Exception) else None)
+
+    if not payload.get("success"):
+        messages = "; ".join(e.get("message", "?") for e in payload.get("errors", []))
+        raise DeployError(f"{method} {path} was rejected by Cloudflare: {messages}")
+    return payload.get("result")
+
+
+def _request_urllib_legacy(method: str, path: str, token: str, *, body=None, content_type=None):
+    """Original urllib implementation, kept for reference. Unused."""
+    import time as _time
+    _REQUEST_DEADLINE = 300
     url = f"{API}{path}"
     headers = {"Authorization": f"Bearer {token}"}
     if content_type:
@@ -119,6 +180,63 @@ def _request(method: str, path: str, token: str, *, body=None, content_type=None
         messages = "; ".join(e.get("message", "?") for e in payload.get("errors", []))
         raise DeployError(f"{method} {path} was rejected by Cloudflare: {messages}")
     return payload.get("result")
+
+
+_CURL = ["curl.exe", "-sS", "--max-time", "150", "-w", "\n%{http_code}"]
+
+def _curl_request(method, path, token, body=None, content_type=None):
+    """One Cloudflare API call via curl. Returns (http_status, payload_dict).
+
+    The deploy script's Python TLS stack cannot complete a handshake with
+    api.cloudflare.com from this host (OpenSSL SSLEOFError on every attempt),
+    while curl's schannel TLS does. Both are "the network"; only one works,
+    so the API calls route through curl and urllib is never used here.
+    """
+    import subprocess as _sp
+    import tempfile as _tf
+    cmd = list(_CURL) + ["-X", method, "-H", f"Authorization: Bearer {token}"]
+    if content_type:
+        cmd += ["-H", f"Content-Type: {content_type}"]
+    # Callers pass `body` as raw bytes (JSON or multipart); curl wants a file
+    # or a string, so bytes go to a temp file that is always cleaned up.
+    body_path = None
+    with _tf.NamedTemporaryFile(delete=False) as tf:
+        out_path = tf.name
+    try:
+        if body is None:
+            cmd += [f"{API}{path}", "-o", out_path]
+        else:
+            data = body if isinstance(body, (bytes, bytearray)) else str(body).encode()
+            with _tf.NamedTemporaryFile(delete=False) as bf:
+                bf.write(data)
+                body_path = bf.name
+            cmd += ["--data-binary", "@" + body_path, f"{API}{path}", "-o", out_path]
+        proc = _sp.run(cmd, capture_output=True, text=True)
+        raw_out = open(out_path, "rb").read()
+        os.unlink(out_path)
+    finally:
+        for p_ in (out_path, body_path):
+            if p_:
+                try:
+                    os.unlink(p_)
+                except OSError:
+                    pass
+    # curl appends a trailing newline + status code; the body is the file.
+    try:
+        payload = json.loads(raw_out.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise DeployError(
+            f"{method} {path} via curl returned unparseable body "
+            f"({len(raw_out)} bytes, stderr: {proc.stderr.strip()[:200]!r})"
+        )
+    status = 0
+    tail = (proc.stdout or "").strip().splitlines()
+    if tail:
+        try:
+            status = int(tail[-1].strip())
+        except ValueError:
+            status = 0
+    return status, payload
 
 
 def preflight(token: str, account: str) -> str:
@@ -261,7 +379,17 @@ def upload(token, account, name, entry, modules, bindings, migrate_do):
         # Must be new_sqlite_classes. The KV-backed `new_classes` form fails on
         # accounts without a pre-existing KV-backed namespace, and SQLite is the
         # only backend available on the free plan.
-        metadata["migrations"] = {"new_tag": "v1", "new_sqlite_classes": [DO_CLASS]}
+        # new_tag must match the tag the script is already on. A script
+        # deployed with --no-do has tag "", and asking to migrate to "v1"
+        # is rejected ("Actor migration tag precondition failed, got tag
+        # '' when expecting 'v1'"), which is how the DO binding ends up
+        # declared against a class that was never registered: the module
+        # then throws on every request (CF 1101) with the code unchanged.
+        # Ask for the tag we are actually on; "" means "no tag yet".
+        metadata["migrations"] = {
+            "new_tag": DO_MIGRATION_TAG,
+            "new_sqlite_classes": [DO_CLASS],
+        }
 
     parts = [("metadata", None, "application/json", json.dumps(metadata).encode())]
     for fname, ctype, data in modules:
