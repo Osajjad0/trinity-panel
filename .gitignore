@@ -101,6 +101,9 @@ desktop.ini
 # ---- local probe/bench/deploy scripts (may contain credentials or live data) ----
 fresh3_*.py
 fresh3_*.json
+# one-shot diagnostics under scripts/ that embedded a live token once —
+# never git-add, however the file is recreated
+scripts/check_deploy*.py
 *_probe.py
 *_bench.py
 ab_*.py

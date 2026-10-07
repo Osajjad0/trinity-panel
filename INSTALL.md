@@ -323,7 +323,7 @@ Deployed.
 | `--xhttp-path`, `--panel-path`, `--sub-path` | Fix a path prefix instead of generating one |
 | `--kv-id <id>` | Reuse an existing KV namespace by id |
 | `--kv-title <title>` | Name the KV namespace something other than `<name>-settings` |
-| `--no-do` | Skip the Durable Object migration. **Use this on every redeploy after the first** |
+| `--no-do` | Skip Durable Object registration. **Leave this off** — redeploys already send no migration; with the flag, a fresh worker fails with CF 10061 instead of registering the class |
 
 **Passing an empty string disables a protocol.** `--trojan-password ""` deploys with
 Trojan off; `--panel-password ""` deploys with no panel at all, which is different
@@ -520,8 +520,10 @@ verify-token endpoint lies about account-scoped tokens.
 **`This account has no workers.dev subdomain yet`** — register one in the dashboard
 under **Workers & Pages**, then re-run.
 
-**Redeploy fails on the Durable Object migration** — pass `--no-do`. The migration
-creates the class and only runs once.
+**Redeploy fails on the Durable Object migration** — redeploys send no migration
+at all (a second declaration of the class is rejected by CF with 412/10079). If
+you see CF 10061 instead, you are on a fresh worker with `--no-do`: drop the flag
+so the class gets registered.
 
 **Network resets mid-deploy (`WinError 10054`)** — the script already retries
 failed requests with backoff. If it still fails, re-run; upload is idempotent.

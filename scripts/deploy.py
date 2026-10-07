@@ -52,9 +52,6 @@ COMPATIBILITY_DATE = "2026-07-01"
 # The Durable Object class exported by the Worker. Must match the Rust type
 # name annotated with #[durable_object].
 DO_CLASS = "XhttpSession"
-# Migration tag of the live script. Kept configurable because a redeploy
-# without a tag (--no-do) leaves the script at "", and a mismatch is rejected.
-DO_MIGRATION_TAG = os.environ.get("TRINITY_DO_TAG", "v1")
 
 
 class DeployError(RuntimeError):
@@ -123,7 +120,12 @@ def _request(method: str, path: str, token: str, *, body=None, content_type=None
 
     if not payload.get("success"):
         messages = "; ".join(e.get("message", "?") for e in payload.get("errors", []))
-        raise DeployError(f"{method} {path} was rejected by Cloudflare: {messages}")
+        err = DeployError(f"{method} {path} was rejected by Cloudflare: {messages}")
+        # Keep the structured error list on the exception: callers must be able
+        # to branch on a specific CF code (10061) instead of parsing message
+        # text, which rewords between API versions.
+        err.payload = payload
+        raise err
     return payload.get("result")
 
 
@@ -375,34 +377,49 @@ def upload(token, account, name, entry, modules, bindings, migrate_do):
         "compatibility_date": COMPATIBILITY_DATE,
         "bindings": bindings,
     }
-    if migrate_do:
-        # Must be new_sqlite_classes. The KV-backed `new_classes` form fails on
-        # accounts without a pre-existing KV-backed namespace, and SQLite is the
-        # only backend available on the free plan.
-        # new_tag must match the tag the script is already on. A script
-        # deployed with --no-do has tag "", and asking to migrate to "v1"
-        # is rejected ("Actor migration tag precondition failed, got tag
-        # '' when expecting 'v1'"), which is how the DO binding ends up
-        # declared against a class that was never registered: the module
-        # then throws on every request (CF 1101) with the code unchanged.
-        # Ask for the tag we are actually on; "" means "no tag yet".
-        metadata["migrations"] = {
-            "new_tag": DO_MIGRATION_TAG,
-            "new_sqlite_classes": [DO_CLASS],
-        }
 
-    parts = [("metadata", None, "application/json", json.dumps(metadata).encode())]
-    for fname, ctype, data in modules:
-        parts.append((fname, fname, ctype, data))
+    def _put(migrations):
+        md = dict(metadata)
+        if migrations:
+            md["migrations"] = migrations
+        parts = [("metadata", None, "application/json", json.dumps(md).encode())]
+        for fname, ctype, data in modules:
+            parts.append((fname, fname, ctype, data))
+        body, ctype = _multipart(parts)
+        return _request(
+            "PUT",
+            f"/accounts/{account}/workers/scripts/{name}",
+            token,
+            body=body,
+            content_type=ctype,
+        )
 
-    body, ctype = _multipart(parts)
-    return _request(
-        "PUT",
-        f"/accounts/{account}/workers/scripts/{name}",
-        token,
-        body=body,
-        content_type=ctype,
-    )
+    # Migration semantics, measured against the live API on a disposable
+    # account (scratch/mig_semantics_round5.json, 11 states):
+    #   - Cloudflare compares a migration's declared `old_tag` with the
+    #     script's actual tag. There is NO `current_tag` field: values of
+    #     ""/false/"bogus" were all rejected identically, while a correct
+    #     `old_tag` passed the tag check. Never send `current_tag`.
+    #   - A script whose class is already registered rejects ANY second
+    #     declaration of that class (412/10079 on the tag check first,
+    #     400/10074 "already depended" once the tag matches). So a redeploy
+    #     must send no migrations block at all — omitting it is a clean 200
+    #     and is what every production redeploy does here.
+    #   - A fresh name whose bindings reference an unregistered class is
+    #     rejected atomically (400/10061 "not currently configured to
+    #     implement Durable Objects"); nothing is created, and re-PUT with a
+    #     tagless migration registers it in one shot (fresh actual tag is
+    #     "" — measured: omitting old_tag on a fresh script → 200).
+    #     That 10061 is the only trustworthy signal that registration is
+    #     still owed, so it is the sole trigger to declare the class.
+    try:
+        return _put(None)
+    except DeployError as exc:
+        payload = getattr(exc, "payload", None) or {}
+        codes = {e.get("code") for e in payload.get("errors", [])}
+        if not migrate_do or 10061 not in codes:
+            raise
+    return _put({"new_sqlite_classes": [DO_CLASS]})
 
 
 def enable_subdomain(token, account, name):
