@@ -407,6 +407,9 @@ async fn serve(
     // predicate below constantly true. Verified with a standalone reproduction
     // of the exact shape. A shared counter cannot be copied out of reach.
     let down_bytes: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    // Longest drought between successful downlink sends, mirroring the XHTTP
+    // relay's max_send_gap_ms: the stall signal for mid-tunnel collapse.
+    let max_gap_ms: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
     // Send protocol-specific prologue (e.g., VLESS response header or SS session
     // header) before data relay begins.
@@ -441,8 +444,16 @@ async fn serve(
     // `Copy`, so this cannot silently diverge from the counter read after the
     // join the way the old `bool` did.
     let down_bytes_pump = down_bytes.clone();
+    let max_gap_pump = max_gap_ms.clone();
     let downlink = async move {
         let down_bytes = &down_bytes_pump;
+        let max_gap_ms = &max_gap_pump;
+        // Wall clock of the last successful downlink send; the gap tracker
+        // stamps the longest drought. Lives INSIDE the pump: a `u64` outside
+        // would be copied into the `async move` block and diverge silently.
+        // Initialised at pump start, so a slow handshake never counts as a
+        // stall -- only droughts *between* sends.
+        let mut last_send_ms = worker::Date::now().as_millis();
         // workerd caps each `read_buf` at one 4 KiB segment, so forwarding per
         // read costs a WS frame, a codec call and a JS boundary crossing per
         // 4 KiB -- measured at ~389 frames/MB. Reads that arrive close together
@@ -491,6 +502,16 @@ async fn serve(
                     Ok(encoded) => {
                         let n = encoded.len() as u64;
                         down_bytes.set(down_bytes.get().saturating_add(n));
+                        // Stall tracking: longest drought between successful
+                        // sends. `worker::Date::now()` is the same clock the
+                        // XHTTP relay uses for its max_send_gap_ms, so the two
+                        // transports agree on what counts as a stall.
+                        let now = worker::Date::now().as_millis();
+                        let gap = now.saturating_sub(last_send_ms);
+                        if gap > max_gap_ms.get() {
+                            max_gap_ms.set(gap);
+                        }
+                        last_send_ms = now;
                         if who.send_with_bytes(&encoded).is_err() {
                             break;
                         }
@@ -587,12 +608,21 @@ async fn serve(
     // destination that answers a ClientHello with a TLS alert and a reset
     // (7-16 bytes) is NOT a working egress, and must not be recorded as one.
     let dirty = dirty_downlink(down_bytes.get());
+    // Stall demotion: a winner that moved real data and then dried up for
+    // 15 s+ mid-session is the flapping-candidate signature (measured live:
+    // 0 → 35 → 0 Mbps inside one tunnel). Same demotion as dirty -- one soft
+    // fail, never a quarantine, self-heals on the next probe -- but the
+    // byte gate keeps idle-but-healthy sessions out: those have almost no
+    // bytes and stay on the dirty rule. XHTTP already tracks max_send_gap_ms
+    // per session; its teardown applies this same predicate below.
+    let stalled = crate::relay::stalled_downlink(down_bytes.get(), max_gap_ms.get());
     let winner_key = plan.candidates.get(winner_idx).map(outbound_state::candidate_key);
     // Session-sourced demotion, the same rule XHTTP's teardown applies: a
-    // connected winner that carried nothing records its first soft fail so
-    // the next plan ranks it behind untried candidates.
+    // connected winner that carried nothing -- or that stalled mid-transfer --
+    // records its first soft fail so the next plan ranks it behind untried
+    // candidates.
     let (ws_doc, session_fail_recorded) =
-        if dirty && plan.candidates.get(winner_idx) != Some(&plan.logical) {
+        if (dirty || stalled) && plan.candidates.get(winner_idx) != Some(&plan.logical) {
             let key = winner_key.clone().unwrap_or_default();
             let (doc, changed) =
                 known_state.clone().with_session_fail(&key, worker::Date::now().as_millis());

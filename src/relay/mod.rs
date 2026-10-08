@@ -54,6 +54,30 @@ pub const fn dirty_downlink(downstream_bytes: u64) -> bool {
     downstream_bytes < DIRTY_DOWNLINK_FLOOR
 }
 
+/// Longest send drought that marks a session stalled rather than merely slow.
+///
+/// Sits orders of magnitude above healthy timing: the coalescing window is
+/// 3 ms and normal inter-burst gaps are ~300 ms, while a stalled relay shows
+/// second-scale gaps for tens of seconds (measured live: 1-13 s gaps over
+/// 90 s on a flapping candidate, 7 s max on a good one). Well under the 60 s
+/// idle timeout, so a live session reaching it is stalled, not idle.
+pub const STALL_SEND_GAP_MS: u64 = 15_000;
+
+/// True when a session moved real data and then stalled mid-transfer.
+///
+/// The companion to [`dirty_downlink`]: dirty catches "connected but carried
+/// nothing" (destination TLS never completed); this catches "carried data,
+/// then the pipe dried up" (mid-tunnel collapse — the dominant live failure:
+/// 0 → 35 → 0 Mbps inside one tunnel). Gated on bytes so an idle-but-healthy
+/// session with almost nothing to send is never punished for its pauses;
+/// those stay dirty-or-clean by byte count as before.
+///
+/// Pure and host-testable, same reason as [`dirty_downlink`].
+#[must_use]
+pub const fn stalled_downlink(downstream_bytes: u64, max_send_gap_ms: u64) -> bool {
+    downstream_bytes >= DIRTY_DOWNLINK_FLOOR && max_send_gap_ms >= STALL_SEND_GAP_MS
+}
+
 /// Initial read buffer size.
 ///
 /// Sized to hold a full TLS record (16 KB plus framing) so the common case of
@@ -393,7 +417,7 @@ mod tests {
 
 #[cfg(test)]
 mod dirty_tests {
-    use super::{dirty_downlink, DIRTY_DOWNLINK_FLOOR};
+    use super::{dirty_downlink, stalled_downlink, DIRTY_DOWNLINK_FLOOR, STALL_SEND_GAP_MS};
 
     /// An egress that answers with a TLS alert and a reset moved 7-16 bytes.
     /// That is the failure the demotion exists to catch, and it must never be
@@ -422,5 +446,28 @@ mod dirty_tests {
     #[test]
     fn both_transports_share_one_floor() {
         assert_eq!(DIRTY_DOWNLINK_FLOOR, 1024, "XHTTP's historical value");
+    }
+
+    #[test]
+    fn stalled_session_with_data_and_long_gap_is_stalled() {
+        // The flapping signature: megabytes moved, then a 15 s+ drought.
+        assert!(stalled_downlink(8_000_000, STALL_SEND_GAP_MS));
+        assert!(stalled_downlink(8_000_000, 90_000));
+        assert!(stalled_downlink(DIRTY_DOWNLINK_FLOOR, STALL_SEND_GAP_MS));
+    }
+
+    #[test]
+    fn idle_or_fast_sessions_are_not_stalled() {
+        // Almost no bytes: an idle-but-healthy session, judged by the dirty
+        // rule, never by the stall rule -- however long its pauses.
+        assert!(!stalled_downlink(0, 60_000));
+        assert!(!stalled_downlink(16, 60_000));
+        assert!(!stalled_downlink(DIRTY_DOWNLINK_FLOOR - 1, 60_000));
+        // Real data with healthy pacing: 7 s was the worst gap measured on
+        // a good candidate; normal inter-burst gaps are ~300 ms.
+        assert!(!stalled_downlink(8_000_000, 0));
+        assert!(!stalled_downlink(8_000_000, 300));
+        assert!(!stalled_downlink(8_000_000, 7_000));
+        assert!(!stalled_downlink(8_000_000, STALL_SEND_GAP_MS - 1));
     }
 }

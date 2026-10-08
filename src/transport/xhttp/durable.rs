@@ -1238,11 +1238,21 @@ async fn own_session(ctx: OwnerContext) {
             // mistaken for one. The rule is shared with the WebSocket relay so
             // the two transports cannot disagree about a given session.
             let dirty = crate::relay::dirty_downlink(diag.downstream_sent.get());
+            // Mid-tunnel stall demotion, the same rule the WebSocket relay
+            // applies: a winner that moved real data and then dried up for
+            // 15 s+ is the flapping-candidate signature. Same soft-fail fold
+            // (never a quarantine, self-heals on the next probe); the byte
+            // gate keeps idle-but-healthy sessions on the dirty rule.
             // Session-sourced demotion: when the winning proxy candidate
-            // connected but carried nothing, record its first soft fail so
-            // the next plan ranks it behind untried candidates (durable.rs
-            // teardown is the ONE path every session exits through).
-            let (lkg_doc, session_fail_recorded) = if dirty && !is_direct {
+            // connected but carried nothing -- or stalled mid-transfer --
+            // record its first soft fail so the next plan ranks it behind
+            // untried candidates (durable.rs teardown is the ONE path every
+            // session exits through).
+            let stalled = crate::relay::stalled_downlink(
+                diag.downstream_sent.get(),
+                diag.max_send_gap_ms.get(),
+            );
+            let (lkg_doc, session_fail_recorded) = if (dirty || stalled) && !is_direct {
                 let key = winner_key.clone().unwrap_or_default();
                 let (doc, changed) = lkg_for_teardown.with_session_fail(&key, now_ms());
                 (doc, changed)
