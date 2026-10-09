@@ -1310,14 +1310,24 @@ fn terminal_reason(event: &supervise::Event) -> SessionEnd {
     }
 }
 
-/// Opt-in publication: only when the deployment carries a `SESSION_DIAG`
-/// binding does teardown write the counters to KV. Production never sets it,
-/// so its sessions skip both the KV write and the log line entirely.
+/// Publication: one console log line at every session teardown, always, and a
+/// KV write only when the deployment carries a `SESSION_DIAG` binding.
+/// Production sets no binding, so it skips the KV write and keeps the log.
+/// The counters were otherwise unreachable in production, and a binding is the
+/// wrong fix: one KV write per session on its own namespace is what burned the
+/// daily quota before.
 ///
 /// The lookup is `env.kv` rather than `env.var` deliberately: `var` demands
 /// the bound value be a JS string and rejects a KV namespace outright, while
 /// `kv` succeeds exactly when the binding exists — which is the whole opt-in.
 async fn publish(diag: &SessionDiag, sid: &str, env: &Env) {
+    // One log line per session teardown, always. Workers logs are free and
+    // `wrangler tail` reads them, so the counters (`reads`, `sends`,
+    // `max_read`, `max_send`, `max_gap_ms`) are reachable in production with
+    // no extra binding and no extra KV write. The KV write below stays gated:
+    // one write per session on its own namespace is what made SESSION_DIAG
+    // burn the daily quota, and it is not needed to read the numbers.
+    worker::console_log!("trinity-diag {}", diag.to_json(sid));
     let Ok(kv) = env.kv("SESSION_DIAG") else {
         return;
     };
@@ -1331,7 +1341,6 @@ async fn publish(diag: &SessionDiag, sid: &str, env: &Env) {
         }
         Err(_) => {}
     }
-    worker::console_log!("trinity-diag {}", diag.to_json(sid));
 }
 
 /// Diag keys go into a KV name; keep it to the same charset `SessionId` already
