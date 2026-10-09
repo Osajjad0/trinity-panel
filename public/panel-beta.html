@@ -2490,6 +2490,11 @@ function setSaveState(kind, message) {
   note.className = kind === "error" ? "sev-error" : kind === "warning" ? "sev-warning"
                  : kind === "saved" ? "sev-saved" : "";
   setBusy($("save"), kind === "saving", kind === "saving" ? "Saving…" : "Save");
+  // The button's enabled state has ONE owner: DIRTY. setBusy unconditionally
+  // re-enables on the not-busy path, which un-did refreshDirty()'s disable
+  // when a manual revert cleared the warning (D5). Re-assert after every
+  // state change; during "saving" the busy disable above must survive.
+  $("save").disabled = kind === "saving" ? true : !DIRTY;
   // Detail "Screen Shaking Feedback": a dead end gets an inline shake, not a page move.
   if (kind === "error" && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
     note.classList.remove("shake-x");
@@ -2551,7 +2556,10 @@ function refreshDirty(){
     if (dirty) any = true;
   }
   DIRTY = any;
-  if (any) $("save").disabled = false;
+  // Mirror the badge truth onto the button both ways: enable on any dirty
+  // section, disable again when a manual revert leaves nothing to save
+  // (matches the boot default `disabled` in the markup).
+  $("save").disabled = !any;
 }
 function markDirty() {
   refreshDirty();
@@ -3051,6 +3059,18 @@ window.__uxTests = async function(){
     assert(acc("sec-advanced").open === true, "advanced closed");
     $("c-log-level").value = "";
     $("c-log-level").dispatchEvent(new Event("change"));
+  });
+  // TEST D5: a manual revert disables the Save button again (badge/button
+  // mirror): dirty → enabled, revert-to-saved → disabled. Guards the
+  // refreshDirty() one-way-enable defect (Save clickable with no diff).
+  await t("D5", async ()=>{
+    const savedLv = $("c-log-level").value;
+    $("c-log-level").value = savedLv === "debug" ? "info" : "debug";
+    $("c-log-level").dispatchEvent(new Event("change"));
+    assert($("save").disabled === false, "save not enabled on real diff");
+    $("c-log-level").value = savedLv;
+    $("c-log-level").dispatchEvent(new Event("change"));
+    assert($("save").disabled === true, "save stays enabled after revert to saved values");
   });
   // TEST H: values persist server-side after save (fresh state doc matches).
   await t("H", async ()=>{
