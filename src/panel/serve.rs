@@ -770,20 +770,53 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         // The probe returns, separately: the address the runtime actually
         // dialed, the TCP connect RTT, and the TLS+HTTP RTT. The health
         // record keeps the total (candidate_key format) as before.
-        let (health, dial_ip, tcp_ms, probe_ms) = match probe_one(&host, port).await {
-            Ok(trace) => (
-                prior.observed_ok(
-                    trace.country,
-                    trace.colo,
-                    trace.exit_ip,
-                    trace.latency_ms,
-                    now,
+        // A bare-IP candidate CANNOT pass this trace: the hop is TLS
+        // passthrough (connect.rs, SecureTransport::Off) and worker::Socket
+        // cannot set SNI for an IP dial, so probe_one always fails there
+        // with a "tcp connect: ..." error — which is the exact string
+        // Health::quarantined() reads as "the worker cannot reach this".
+        // Recording that manufactured a hard unreachable verdict out of a
+        // diagnostic limitation, quarantining candidates whose transport
+        // is fine (and, via fail_count, permanently). For an IP candidate
+        // measure TRANSPORT with probe_tcp_one — the runtime's own dial — and
+        // leave egress identity untouched; the relay verdicts below are the
+        // capability evidence. A hostname candidate still gets the full
+        // trace, which can genuinely verify an exit.
+        let is_ip = super::api::probe_kind(&host) == super::api::ProbeKind::Transport;
+        let (health, dial_ip, tcp_ms, probe_ms) = if is_ip {
+            // Clone the identity out first: `observed_ok` takes `self`,
+            // so a borrow inside its own argument list would move a
+            // value it still needs (same shape as the verify pass).
+            let (c, colo, ip) = (
+                prior.country.clone(),
+                prior.colo.clone(),
+                prior.exit_ip.clone(),
+            );
+            match probe_tcp_one(&host, port).await {
+                Ok(t) => (
+                    prior.observed_ok(c, colo, ip, t.latency_ms, now),
+                    t.dial_ip,
+                    Some(t.tcp_ms),
+                    None,
                 ),
-                trace.dial_ip,
-                Some(trace.tcp_ms),
-                Some(trace.probe_ms),
-            ),
-            Err((e, dial_ip, tcp_ms)) => (prior.observed_fail(e, now), dial_ip, tcp_ms, None),
+                Err((e, dial_ip, tcp_ms)) => (prior.observed_fail(e, now), dial_ip, tcp_ms, None),
+            }
+        } else {
+            match probe_one(&host, port).await {
+                Ok(trace) => (
+                    prior.observed_ok(
+                        trace.country,
+                        trace.colo,
+                        trace.exit_ip,
+                        trace.latency_ms,
+                        now,
+                    ),
+                    trace.dial_ip,
+                    Some(trace.tcp_ms),
+                    Some(trace.probe_ms),
+                ),
+                Err((e, dial_ip, tcp_ms)) => (prior.observed_fail(e, now), dial_ip, tcp_ms, None),
+            }
         };
         // Diversified generic-TCP relay check (3 SNIs: own-origin / Fastly
         // / generic), one plain-TCP dial per SNI. Independent of the edge

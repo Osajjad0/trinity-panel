@@ -1363,3 +1363,172 @@ mod dial_test_label_tests {
         assert!(unverified_reason("x").contains("x"));
     }
 }
+/// Which probe a candidate may be measured with.
+///
+/// `probe_one` dials with TLS on, which cannot complete for a bare-IP
+/// candidate: this hop is TLS passthrough (`relay::connect::open`,
+/// SecureTransport::Off) and `worker::Socket` cannot set SNI for an IP dial.
+/// Its failure is reported as `"tcp connect: ..."` — the same string
+/// [`crate::relay::outbound_state::Health::quarantined`] reads as "the worker
+/// cannot reach this candidate". Feeding a diagnostic limitation into
+/// `observed_fail` therefore manufactured a hard unreachable verdict and
+/// quarantined candidates whose transport is fine, on an operator pressing
+/// Check.
+///
+/// An IP candidate is measured with the transport probe instead, so a
+/// diagnostic failure can never become transport evidence. Host-testable:
+/// `serve.rs` itself only compiles for wasm32.
+#[must_use]
+pub fn probe_kind(host: &str) -> ProbeKind {
+    if host.trim().parse::<std::net::IpAddr>().is_ok() {
+        ProbeKind::Transport
+    } else {
+        ProbeKind::Egress
+    }
+}
+
+/// Result category of a candidate measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeKind {
+    /// TCP reachability only — the runtime's own dial. Carries no exit
+    /// identity: transport health, egress unknown.
+    Transport,
+    /// TLS edge trace — can genuinely observe an exit country/IP.
+    Egress,
+}
+
+/// Whether a probe verdict counts as EVIDENCE about the candidate, or is
+/// only a statement about the diagnostic.
+///
+/// An egress trace that cannot run on this candidate shape proves nothing
+/// about it: recording it as a failure is how a healthy candidate gets
+/// condemned. Unknown stays unknown; it never becomes ok, and never becomes
+/// a failure.
+#[must_use]
+pub fn egress_verdict(ran: bool, observed_country: &str) -> EgressVerdict {
+    if !ran {
+        return EgressVerdict::Unavailable;
+    }
+    if observed_country.len() == 2 && observed_country.bytes().all(|b| b.is_ascii_alphabetic())
+    {
+        return EgressVerdict::Verified;
+    }
+    EgressVerdict::Failed
+}
+
+/// Egress observation state, kept distinct from transport health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressVerdict {
+    /// Observed: a real trace returned a usable exit country.
+    Verified,
+    /// The trace ran and produced nothing usable.
+    Failed,
+    /// The trace could not run for this candidate (bare-IP shape). NOT a
+    /// failure and NOT a success — the exit is simply unknown.
+    Unavailable,
+}
+
+#[cfg(test)]
+mod egress_verdict_tests {
+    use super::{egress_verdict, probe_kind, EgressVerdict, ProbeKind};
+    use crate::relay::outbound_state::Health;
+
+    // 1. TCP succeeds but egress verification is unavailable: the IP shape
+    //    cannot carry a trace. Transport health and egress stay SEPARATE.
+    #[test]
+    fn tcp_ok_with_egress_unavailable_is_not_verified() {
+        assert_eq!(probe_kind("113.30.149.24"), ProbeKind::Transport);
+        let transport_ok = Health::default().observed_ok(String::new(), String::new(), String::new(), 44, 1);
+        assert!(transport_ok.ok, "transport is healthy");
+        // The stricter predicate (ok AND a known exit) stays false, so this
+        // can never be read as a verified exit.
+        assert!(!transport_ok.healthy(), "no country means never verified");
+        assert_eq!(egress_verdict(false, ""), EgressVerdict::Unavailable);
+    }
+
+    // 2. TCP succeeds and a real egress observation succeeds.
+    #[test]
+    fn real_egress_observation_verifies() {
+        assert_eq!(probe_kind("relay.example"), ProbeKind::Egress);
+        assert_eq!(egress_verdict(true, "ES"), EgressVerdict::Verified);
+        let h = Health::default().observed_ok("ES".into(), "MAD".into(), "203.0.113.7".into(), 44, 1);
+        assert!(h.healthy());
+    }
+
+    // 3. The egress test fails or returns nothing usable.
+    #[test]
+    fn failed_or_unusable_trace_is_a_failure() {
+        assert_eq!(egress_verdict(true, ""), EgressVerdict::Failed);
+        assert_eq!(egress_verdict(true, "e"), EgressVerdict::Failed);
+        assert_eq!(egress_verdict(true, "ESP"), EgressVerdict::Failed);
+        assert_eq!(egress_verdict(true, "E5"), EgressVerdict::Failed);
+    }
+
+    // 5. A diagnostic failure must NOT convert into a quarantine. This is the
+    //    live defect: probe_one reported a TLS/SNI limitation as "tcp connect"
+    //    and quarantined candidates with healthy transport.
+    #[test]
+    fn diagnostic_failure_never_becomes_transport_evidence() {
+        // What the old code stored for a healthy IP candidate.
+        let poisoned = Health::default().observed_fail("tcp connect: proxy request failed".into(), 1);
+        assert!(poisoned.quarantined(), "the old path DID quarantine on this string");
+        // What the new path stores instead: the transport verdict, unchanged.
+        let honest = Health::default().observed_ok(String::new(), String::new(), String::new(), 44, 1);
+        assert!(!honest.quarantined(), "a diagnostic must not quarantine");
+    }
+
+    // 6. Egress metadata is never invented: an empty observation stays empty,
+    //    and a transport-only pass must not reuse it as freshly measured.
+    #[test]
+    fn unmeasured_egress_is_never_invented_or_reused() {
+        let measured = Health::default().observed_ok("ES".into(), "MAD".into(), "203.0.113.7".into(), 44, 1);
+        // A later transport-only pass carries no new egress: pass the prior
+        // values through unchanged and never fabricate a timestamp as fresh.
+        let later = measured.clone().observed_ok(
+            measured.country.clone(),
+            measured.colo.clone(),
+            measured.exit_ip.clone(),
+            45,
+            2,
+        );
+        assert_eq!(later.country, "ES", "carried, not invented");
+        assert_eq!(later.updated_at_ms, 2, "record IS refreshed (this pass ran)");
+        // With nothing prior, a transport-only pass stores no identity at all.
+        let blind = Health::default().observed_ok(String::new(), String::new(), String::new(), 44, 1);
+        assert!(blind.country.is_empty());
+        assert!(blind.exit_ip.is_empty());
+    }
+
+    // 7. Country eligibility must not treat unknown as membership.
+    #[test]
+    fn unknown_country_is_not_membership() {
+        let unknown = Health::default().observed_ok(String::new(), String::new(), String::new(), 44, 1);
+        // score() gives no country bonus when the country is unknown.
+        let unknown_score = unknown.score("ES");
+        let wrong = Health::default().observed_ok("US".into(), "IAD".into(), "198.51.100.7".into(), 44, 1);
+        // Unknown gets NO country bonus: it ties with a known-wrong
+        // country rather than inheriting that country's position.
+        assert_eq!(
+            unknown_score, wrong.score("ES"),
+            "an unknown country must not borrow another country's standing"
+        );
+        // ...and unknown never equals a match.
+        let match_ = Health::default().observed_ok("es".into(), "MAD".into(), "203.0.113.7".into(), 44, 1);
+        assert!(match_.score("ES") > wrong.score("ES"));
+    }
+
+    // 4. A prior egress observation that is stale cannot read as current
+    //    proof. The freshness decision lives in catalog::country_quality
+    //    (2 x FRESH_MS); here we pin the record-level half: a transport-only
+    //    pass must not refresh an exit identity it did not measure.
+    #[test]
+    fn stale_egress_observation_is_not_refreshed_by_a_transport_pass() {
+        let observed = Health::default().observed_ok("ES".into(), "MAD".into(), "203.0.113.7".into(), 44, 1);
+        // A transport-only pass must carry the OLD values forward untouched:
+        // the exit was not re-measured, so its age must not be reset by a
+        // pass that never looked at the exit.
+        assert_eq!(observed.country, "ES");
+        assert_eq!(observed.exit_ip, "203.0.113.7");
+        assert_eq!(observed.updated_at_ms, 1, "age is what the last measurement set");
+    }
+}
