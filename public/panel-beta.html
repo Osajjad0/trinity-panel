@@ -1033,58 +1033,6 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
       </details>
     </details>
 
-    <details class="acc" id="sec-outbound">
-      <summary><h2>Routing</h2><span class="acc-hint muted">How Trinity sends traffic.</span><span class="acc-note" data-dirty-for="routing" hidden>Unsaved changes</span></summary>
-
-      <div class="sub">
-        <div class="field" style="max-width:320px">
-          <label for="ob-mode">Mode</label>
-          <div class="help">How traffic leaves this deployment.</div>
-          <select id="ob-mode">
-            <option value="off">Off: direct dial</option>
-            <option value="proxyIp">Proxy-IP: Custom</option>
-            <option value="pool">Proxy Pool: Location</option>
-            <option value="nat64">NAT64: experimental</option>
-          </select>
-        </div>
-
-        <div id="ob-proxy" class="hidden">
-          <div class="field">
-            <label for="ob-proxies">Proxy candidates</label>
-            <div class="help">One address or hostname per line. Tried in order.</div>
-            <textarea id="ob-proxies" rows="4" spellcheck="false" placeholder="1.2.3.4&#10;edge.example.com"></textarea>
-          </div>
-          <details class="inner-acc">
-            <summary>Advanced</summary>
-            <div class="field" style="max-width:160px;margin-top:.5rem">
-              <label for="ob-attempts">Max attempts</label>
-              <div class="help">How many candidates to try before giving up (1–8).</div>
-              <input id="ob-attempts" type="number" min="1" max="8" value="3">
-            </div>
-            <div class="row" style="margin-top:.4rem">
-              <button type="button" id="ob-unpin">Unpin / Auto</button>
-              <button type="button" id="ob-probe">Test manual candidates</button>
-              <span id="ob-probe-note" class="muted"></span>
-            </div>
-            <div id="ob-health" class="field" style="margin-top:.5rem"></div>
-          </details>
-        </div>
-
-        <div id="ob-nat64" class="hidden">
-          <div class="field">
-            <label for="ob-prefixes">NAT64 prefixes</label>
-            <div class="help">One /96 prefix per line. The first valid one
-               is used; <code>64:ff9b::/96</code> is the default if none apply.</div>
-            <textarea id="ob-prefixes" rows="3" spellcheck="false" placeholder="64:ff9b::/96"></textarea>
-          </div>
-          <p class="muted sev-degraded">Experimental: not working on workers.dev
-             as of 2026-08. Proxy IP is the working path.</p>
-        </div>
-      </div>
-    </details>
-
-    <!-- Common (v1.9.7): shared client-config preferences. Rides the settings document;
-         zero hot-path cost. -->
     <details class="acc" id="sec-common">
       <summary>
         <h2>Common</h2><span class="acc-hint muted">Shared client settings</span><span class="acc-note" data-dirty-for="common" hidden>Unsaved changes</span></summary>
@@ -1175,6 +1123,58 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
     </details>
 
 
+    <details class="acc" id="sec-outbound">
+      <summary><h2>Routing</h2><span class="acc-hint muted">How Trinity sends traffic.</span><span class="acc-note" data-dirty-for="routing" hidden>Unsaved changes</span></summary>
+
+      <div class="sub">
+        <div class="field" style="max-width:320px">
+          <label for="ob-mode">Mode</label>
+          <div class="help">How traffic leaves this deployment.</div>
+          <select id="ob-mode">
+            <option value="off">Off: direct dial</option>
+            <option value="proxyIp">Proxy-IP: Custom</option>
+            <option value="pool">Proxy Pool: Location</option>
+            <option value="nat64">NAT64: experimental</option>
+          </select>
+        </div>
+
+        <div id="ob-proxy" class="hidden">
+          <div class="field">
+            <label for="ob-proxies">Proxy candidates</label>
+            <div class="help">One address or hostname per line. Tried in order.</div>
+            <textarea id="ob-proxies" rows="4" spellcheck="false" placeholder="1.2.3.4&#10;edge.example.com"></textarea>
+          </div>
+          <details class="inner-acc">
+            <summary>Advanced</summary>
+            <div class="field" style="max-width:160px;margin-top:.5rem">
+              <label for="ob-attempts">Max attempts</label>
+              <div class="help">How many candidates to try before giving up (1–8).</div>
+              <input id="ob-attempts" type="number" min="1" max="8" value="3">
+            </div>
+            <div class="row" style="margin-top:.4rem">
+              <button type="button" id="ob-unpin">Unpin / Auto</button>
+              <button type="button" id="ob-probe">Test manual candidates</button>
+              <span id="ob-probe-note" class="muted"></span>
+            </div>
+            <div id="ob-health" class="field" style="margin-top:.5rem"></div>
+          </details>
+        </div>
+
+        <div id="ob-nat64" class="hidden">
+          <div class="field">
+            <label for="ob-prefixes">NAT64 prefixes</label>
+            <div class="help">One /96 prefix per line. The first valid one
+               is used; <code>64:ff9b::/96</code> is the default if none apply.</div>
+            <textarea id="ob-prefixes" rows="3" spellcheck="false" placeholder="64:ff9b::/96"></textarea>
+          </div>
+          <p class="muted sev-degraded">Experimental: not working on workers.dev
+             as of 2026-08. Proxy IP is the working path.</p>
+        </div>
+      </div>
+    </details>
+
+    <!-- Common (v1.9.7): shared client-config preferences. Rides the settings document;
+         zero hot-path cost. -->
     <details class="acc" id="sec-proxyip">
       <summary><h2>Proxy Pool</h2><span class="acc-hint muted">Verified feed.</span><span class="acc-note" data-dirty-for="proxyip" hidden>Unsaved changes</span></summary>
       <div class="sub hidden" id="cat-card">
