@@ -753,8 +753,15 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         error: String,
     }
     let mut results = Vec::new();
-    for (host, source) in scope {
-        let port: u16 = 443;
+    for (entry, source) in scope {
+        // A scope entry is EITHER a bare host (a configured candidate)
+        // OR "host:port" (a runtime-pool candidate, which the catalog
+        // publishes with its real port). Hardcoding 443 dialed the wrong
+        // port for every pool entry and made the host unparseable as an
+        // IP, so the transport/egress split below never fired. Split it
+        // here: the IPv6 form keeps its brackets (probe_dial_address
+        // expects them).
+        let (host, port) = super::api::split_host_port(&entry);
         // Health key matches `candidate_key` (host:port) so dial-path demotion,
         // LKG and the panel all read and write the same record. Port-443
         // configured candidates keep their historical bare-host keys via the

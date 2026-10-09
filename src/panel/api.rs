@@ -1532,3 +1532,81 @@ mod egress_verdict_tests {
         assert_eq!(observed.updated_at_ms, 1, "age is what the last measurement set");
     }
 }
+/// Split a candidate entry into (host, port).
+///
+/// Configured candidates are a bare host and keep the historical
+/// default 443; a runtime-pool entry arrives as `host:port`. A bracketed
+/// IPv6 literal keeps its brackets for the dialer, which parses them
+/// back off. Host-testable pure split — the caller lives in a
+/// wasm32-only module.
+#[must_use]
+pub fn split_host_port(entry: &str) -> (String, u16) {
+    let e = entry.trim();
+    // Bracketed IPv6: "[::1]:8443" — split on the LAST colon only.
+    if let Some(rest) = e.strip_prefix('[') {
+        if let Some((h, p)) = rest.split_once(']').and_then(|(h, t)| {
+            Some((h, t.strip_prefix(':')?))
+        }) {
+            if let Ok(port) = p.parse::<u16>() {
+                return (format!("[{h}]"), port);
+            }
+        }
+        return (e.to_owned(), 443);
+    }
+    match e.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !h.contains(':') => {
+            match p.parse::<u16>() {
+                Ok(port) => (h.to_owned(), port),
+                Err(_) => (e.to_owned(), 443),
+            }
+        }
+        _ => (e.to_owned(), 443),
+    }
+}
+
+#[cfg(test)]
+mod split_host_port_tests {
+    use super::split_host_port;
+
+    // A bare configured candidate keeps the historical default 443.
+    #[test]
+    fn bare_host_defaults_to_443() {
+        assert_eq!(split_host_port("relay.example"), ("relay.example".into(), 443));
+        assert_eq!(split_host_port("  113.30.149.24  "), ("113.30.149.24".into(), 443));
+    }
+
+    // A runtime-pool entry carries its real port. Hardcoding 443 dialled the
+    // WRONG port for every pool row (live: 162.141.93.190:2083, 185.121.12.28:8443).
+    #[test]
+    fn host_port_entry_splits_on_the_real_port() {
+        assert_eq!(split_host_port("162.141.93.190:2083"), ("162.141.93.190".into(), 2083));
+        assert_eq!(split_host_port("185.121.12.28:8443"), ("185.121.12.28".into(), 8443));
+    }
+
+    // With the port split off, the IP parse works, so the transport/egress
+    // decision can fire at all. This is the bug behind "every IP candidate
+    // looked like a hostname".
+    #[test]
+    fn split_makes_ip_detection_possible() {
+        let (host, _) = split_host_port("162.141.93.190:2083");
+        assert!(host.parse::<std::net::IpAddr>().is_ok());
+        let (host, _) = split_host_port("162.141.93.190");
+        assert!(host.parse::<std::net::IpAddr>().is_ok());
+    }
+
+    // A bracketed IPv6 literal keeps its brackets for the dialer and still
+    // splits the port; an unbracketed IPv6 stays whole (bare IPv6 has many
+    // colons, so splitting on the last one would corrupt it).
+    #[test]
+    fn ipv6_survives_the_split() {
+        assert_eq!(split_host_port("[2001:db8::1]:8443"), ("[2001:db8::1]".into(), 8443));
+        let (host, port) = split_host_port("2001:db8::1");
+        assert_eq!((host.as_str(), port), ("2001:db8::1", 443));
+    }
+
+    // A non-numeric tail is not a port: keep the whole entry, never invent one.
+    #[test]
+    fn non_numeric_tail_is_not_a_port() {
+        assert_eq!(split_host_port("relay.example:https"), ("relay.example:https".into(), 443));
+    }
+}
