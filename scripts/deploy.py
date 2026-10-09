@@ -34,16 +34,23 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
+import hashlib
 import mimetypes
 import os
+import subprocess
 import secrets
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 import uuid
 
 API = "https://api.cloudflare.com/client/v4"
+
+# This file lives in scripts/ inside the repository it builds.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Pins runtime behaviour. Changing this can change semantics, so it moves only
 # deliberately and in step with the Rust build.
@@ -53,10 +60,254 @@ COMPATIBILITY_DATE = "2026-07-01"
 # name annotated with #[durable_object].
 DO_CLASS = "XhttpSession"
 
+# ---- release integrity -------------------------------------------------
+# A build directory is anonymous: nothing recorded which source revision
+# produced it, and nothing stopped a deploy from uploading files that a later
+# build had already replaced. Two deploys 54s apart against two different
+# builds were indistinguishable to this pipeline. The manifest below is the
+# missing record, and the checks around it are the gate that reads it.
+#
+# They live in collect_modules()/upload() rather than in main() because the
+# setup wizard (install.py) calls those two directly and never runs main(): a
+# guard added only to main() would cover the CLI and nothing else.
+#
+# ponytail: one lock file per Worker name in the temp dir. It serializes
+# deploys on this machine only; two machines can still race, which is what the
+# post-upload etag check reports.
 
 class DeployError(RuntimeError):
     """Anything that should stop the deployment with a readable message."""
 
+
+MANIFEST_NAME = "release-manifest.json"
+
+# Everything whose contents change the built modules. Untracked junk elsewhere
+# in the repo is deliberately excluded, so an unrelated scratch file cannot
+# block a valid deploy, while a new untracked source file does change it.
+SNAPSHOT_PATHS = ("src", "public", "Cargo.toml", "Cargo.lock", "build.py", "wrangler.jsonc")
+
+SUFFIXES = (".wasm", ".mjs", ".js")
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git(*args) -> str:
+    proc = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _snapshot_root() -> str:
+    """The checkout whose build inputs are hashed: the cwd, as git sees it.
+
+    git resolves relative paths against the working directory, so the snapshot
+    must too, otherwise "deploy from the repo root" and "verify from elsewhere"
+    would read different trees. Falls back to this script's own repository so a
+    deploy.py invoked from an unrelated directory still records a real revision
+    instead of an empty one.
+    """
+    if _git("rev-parse", "--show-toplevel"):
+        return _git("rev-parse", "--show-toplevel")
+    return ROOT
+
+
+def source_snapshot() -> str:
+    """One value that changes whenever the build inputs change.
+
+    A content digest of every build input, plus the commit. The content digest
+    is what makes this correct rather than merely plausible: `git status` is
+    byte-identical for an untracked file before and after its contents are
+    edited, so a source file that was never committed could change and still
+    produce the same status output. Hashing the bytes themselves cannot.
+
+    Only SNAPSHOT_PATHS is walked, so a local .env or credential file can never
+    enter this value or anything derived from it.
+    """
+    root = _snapshot_root()
+    parts = [_git("rev-parse", "HEAD")]
+    for rel_path in SNAPSHOT_PATHS:
+        full = os.path.join(root, rel_path)
+        if os.path.isfile(full):
+            parts.append(f"{rel_path}\0{_sha256_file(full)}")
+            continue
+        for dirpath, dirnames, filenames in os.walk(full):
+            dirnames.sort()
+            for fname in sorted(filenames):
+                if fname.endswith((".exe", ".dll", ".pdb")):
+                    continue
+                child = os.path.join(dirpath, fname)
+                if not os.path.isfile(child):
+                    continue
+                parts.append(f"{os.path.relpath(child, root)}\0{_sha256_file(child)}")
+    parts.sort()
+    return hashlib.sha256("\0".join(parts).encode("utf-8", "replace")).hexdigest()
+
+def write_manifest(build_dir: str) -> dict:
+    """Record what this build is, so the deploy can prove it.
+
+    A commit hash, a snapshot hash and a SHA-256 per module: enough to reject
+    every stale or substituted artifact, and nothing sensitive to store.
+    """
+    artifacts = {}
+    for root, _dirs, files in os.walk(build_dir):
+        for fname in files:
+            if fname.endswith(SUFFIXES):
+                full = os.path.join(root, fname)
+                rel = os.path.relpath(full, build_dir).replace(os.sep, "/")
+                artifacts[rel] = _sha256_file(full)
+    if not artifacts:
+        raise DeployError(f"no modules to record in {build_dir}")
+    commit = _git("rev-parse", "HEAD")
+    if not commit:
+        raise DeployError(
+            "cannot record provenance: this is not a git checkout, so deployed "
+            "bytes could never be tied to a reviewed source revision."
+        )
+    manifest = {
+        "commit": commit,
+        "snapshot": source_snapshot(),
+        "artifacts": dict(sorted(artifacts.items())),
+    }
+    with open(os.path.join(build_dir, MANIFEST_NAME), "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    return manifest
+
+
+def read_manifest(build_dir: str) -> dict:
+    """Load the manifest, failing closed when it is absent or unusable."""
+    path = os.path.join(build_dir, MANIFEST_NAME)
+    if not os.path.isfile(path):
+        raise DeployError(
+            f"No {MANIFEST_NAME} in {build_dir}. That build directory was not "
+            f"produced by scripts/build.py, so its provenance cannot be "
+            f"verified and it will not be deployed."
+        )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise DeployError(f"{path} is unreadable: {exc}") from exc
+    if not isinstance(manifest.get("artifacts"), dict) or not manifest["artifacts"]:
+        raise DeployError(f"{path} records no artifacts.")
+    for field in ("commit", "snapshot"):
+        if not manifest.get(field):
+            raise DeployError(f"{path} has no {field}.")
+    return manifest
+
+
+def verify_release(build_dir: str, modules=None) -> dict:
+    """Fail closed unless these bytes are exactly the reviewed build.
+
+    Called twice on purpose: once before any API call, so a bad build never
+    reaches the account, and again on the module bytes about to be uploaded,
+    which closes the window between the two. With `modules` given, the hashes
+    are taken from the in-memory bytes, so what is verified IS what is sent.
+
+    Returns the manifest; raises DeployError on any mismatch.
+    """
+    manifest = read_manifest(build_dir)
+    recorded = manifest["artifacts"]
+    if modules is None:
+        present = {}
+        for root, _dirs, files in os.walk(build_dir):
+            for fname in files:
+                if fname.endswith(SUFFIXES):
+                    full = os.path.join(root, fname)
+                    present[os.path.relpath(full, build_dir).replace(os.sep, "/")] = _sha256_file(full)
+    else:
+        present = {rel: hashlib.sha256(data).hexdigest() for rel, _ctype, data in modules}
+
+    missing = sorted(set(recorded) - set(present))
+    if missing:
+        raise DeployError(
+            "recorded artifact(s) are missing from the build directory: "
+            + ", ".join(missing)
+            + ". A partial build would deploy a broken module set."
+        )
+    extra = sorted(set(present) - set(recorded))
+    if extra:
+        raise DeployError(
+            "module(s) present but not in the manifest: "
+            + ", ".join(extra)
+            + ". An artifact was substituted or left over from an earlier build."
+        )
+    changed = sorted(name for name in recorded if recorded[name] != present[name])
+    if changed:
+        raise DeployError(
+            "artifact(s) do not match the recorded SHA-256: "
+            + ", ".join(changed)
+            + ". The files changed after the build was verified."
+        )
+    if manifest["snapshot"] != source_snapshot():
+        raise DeployError(
+            "the source tree changed after this build was recorded (built from "
+            f"{manifest['commit'][:7]}). Rebuild so the artifact matches the "
+            "source that was reviewed."
+        )
+    return manifest
+
+
+@contextlib.contextmanager
+def deploy_lock(name: str):
+    """One deploy per Worker at a time.
+
+    Two uploads racing the same script name interleave, and the loser silently
+    overwrites the winner's modules with whatever it had read. An exclusive
+    create is the entire mechanism.
+    """
+    path = os.path.join(tempfile.gettempdir(), f"trinity-deploy-{name}.lock")
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise DeployError(
+            f"another deploy of {name} holds {path}. Wait for it to finish, or "
+            f"delete that file if no deploy is running."
+        ) from exc
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        os.close(fd)
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def live_revision(token: str, account: str, name: str) -> dict:
+    """The newest deployed version's id and script etag, or {} if unavailable.
+
+    Cloudflare's per-version `script.etag` is a content hash of what was
+    actually stored, which is the one identity available for the deployed bytes
+    without putting anything in the Worker or in a public response.
+
+    The etag lives on the version detail resource, not in the versions LIST:
+    a list item carries only id/number/metadata, so reading the etag from there
+    yields an empty string that looks like a successful check. That is exactly
+    the kind of "proved nothing" signal this whole gate exists to remove, so the
+    detail is fetched and the etag is only reported when it is really there.
+    """
+    listing = _request("GET", f"/accounts/{account}/workers/scripts/{name}/versions?per_page=1", token) or {}
+    items = (listing.get("items") or []) if isinstance(listing, dict) else []
+    if not items:
+        return {}
+    top = items[0]
+    version_id = top.get("id", "")
+    detail = _request("GET", f"/accounts/{account}/workers/scripts/{name}/versions/{version_id}", token) or {}
+    resources = (detail.get("resources") or {}) if isinstance(detail, dict) else {}
+    etag = ((resources.get("script") or {}).get("etag") or "").strip()
+    return {
+        "version_id": version_id,
+        "version_number": top.get("number"),
+        "created_on": (top.get("metadata") or {}).get("created_on", ""),
+        "script_etag": etag,
+    }
 
 def _request(method: str, path: str, token: str, *, body=None, content_type=None):
     """Call the Cloudflare API, retrying on transient network resets.
@@ -318,6 +569,7 @@ def _multipart(parts):
     return bytes(out), f"multipart/form-data; boundary={boundary}"
 
 
+
 def collect_modules(build_dir: str):
     """Find the entry module and every sibling module it needs."""
     if not os.path.isdir(build_dir):
@@ -352,6 +604,11 @@ def collect_modules(build_dir: str):
     # and index.js is a dependency. Picking by directory order would choose
     # index.js, which exports the raw bindings and no Worker handler, and the
     # deployment would fail at runtime rather than at upload.
+    # Provenance gate, on the shared read path. Both callers (deploy.py main and
+    # the setup wizard) come through here, so this is the one place that has to
+    # be right.
+    verify_release(build_dir)
+
     for preferred in ("shim.mjs", "worker.mjs", "index.mjs"):
         if any(m[0] == preferred for m in modules):
             entry = preferred
@@ -372,6 +629,18 @@ def collect_modules(build_dir: str):
 
 
 def upload(token, account, name, entry, modules, bindings, migrate_do):
+    """PUT the module set, serialized per Worker, and report what landed.
+
+    The lock is held across the whole retrying upload rather than only around
+    the API call: a deploy that is still retrying a dropped connection holds
+    the script slot just as much as one that is mid-request, and releasing the
+    lock between attempts is exactly how two uploads interleave.
+    """
+    with deploy_lock(name):
+        return _upload_locked(token, account, name, entry, modules, bindings, migrate_do)
+
+
+def _upload_locked(token, account, name, entry, modules, bindings, migrate_do):
     metadata = {
         "main_module": entry,
         "compatibility_date": COMPATIBILITY_DATE,
@@ -567,6 +836,9 @@ def main() -> int:
         sub_path = args.sub_path or "/" + secrets.token_hex(8)
 
         entry, modules = collect_modules(args.build_dir)
+        # collect_modules() already verified the on-disk bytes. The second,
+        # stricter check runs against the in-memory module list immediately
+        # before upload(), so what is hashed is what the account will receive.
         total = sum(len(m[2]) for m in modules)
         print(f"Uploading {len(modules)} module(s), {total // 1024} KiB, entry {entry}...")
 
@@ -595,7 +867,22 @@ def main() -> int:
                 {"type": "kv_namespace", "name": "SESSION_DIAG", "namespace_id": diag_kv}
             )
 
+        manifest = verify_release(args.build_dir, modules)
+        print(
+              f"Release verified: commit {manifest['commit'][:7]}, "
+              f"snapshot {manifest['snapshot'][:16]}")
         upload(token, account, args.name, entry, modules, bindings, not args.no_do)
+        landed = live_revision(token, account, args.name)
+        if landed:
+            # The etag is Cloudflare's content hash of what it stored. Printing
+            # it is the difference between "I uploaded something" and "this is
+            # what the account now holds". When the API does not return one,
+            # say so rather than printing an empty field that reads as a pass.
+            etag = landed["script_etag"]
+            shown = f"etag {etag[:16]}" if etag else "etag unavailable from the API"
+            print(
+                  f"  Landed     version {landed['version_number']} "
+                  f"({landed['created_on']}) {shown}")
         enable_subdomain(token, account, args.name)
         if args.cron:
             register_cron(token, account, args.name, args.cron)

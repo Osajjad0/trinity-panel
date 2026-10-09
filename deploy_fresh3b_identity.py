@@ -41,9 +41,13 @@ cmd = [sys.executable, os.path.join(ROOT, "scripts", "deploy.py"),
        "--ss-users", grab("SS_USERS"),
        "--cron", "23 */6 * * *"]
 # Pass args via a temp file? deploy.py takes argv directly; keep env clean otherwise.
+# Keep the release-integrity lines: without them the deploy prints only
+# "Deployed", which is exactly the signal that failed to distinguish a stale
+# artifact from a correct one.
 filter_keys = ("Deployed", "Host", "XHTTP path", "Panel path", "Subscription",
                "rejected", "Error", "error", "Checking", "Uploading", "KV", "Durable",
-               "wasm", "sha256", "Identity")
+               "wasm", "sha256", "Identity", "Release verified", "Landed",
+               "manifest", "commit", "snapshot", "modules")
 out_path = os.path.join(tempfile.gettempdir(), "fresh3b_deploy_out.txt")
 with open(out_path, "w") as outf:
     code = subprocess.call(cmd, stdout=outf, stderr=subprocess.STDOUT,

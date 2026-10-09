@@ -28,6 +28,14 @@ Set WASM_BINDGEN to an explicit path if the binary is not on PATH.
 
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+
+# build.py and deploy.py are siblings and share the release gate (the manifest
+# and its checks). Insert this directory so `import deploy` resolves whether
+# build.py was run as a script or imported by a test.
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+
 import argparse
 import os
 import re
@@ -349,13 +357,22 @@ def main() -> int:
         os.rmdir(snippets)
 
     print("\nBuilt:")
+
+    # Record what this build is, so the deploy can refuse anything else. The
+    # import is local because build.py also runs as a standalone script (the
+    # setup wizard shells out to it), and the sys.path line above makes the
+    # sibling module importable either way.
+    import deploy  # noqa: E402
+    manifest = deploy.write_manifest(args.out)
+    print(f"  {deploy.MANIFEST_NAME:18} commit {manifest['commit'][:7]} snapshot {manifest['snapshot'][:16]}")
     total = 0
     for name in sorted(os.listdir(args.out)):
         full = os.path.join(args.out, name)
         if os.path.isfile(full):
             size = os.path.getsize(full)
             total += size
-            print(f"  {name:20} {size / 1024:8.1f} KiB")
+            sha = deploy._sha256_file(full) if name.endswith(deploy.SUFFIXES) else ""
+            print(f"  {name:20} {size / 1024:8.1f} KiB  {sha[:16]}")
     print(f"  {'total':20} {total / 1024:8.1f} KiB")
     print(f"\nDeploy with:\n  python scripts/deploy.py --name <worker-name> --build-dir {args.out}")
     return 0
