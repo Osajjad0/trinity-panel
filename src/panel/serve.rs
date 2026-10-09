@@ -1679,8 +1679,47 @@ async fn pool_dial_test(req: &Request, env: &Env) -> Result<Response> {
                         continue;
                     }
                     Err((reason, _, _)) => {
-                        // fall through to the plain TCP row below
-                        let _ = reason;
+                        // The edge trace CANNOT succeed on a bare-IP candidate:
+                        // this hop is TLS passthrough (`relay::connect::open`,
+                        // SecureTransport::Off) and worker::Socket cannot set
+                        // SNI for an IP dial, so the handshake never completes
+                        // and EVERY candidate "fails" the trace — including
+                        // ones a real session proves good. Falling through
+                        // silently reported `ok: true` with an empty
+                        // country/exitIp, which reads as "verified ES" while
+                        // proving nothing. Keep the TCP verdict (unchanged) but
+                        // carry the reason, so the operator sees the exit
+                        // country is UNVERIFIED rather than absent by design.
+                        let unverified = super::api::unverified_reason(&reason);
+                        match probe_tcp_one(&endpoint.host, endpoint.port).await {
+                            Ok(t) => rows.push(Row {
+                                candidate,
+                                dial_ip: t.dial_ip,
+                                tcp_ms: Some(t.tcp_ms),
+                                probe_ms: None,
+                                observed_country: String::new(),
+                                colo: String::new(),
+                                exit_ip: String::new(),
+                                ok: true,
+                                error: unverified,
+                            }),
+                            Err((r2, attempted, tcp_ms)) => rows.push(Row {
+                                candidate: if attempted.is_empty() {
+                                    candidate
+                                } else {
+                                    attempted
+                                },
+                                dial_ip: String::new(),
+                                tcp_ms,
+                                probe_ms: None,
+                                observed_country: String::new(),
+                                colo: String::new(),
+                                exit_ip: String::new(),
+                                ok: false,
+                                error: r2,
+                            }),
+                        }
+                        continue;
                     }
                 }
             }

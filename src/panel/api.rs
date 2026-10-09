@@ -1315,3 +1315,51 @@ mod tests {
         assert_eq!(back.outbound.catalog_country, "AUTO");
     }
 }
+
+/// Label for a pool dial-test row whose exit country could not be proven.
+///
+/// The edge trace cannot succeed on a bare-IP candidate: this hop is TLS
+/// passthrough (`relay::connect::open`, SecureTransport::Off) and
+/// worker::Socket cannot set SNI for an IP dial, so every candidate "fails"
+/// the trace — including ones a real session proves good. Returning the bare
+/// reason rendered a successful-looking row with no explanation, so a
+/// TCP-only row could not be told apart from a verified one.
+#[must_use]
+pub fn unverified_reason(reason: &str) -> String {
+    if reason.starts_with("exit unverified:") {
+        return reason.to_owned();
+    }
+    format!("exit unverified: {reason}")
+}
+
+#[cfg(test)]
+mod dial_test_label_tests {
+    use super::unverified_reason;
+
+    // Regression: on the live ES pool every one of the 8 rows came back
+    // `ok: true` with an empty country/exitIp — "verified" while proving
+    // nothing — on a candidate (162.141.93.190) a real session proved good.
+    #[test]
+    fn unverified_exit_is_labelled_not_silent() {
+        let got = unverified_reason("no loc= in trace");
+        assert_eq!(got, "exit unverified: no loc= in trace");
+        assert!(
+            got.contains("unverified"),
+            "a TCP-only row must say the exit is UNVERIFIED, got {got:?}"
+        );
+    }
+
+    // Idempotent: an already-labelled reason is not double-prefixed.
+    #[test]
+    fn label_is_idempotent() {
+        let once = unverified_reason("tls/read: closed");
+        assert_eq!(unverified_reason(&once), once);
+    }
+
+    // Never silently empty: every reason produces a non-empty label.
+    #[test]
+    fn reason_is_never_dropped() {
+        assert!(!unverified_reason("").is_empty());
+        assert!(unverified_reason("x").contains("x"));
+    }
+}
