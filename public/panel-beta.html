@@ -1011,9 +1011,9 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
 
     <div id="banner"></div>
 
-    <!-- egress check (Bug #1 honesty aid): one fetch per click, nothing stored -->
+    <!-- Browser-route check: one fetch per click, nothing stored, never submitted. -->
     <div class="row" style="margin:0.5rem 0">
-      <button type="button" id="egress-btn">Measured exit</button>
+      <button type="button" id="egress-btn">Browser route</button>
       <span class="muted mono" id="egress-check"></span>
     </div>
 
@@ -1473,22 +1473,46 @@ $("signout").onclick = async () => {
   location.reload();
 };
 
-// ---- egress check (Bug #1 honesty aid) -------------------------------------
-// The panel page itself may be loaded through the tunnel (browser routed via
-// the proxy client). This check reports THAT route's public exit — the same
-// signal whoer-style sites show — labeled exactly as what it is: this
-// browser's current route, one fetch per click, nothing stored.
+// ---- egress check -----------------------------------------------------------
+// Measured live: this button reported 2.183.28.132 / IR while the tunnel itself
+// exited 113.30.149.24 / ES. It is a fetch() from THIS page, so it reports the
+// operator's own browser route, which is the tunnel only when the browser is
+// deliberately routed through the proxy client. Nothing here can prove the
+// request left via a specific Proxy-IP candidate: the page has no handle on the
+// client's socket pool, and the client picks whichever candidate wins the dial.
+//
+// So the label states what was measured, and the session's own recorded winner
+// is shown beside it for comparison. Nothing is stored and nothing is submitted:
+// an advisory observation must never reach country eligibility, which comes from
+// the scanner-verified catalog.
 $("egress-btn").onclick = async () => {
   const out = $("egress-check");
-  out.textContent = "Measured exit: checking…";
+  const win = STATE && STATE.sessionWinner;
+  const winner = win ? win.candidate : "";
+  out.textContent = "Browser route: checking\u2026";
+  let line;
   try {
     const r = await fetch("https://ipwho.is/", { cache: "no-store" });
     const j = await r.json();
-    out.textContent = "Measured exit (this browser route): " + (j.ip || "?")
-      + " — " + (j.country || "?") + " (" + new Date().toLocaleTimeString() + ")";
+    if (!j || !j.ip) throw new Error("empty");
+    const when = new Date().toLocaleTimeString();
+    // Only a literal match against the candidate a real session last exited
+    // through is reported as coinciding. Anything else stays advisory.
+    const host = winner.split(":")[0];
+    const coincides = host && host === j.ip;
+    line = "Browser route: " + j.ip + " \u2014 " + (j.country || "?")
+      + " (" + when + ")";
+    if (coincides) {
+      line += " \u00b7 matches the session winner " + winner;
+    } else if (winner) {
+      line += " \u00b7 not the session route (session last exited via " + winner + ")";
+    } else {
+      line += " \u00b7 no session winner recorded yet";
+    }
   } catch {
-    out.textContent = "Measured exit: lookup failed (offline or blocked)";
+    line = "Browser route: lookup failed (offline or blocked)";
   }
+  out.textContent = line;
 };
 
 // ---- boot ------------------------------------------------------------------

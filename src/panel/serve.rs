@@ -337,6 +337,7 @@ async fn state(req: &Request, env: &Env) -> Result<Response> {
         fallback,
         country_quality,
         &snapshot.map(|s| s.quality_by_endpoint).unwrap_or_default(),
+        super::api::session_winner_view(&outbound_state),
     ))
 }
 
@@ -506,6 +507,7 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
             &snapshot
                 .map(|s| s.quality_by_endpoint)
                 .unwrap_or_default(),
+            super::api::session_winner_view(&load_outbound_state(env).await),
         );
         return json(&SavedResponse { ok: true, state });
     }
@@ -560,6 +562,7 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         &snapshot
             .map(|s| s.quality_by_endpoint)
             .unwrap_or_default(),
+        super::api::session_winner_view(&load_outbound_state(env).await),
     );
     Ok(json(&SavedResponse { ok: true, state })?)
 }

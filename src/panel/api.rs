@@ -268,6 +268,45 @@ pub struct State {
     >,
     /// Common-section preferences (v1.9.7).
     pub common: super::store::CommonSettings,
+    /// The Proxy-IP candidate a real session last exited through
+    /// (`host:port`, from the teardown LKG write), plus when it was recorded.
+    ///
+    /// This is the ONLY correlation anchor between "a candidate won a real
+    /// session" and "something observed an exit address". Without it no
+    /// observation can be attributed to a candidate at all, which is why the
+    /// egress widget cannot claim a proxy-bound exit: it has no way to know
+    /// which candidate, if any, its own fetch went through. Empty when no
+    /// proxy candidate has won yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_winner: Option<SessionWinner>,
+}
+
+/// Project the stored LKG preference into the panel's correlation view.
+///
+/// Pure so the two call sites that do not already hold an `OutboundState` can
+/// share it, and so the mapping is testable on the host. A candidate with no
+/// recorded preference yields `None`, which the panel renders as "no session
+/// winner yet" rather than as a blank that looks like a match.
+#[must_use]
+pub fn session_winner_view(state: &crate::relay::outbound_state::OutboundState) -> Option<SessionWinner> {
+    let candidate = state.preferred.clone()?;
+    if candidate.trim().is_empty() {
+        return None;
+    }
+    Some(SessionWinner {
+        candidate,
+        observed_at_ms: state.updated_at_ms,
+    })
+}
+
+/// The candidate a real session last exited through.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionWinner {
+    /// Canonical `host:port` of the winning candidate.
+    pub candidate: String,
+    /// When the preference was recorded (session teardown).
+    pub observed_at_ms: u64,
 }
 
 /// Compact fallback view for the panel.
@@ -447,6 +486,7 @@ pub fn state(
         std::collections::BTreeMap<String, crate::catalog::CountryQuality>,
     >,
     quality_by_endpoint: &std::collections::BTreeMap<String, String>,
+    session_winner: Option<SessionWinner>,
 ) -> State {
     let clients = bundle::all_clients()
         .into_iter()
@@ -486,6 +526,7 @@ pub fn state(
         country_quality,
         rev: settings.rev,
         common: settings.common.clone(),
+        session_winner,
     }
 }
 
@@ -900,6 +941,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            None,
         );
         assert_eq!(s.clients.len(), bundle::all_clients().len());
         assert_eq!(s.source, "derived");
@@ -946,6 +988,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            None,
         );
         let mihomo = s
             .clients
@@ -974,6 +1017,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            None,
         );
         let first = &s.views[0];
         assert_eq!(first.tag, "a");
@@ -1231,6 +1275,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            None,
         );
         assert!(s.catalog.is_none());
         let meta = crate::catalog::Meta::default();
@@ -1428,6 +1473,95 @@ pub enum EgressVerdict {
     Unavailable,
 }
 
+/// What a browser-side egress observation proves, and how it may be used.
+///
+/// The panel's "Measured exit" button is a `fetch()` from the page, so it
+/// reports whatever route the OPERATOR's browser happens to have. That is a
+/// real measurement of the wrong thing: on a machine whose browser is routed
+/// through Trinity it is the tunnel's exit, and on a machine whose browser is
+/// not it is the local ISP's exit (measured live: the widget returned the
+/// host's own 2.183.28.132 / IR while the tunnel exited 113.30.149.24 / ES).
+///
+/// No browser fetch can prove it left through a specific candidate: the page
+/// has no handle on the tunnel's socket pool, and the proxy client reuses
+/// whichever candidate happens to win the dial. So these verdicts deliberately
+/// withhold "verified" unless the operator has positively demonstrated the
+/// route, and even then only as ADVISORY metadata that never touches country
+/// eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientEgress {
+    /// The browser route equals the address the session recorded as the
+    /// winner, so the observation and the candidate genuinely coincide.
+    MatchesSession,
+    /// A real measurement, but of a route that is not provably the session's.
+    Advisory,
+    /// The measurement failed or was empty.
+    Failed,
+    /// No session winner is known yet, so nothing can be attributed.
+    Unattributed,
+}
+
+/// TTL for a browser-observed exit. Shorter than [`crate::relay::outbound_state`]'s
+/// health windows on purpose: this is a human-scale observation of a route that
+/// can be rerouted at any moment by restarting the client.
+pub const CLIENT_EGRESS_TTL_MS: u64 = 30 * 60 * 1000;
+
+/// Classify a browser-observed exit against the session-won candidate.
+///
+/// `observed_ip` / `observed_country` are whatever the page fetched; empty
+/// strings mean the fetch produced nothing usable. `session_winner` is the
+/// `preferred` key the session teardown recorded (`host:port`), empty when no
+/// proxy candidate has won yet.
+///
+/// The country is normalised to upper case and length-checked, so a malformed
+/// or hostile value can never be carried forward as an observation.
+#[must_use]
+pub fn classify_client_egress(
+    observed_ip: &str,
+    observed_country: &str,
+    session_winner: &str,
+    now_ms: u64,
+    observed_at_ms: u64,
+) -> ClientEgress {
+    if observed_ip.trim().is_empty() {
+        return ClientEgress::Failed;
+    }
+    if session_winner.trim().is_empty() {
+        return ClientEgress::Unattributed;
+    }
+    // An observation older than the TTL describes a route that may since have
+    // changed; it must not be presented as current.
+    if observed_at_ms == 0 || now_ms.saturating_sub(observed_at_ms) > CLIENT_EGRESS_TTL_MS {
+        return ClientEgress::Unattributed;
+    }
+    let country_ok = observed_country.trim().len() == 2
+        && observed_country.trim().bytes().all(|b| b.is_ascii_alphabetic());
+    if !country_ok {
+        return ClientEgress::Failed;
+    }
+    // Only the session's own recorded winner can be matched against. The IP the
+    // browser saw is the exit address of its route, which for a pool is one hop
+    // past the candidate, so the two are compared only when the winner is itself
+    // an address that could be the exit.
+    if session_winner.split(':').next().unwrap_or("") == observed_ip.trim() {
+        ClientEgress::MatchesSession
+    } else {
+        ClientEgress::Advisory
+    }
+}
+
+/// Whether a browser-observed country may influence anything persistent.
+///
+/// No. Advisory observations are shown to the operator and never promoted:
+/// country eligibility comes from the scanner-verified catalog
+/// (`snapshot.pool(Some(country))`), and `Health::country` is written only by
+/// the Worker-side probe. Keeping this a function with one answer means the
+/// refusal is enforced in one place instead of relied on at each call site.
+#[must_use]
+pub const fn client_egress_is_persistable(_verdict: ClientEgress) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod egress_verdict_tests {
     use super::{egress_verdict, probe_kind, EgressVerdict, ProbeKind};
@@ -1610,3 +1744,79 @@ mod split_host_port_tests {
         assert_eq!(split_host_port("relay.example:https"), ("relay.example:https".into(), 443));
     }
 }
+#[cfg(test)]
+mod client_egress_tests {
+    use super::{
+        classify_client_egress, client_egress_is_persistable, ClientEgress, CLIENT_EGRESS_TTL_MS,
+    };
+
+    const NOW: u64 = 1_700_000_000_000;
+
+    // 1. A real measurement whose IP is the session's recorded winner.
+    #[test]
+    fn matching_ip_is_the_only_way_to_claim_the_session() {
+        let v = classify_client_egress("113.30.149.24", "ES", "113.30.149.24:443", NOW, NOW - 1000);
+        assert_eq!(v, ClientEgress::MatchesSession);
+    }
+
+    // 2. A real measurement of a DIFFERENT route (the live IR case): honest,
+    //    but not attributable to the candidate.
+    #[test]
+    fn direct_browser_route_is_advisory_not_the_session() {
+        let v = classify_client_egress("2.183.28.132", "IR", "113.30.149.24:443", NOW, NOW - 1000);
+        assert_eq!(v, ClientEgress::Advisory);
+    }
+
+    // 3. No observation at all: unknown, never failed.
+    #[test]
+    fn empty_observation_fails() {
+        assert_eq!(classify_client_egress("", "", "113.30.149.24:443", NOW, NOW - 1000), ClientEgress::Failed);
+    }
+
+    // 4. Trace failure / timeout: failed, and NOT unattributed.
+    #[test]
+    fn trace_failure_is_failed() {
+        assert_eq!(classify_client_egress("1.2.3.4", "", "113.30.149.24:443", NOW, NOW - 1000), ClientEgress::Failed);
+        assert_eq!(classify_client_egress("1.2.3.4", "!!", "113.30.149.24:443", NOW, NOW - 1000), ClientEgress::Failed);
+        assert_eq!(classify_client_egress("1.2.3.4", "USA", "1.2.3.4:443", NOW, NOW - 1000), ClientEgress::Failed);
+    }
+
+    // 5. No session winner: a fresh IP is still unattributable.
+    #[test]
+    fn no_session_winner_is_unattributed() {
+        assert_eq!(classify_client_egress("113.30.149.24", "ES", "", NOW, NOW - 1000), ClientEgress::Unattributed);
+        assert_eq!(classify_client_egress("113.30.149.24", "ES", "   ", NOW, NOW - 1000), ClientEgress::Unattributed);
+    }
+
+    // 6. Stale: an old success must not present as current (requirement 5).
+    #[test]
+    fn stale_observation_is_unattributed() {
+        let old = NOW - CLIENT_EGRESS_TTL_MS - 1;
+        assert_eq!(classify_client_egress("113.30.149.24", "ES", "113.30.149.24:443", NOW, old), ClientEgress::Unattributed);
+        // Missing timestamp is treated as unknown, never as fresh.
+        assert_eq!(classify_client_egress("113.30.149.24", "ES", "113.30.149.24:443", NOW, 0), ClientEgress::Unattributed);
+        // A clock skew that puts the observation in the future does not panic or pass.
+        assert_eq!(classify_client_egress("113.30.149.24", "ES", "113.30.149.24:443", 1000, NOW), ClientEgress::MatchesSession);
+    }
+
+    // 7. A hostname winner can never equal an IP, so it stays advisory.
+    #[test]
+    fn hostname_winner_is_never_a_match() {
+        assert_eq!(classify_client_egress("1.2.3.4", "US", "proxy.example.com:443", NOW, NOW - 1000), ClientEgress::Advisory);
+    }
+
+    // 8/9. Nothing a client reports is ever promoted into persistent metadata.
+    #[test]
+    fn no_client_verdict_is_persistable() {
+        for v in [ClientEgress::MatchesSession, ClientEgress::Advisory, ClientEgress::Failed, ClientEgress::Unattributed] {
+            assert!(!client_egress_is_persistable(v), "{v:?} must not be persistable");
+        }
+    }
+
+    // 10. Session rotation: a DIFFERENT winner never inherits the old verdict.
+    #[test]
+    fn rotation_breaks_the_association() {
+        assert_eq!(classify_client_egress("113.30.149.24", "ES", "162.141.93.190:2083", NOW, NOW - 1000), ClientEgress::Advisory);
+    }
+}
+
