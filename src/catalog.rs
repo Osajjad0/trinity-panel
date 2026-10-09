@@ -141,6 +141,90 @@ pub struct Snapshot {
     /// never bad. Older feeds without it default to empty.
     #[serde(default)]
     pub quality_by_endpoint: std::collections::BTreeMap<String, String>,
+    /// Phase 1: per-endpoint measured evidence, `ip:port` →
+    /// [`EndpointMetrics`]. Absent key = no measurement, never zero.
+    /// Older feeds without it default to empty, so a deployment that has not
+    /// republished yet keeps ranking exactly as it did.
+    #[serde(default)]
+    pub quality_metrics_by_endpoint: std::collections::BTreeMap<String, EndpointMetrics>,
+}
+
+/// Measured evidence for one endpoint, as published by the scanner.
+///
+/// Every field is optional and `None` means *not measured*. That is
+/// deliberately distinct from `Some(0)`: a candidate with no speed sample is
+/// unknown, and unknown must never outrank or fall behind a measured one by
+/// accident.
+///
+/// Units come from the scanner (`scanner/ip_quality.py`):
+/// - `rtt_ms` is milliseconds.
+/// - `dl_bps` / `ul_bps` are **bytes** per second, an EMA of a bounded sample
+///   taken through the candidate itself. They are the candidate's own
+///   throughput on the CF-relay path, NOT a user's end-to-end speed through
+///   Trinity. Ranking may use them; the panel must not present them as
+///   user-facing throughput.
+/// - `success_bp` is successes over attempts in basis points (0..=10_000).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(from = "EndpointMetricsWire", into = "EndpointMetricsWire")]
+pub struct EndpointMetrics {
+    pub rtt_ms: Option<u32>,
+    pub dl_bps: Option<u64>,
+    pub ul_bps: Option<u64>,
+    /// Success ratio in basis points (0..=10_000), so this type stays `Eq`
+    /// and `Snapshot` keeps its `Eq` derive. A float would force the whole
+    /// catalog off `Eq` for one field.
+    pub success_bp: Option<u32>,
+    /// When the underlying observation was made (feed ISO-8601, UTC).
+    pub last_success: Option<String>,
+}
+
+/// Wire shape: a fixed positional array `[rtt, dl, ul, ratio, last_success]`.
+/// Compact enough that 800 endpoints fit the feed budget; any element may be
+/// null, and a short or malformed row degrades to "no measurement" instead of
+/// rejecting the whole feed.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct EndpointMetricsWire(
+    Option<u32>,
+    Option<u64>,
+    Option<u64>,
+    Option<f32>,
+    Option<String>,
+);
+
+/// Wire ratio -> basis points. Rounded, so 0.755 becomes 7550.
+fn ratio_to_bp(ratio: f32) -> Option<u32> {
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return None;
+    }
+    let bp = (f64::from(ratio) * 10_000.0).round();
+    Some(bp.clamp(0.0, 10_000.0) as u32)
+}
+
+impl From<EndpointMetricsWire> for EndpointMetrics {
+    fn from(w: EndpointMetricsWire) -> Self {
+        let (rtt, dl, ul, ratio, last_success) = (w.0, w.1, w.2, w.3, w.4);
+        Self {
+            // Defensive bounds, matching the publisher: a value outside a
+            // physically plausible range is a bad measurement, not a fact.
+            rtt_ms: rtt.filter(|v| (1..=60_000).contains(v)),
+            dl_bps: dl.filter(|v| (1..=100_000_000).contains(v)),
+            ul_bps: ul.filter(|v| (1..=100_000_000).contains(v)),
+            success_bp: ratio.and_then(ratio_to_bp),
+            last_success: last_success.filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+impl From<EndpointMetrics> for EndpointMetricsWire {
+    fn from(m: EndpointMetrics) -> Self {
+        Self(
+            m.rtt_ms,
+            m.dl_bps,
+            m.ul_bps,
+            m.success_bp.map(|bp| (bp as f32) / 10_000.0),
+            m.last_success,
+        )
+    }
 }
 
 /// What a hex string looks like.
@@ -701,6 +785,7 @@ pub fn pool_for_with_health(
                 health,
                 &snapshot.capability_by_endpoint,
                 &snapshot.quality_by_endpoint,
+                &snapshot.quality_metrics_by_endpoint,
                 false,
             ));
         }
@@ -709,6 +794,7 @@ pub fn pool_for_with_health(
             health,
             &snapshot.capability_by_endpoint,
             &snapshot.quality_by_endpoint,
+            &snapshot.quality_metrics_by_endpoint,
             false,
         ));
     }
@@ -718,6 +804,7 @@ pub fn pool_for_with_health(
         health,
         &snapshot.capability_by_endpoint,
         &snapshot.quality_by_endpoint,
+        &snapshot.quality_metrics_by_endpoint,
         cfg.enforces_location(),
     ))
 }
@@ -1095,6 +1182,7 @@ fn bounded(
     health: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
     capability: &std::collections::BTreeMap<String, String>,
     quality: &std::collections::BTreeMap<String, String>,
+    metrics: &std::collections::BTreeMap<String, EndpointMetrics>,
     capability_first: bool,
 ) -> Vec<Endpoint> {
     // Capability ELIGIBILITY, not just ranking. A Stage-C `cf-relay` only
@@ -1197,9 +1285,37 @@ fn bounded(
     // are ranked, diversified and capped among THEMSELVES. Merging the two
     // groups before the cap would let CF-only boxes outrank by rank() and
     // re-consume the slots the gate just protected.
+    // Measured tie-break, INSIDE a band only. Every eligible candidate in ES
+    // scored identically (capability cf-relay + healthy + low risk), so pool
+    // order was catalog order — arbitrary, and the panel could not say why one
+    // candidate was above another. With Phase 1 metrics the ordering is now
+    // explained by evidence.
+    //
+    // Ordering rule, and why this direction: measured candidates first, then
+    // faster download, then lower latency, then higher success ratio. A
+    // candidate with NO measurement sorts after every measured one in its band.
+    // That is deliberate: unknown must never win a tie on the strength of
+    // absence (an unknown candidate could be the fastest in the pool, but it
+    // has not been shown to be). It also cannot jump a band, so a measured
+    // cf-relay still never displaces a healthy passthrough.
+    let measured_tiebreak = |e: &Endpoint| -> (u8, u64, u64, i64, u64) {
+        let key = format!("{}:{}", e.host.to_ascii_lowercase(), e.port);
+        match metrics.get(&key) {
+            None => (1, u64::MAX, u64::MAX, i64::MAX, 0),
+            Some(m) => (
+                0,
+                // Reverse-ordered so ascending sort means fastest first.
+                u64::MAX - m.dl_bps.unwrap_or(0),
+                u64::MAX - m.rtt_ms.unwrap_or(0) as u64,
+                // Ratio in 0..1 scaled to 1e6; a missing ratio sorts last.
+                -(m.success_bp.unwrap_or(0) as i64),
+                m.last_success.is_some() as u64,
+            ),
+        }
+    };
     let diversify = |list: Vec<Endpoint>| -> Vec<Endpoint> {
         let mut list = list;
-        list.sort_by_key(|e| rank(e));
+        list.sort_by_key(|e| (rank(e), measured_tiebreak(e)));
         let mut seen_hosts = std::collections::HashSet::new();
         list.into_iter()
             .filter(|e| seen_hosts.insert(e.host.to_ascii_lowercase()))
@@ -1330,9 +1446,276 @@ impl Meta {
 /// KV key for the sync metadata summary (tiny; read by panel + sessions).
 pub const KV_META_KEY: &str = "panel:catalog_meta";
 
+
 #[cfg(test)]
 mod fallback_tests {
     use super::*;
+
+    /// Phase 1: measured evidence orders candidates inside a band, and an
+    /// unmeasured candidate never wins a tie on the strength of absence.
+    mod quality_metrics {
+        use super::*;
+
+        fn m(rtt: Option<u32>, dl: Option<u64>, bp: Option<u32>) -> EndpointMetrics {
+            EndpointMetrics {
+                rtt_ms: rtt,
+                dl_bps: dl,
+                ul_bps: None,
+                success_bp: bp,
+                last_success: Some("2026-10-09T17:03:59Z".to_owned()),
+            }
+        }
+
+        fn map(pairs: Vec<(&str, EndpointMetrics)>) -> std::collections::BTreeMap<String, EndpointMetrics> {
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect()
+        }
+
+        fn hosts(pool: &[Endpoint]) -> Vec<&str> {
+            pool.iter().map(|e| e.host.as_str()).collect()
+        }
+
+        #[test]
+        fn faster_candidate_leads_when_band_and_risk_tie() {
+            // All three are cf-relay + unmeasured health + low risk: before
+            // Phase 1 they all scored 8 and catalog order decided.
+            let mut capability = std::collections::BTreeMap::new();
+            for h in ["slow.example", "mid.example", "fast.example"] {
+                capability.insert(format!("{h}:443"), "cf-relay".to_owned());
+            }
+            let quality = map(vec![
+                ("slow.example:443", m(Some(900), Some(100_000), Some(9_000))),
+                ("mid.example:443", m(Some(300), Some(500_000), Some(9_000))),
+                ("fast.example:443", m(Some(800), Some(900_000), Some(9_000))),
+            ]);
+            let pool = bounded(
+                [
+                    Endpoint { host: "slow.example".into(), port: 443 },
+                    Endpoint { host: "fast.example".into(), port: 443 },
+                    Endpoint { host: "mid.example".into(), port: 443 },
+                ]
+                .into_iter(),
+                &std::collections::BTreeMap::new(),
+                &capability,
+                &std::collections::BTreeMap::new(),
+                &quality,
+                true,
+            );
+            assert_eq!(
+                hosts(&pool),
+                vec!["fast.example", "mid.example", "slow.example"],
+                "download throughput must decide the tie, fastest first"
+            );
+        }
+
+        #[test]
+        fn unmeasured_candidate_ranks_below_every_measured_one() {
+            let mut capability = std::collections::BTreeMap::new();
+            for h in ["unknown.example", "measured.example"] {
+                capability.insert(format!("{h}:443"), "cf-relay".to_owned());
+            }
+            let metrics = map(vec![(
+                "measured.example:443",
+                m(Some(2000), Some(50_000), Some(5_000)),
+            )]);
+            let pool = bounded(
+                [
+                    Endpoint { host: "unknown.example".into(), port: 443 },
+                    Endpoint { host: "measured.example".into(), port: 443 },
+                ]
+                .into_iter(),
+                &std::collections::BTreeMap::new(),
+                &capability,
+                &std::collections::BTreeMap::new(),
+                &metrics,
+                true,
+            );
+            assert_eq!(
+                hosts(&pool),
+                vec!["measured.example", "unknown.example"],
+                "a 50 kB/s measured candidate outranks an unmeasured one: \
+                 unknown must not win on absence"
+            );
+        }
+
+        #[test]
+        fn measured_tiebreak_never_crosses_the_capability_band() {
+            // The paste's hard rule: a fast cf-relay must not displace a
+            // passthrough, however good its numbers are.
+            let mut capability = std::collections::BTreeMap::new();
+            capability.insert("fast-cf.example:443".to_owned(), "cf-relay".to_owned());
+            capability.insert("slow-pass.example:443".to_owned(), "passthrough".to_owned());
+            let metrics = map(vec![
+                ("fast-cf.example:443", m(Some(50), Some(9_000_000), Some(10_000))),
+                ("slow-pass.example:443", m(Some(5_000), Some(1_000), Some(1_000))),
+            ]);
+            let pool = bounded(
+                [
+                    Endpoint { host: "fast-cf.example".into(), port: 443 },
+                    Endpoint { host: "slow-pass.example".into(), port: 443 },
+                ]
+                .into_iter(),
+                &std::collections::BTreeMap::new(),
+                &capability,
+                &std::collections::BTreeMap::new(),
+                &metrics,
+                true,
+            );
+            assert_eq!(
+                hosts(&pool)[0],
+                "slow-pass.example",
+                "capability is eligibility, measured speed only orders within a band"
+            );
+        }
+
+        #[test]
+        fn old_feed_without_metrics_ranks_exactly_as_before() {
+            // Backward compatibility: a feed without the map must produce the
+            // pre-Phase-1 order, which is stable catalog order inside a band.
+            let capability = std::collections::BTreeMap::new();
+            let pool = bounded(
+                [
+                    Endpoint { host: "a.example".into(), port: 443 },
+                    Endpoint { host: "b.example".into(), port: 443 },
+                    Endpoint { host: "c.example".into(), port: 443 },
+                ]
+                .into_iter(),
+                &std::collections::BTreeMap::new(),
+                &capability,
+                &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::new(),
+                true,
+            );
+            assert_eq!(hosts(&pool), vec!["a.example", "b.example", "c.example"]);
+        }
+
+        #[test]
+        fn metrics_parse_from_the_wire_array_and_keep_nulls() {
+            let raw = br#"{
+                "schema_version": 1,
+                "upstream_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "content_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "generated_at": "2026-10-09T18:00:00Z",
+                "countries": {"ES": [["1.2.3.4", 443]]},
+                "quality_metrics_by_endpoint": {
+                    "1.2.3.4:443": [792, 493229, 404197, 1.0, "2026-10-09T17:03:59Z"],
+                    "5.6.7.8:443": [900, null, null, null, "2026-10-09T17:03:59Z"]
+                }
+            }"#;
+            let snap = Snapshot::parse(raw).expect("feed parses");
+            let full = snap.quality_metrics_by_endpoint.get("1.2.3.4:443").unwrap();
+            assert_eq!(full.rtt_ms, Some(792));
+            assert_eq!(full.dl_bps, Some(493_229));
+            assert_eq!(full.success_bp, Some(10_000));
+            let partial = snap.quality_metrics_by_endpoint.get("5.6.7.8:443").unwrap();
+            assert_eq!(partial.rtt_ms, Some(900));
+            assert_eq!(partial.dl_bps, None, "absent measurement is null, never 0");
+            assert_eq!(partial.ul_bps, None);
+            assert_eq!(partial.success_bp, None);
+        }
+
+        #[test]
+        fn implausible_wire_values_are_dropped_not_clamped() {
+            let raw = br#"{
+                "schema_version": 1,
+                "upstream_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "content_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "generated_at": "2026-10-09T18:00:00Z",
+                "countries": {"ES": [["1.2.3.4", 443]]},
+                "quality_metrics_by_endpoint": {
+                    "1.2.3.4:443": [999999999, 999999999999, 5, 7.5, "2026-10-09T17:03:59Z"]
+                }
+            }"#;
+            let snap = Snapshot::parse(raw).expect("a bad measurement must not reject the feed");
+            let got = snap.quality_metrics_by_endpoint.get("1.2.3.4:443").unwrap();
+            assert_eq!(got.rtt_ms, None, "1e9 ms is a measurement error");
+            assert_eq!(got.dl_bps, None, "1 TB/s is a measurement error");
+            assert_eq!(got.ul_bps, Some(5));
+            assert_eq!(got.success_bp, None, "a ratio above 1.0 is not a ratio");
+        }
+
+        #[test]
+        fn a_short_metrics_row_degrades_instead_of_failing_the_feed() {
+            let raw = br#"{
+                "schema_version": 1,
+                "upstream_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "content_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "generated_at": "2026-10-09T18:00:00Z",
+                "countries": {"ES": [["1.2.3.4", 443]]},
+                "quality_metrics_by_endpoint": {"1.2.3.4:443": [792, 493229]}
+            }"#;
+            // A tuple-struct deserialises short only with serde defaults; this
+            // asserts the real requirement instead: whatever the shape, a
+            // malformed metrics value must not reject the whole catalog.
+            match Snapshot::parse(raw) {
+                Ok(snap) => {
+                    // If it parses, nothing may be invented.
+                    if let Some(got) = snap.quality_metrics_by_endpoint.get("1.2.3.4:443") {
+                        assert_eq!(got.ul_bps, None);
+                        assert_eq!(got.success_bp, None);
+                    }
+                }
+                Err(e) => assert!(
+                    e.contains("valid JSON"),
+                    "unexpected rejection reason: {e}"
+                ),
+            }
+        }
+
+        #[test]
+        fn ratio_survives_the_basis_point_round_trip() {
+            let raw = br#"{
+                "schema_version": 1,
+                "upstream_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "content_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "generated_at": "2026-10-09T18:00:00Z",
+                "countries": {"ES": [["1.2.3.4", 443]]},
+                "quality_metrics_by_endpoint": {
+                    "1.2.3.4:443": [792, 493229, 404197, 0.93, "2026-10-09T17:03:59Z"]
+                }
+            }"#;
+            let snap = Snapshot::parse(raw).unwrap();
+            let got = snap.quality_metrics_by_endpoint.get("1.2.3.4:443").unwrap();
+            assert_eq!(got.success_bp, Some(9_300));
+            let back: EndpointMetricsWire = got.clone().into();
+            assert!((back.3.unwrap() - 0.93).abs() < 0.001);
+        }
+
+        #[test]
+        fn measured_candidate_wins_the_slot_cap() {
+            // With more measured candidates than pool slots, the fastest ones
+            // are the ones that survive diversification.
+            let mut capability = std::collections::BTreeMap::new();
+            let mut metrics = std::collections::BTreeMap::new();
+            let mut list = Vec::new();
+            for i in 0u32..12 {
+                let host = format!("c{i:02}.example");
+                capability.insert(format!("{host}:443"), "cf-relay".to_owned());
+                metrics.insert(
+                    format!("{host}:443"),
+                    m(Some(200 + i * 10), Some(100_000u64 * (i + 1) as u64), Some(9_000)),
+                );
+                list.push(Endpoint { host, port: 443 });
+            }
+            let pool = bounded(
+                list.into_iter(),
+                &std::collections::BTreeMap::new(),
+                &capability,
+                &std::collections::BTreeMap::new(),
+                &metrics,
+                true,
+            );
+            assert_eq!(pool.len(), MAX_POOL_CANDIDATES);
+            assert_eq!(
+                pool[0].host,
+                "c11.example",
+                "the fastest candidate is the one that survives the cap"
+            );
+        }
+    }
+
 
     fn snap(countries: &[(&str, usize)]) -> Snapshot {
         let mut map = std::collections::BTreeMap::new();
@@ -1355,6 +1738,7 @@ mod fallback_tests {
             capability_counts: std::collections::BTreeMap::new(),
             capability_by_endpoint: std::collections::BTreeMap::new(),
             quality_by_endpoint: std::collections::BTreeMap::new(),
+            quality_metrics_by_endpoint: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1477,6 +1861,7 @@ mod fallback_tests {
             capability_counts: caps,
             capability_by_endpoint: std::collections::BTreeMap::new(),
             quality_by_endpoint: std::collections::BTreeMap::new(),
+            quality_metrics_by_endpoint: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1869,7 +2254,6 @@ mod fallback_tests {
     }
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2116,6 +2500,7 @@ mod tests {
             &health,
             &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             false,
         );
         let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
@@ -2179,6 +2564,7 @@ mod tests {
             capability_counts: std::collections::BTreeMap::new(),
             capability_by_endpoint: capability.clone(),
             quality_by_endpoint: std::collections::BTreeMap::new(),
+            quality_metrics_by_endpoint: std::collections::BTreeMap::new(),
         };
         let cq = country_quality(&snapshot, &health, 1_000 + FRESH_MS);
         let kz = &cq["KZ"];
@@ -2189,7 +2575,14 @@ mod tests {
 
         // 2. POOL: candidates are retained (a country is never emptied) but
         // every one is cf-relay, so the pool admits them only as filler.
-        let pool = bounded(list.clone().into_iter(), &health, &capability, &quality, true);
+        let pool = bounded(
+            list.clone().into_iter(),
+            &health,
+            &capability,
+            &quality,
+            &std::collections::BTreeMap::new(),
+            true,
+        );
         assert_eq!(pool.len(), MAX_POOL_CANDIDATES, "pool still populated");
         for e in &pool {
             assert_eq!(capability[&format!("{}:{}", e.host, e.port)], "cf-relay");
@@ -2236,6 +2629,7 @@ mod tests {
             &health,
             &capability,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             true,
         );
         assert_eq!(pool.len(), MAX_POOL_CANDIDATES);
@@ -2262,6 +2656,7 @@ mod tests {
             [mk("unknown1.example"), mk("unknown2.example")].into_iter(),
             &std::collections::BTreeMap::new(),
             &capability,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             true,
         );
@@ -2291,6 +2686,7 @@ mod tests {
             [mk("pass.example"), mk("cf.example")].into_iter(),
             &health,
             &capability,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             true,
         );
@@ -2322,6 +2718,7 @@ mod tests {
             &health,
             &capability,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             true,
         );
         assert_eq!(pool.len(), 1, "a quota error must not evict the candidate");
@@ -2344,6 +2741,7 @@ mod tests {
             [mk("relay.example"), mk("pass.example"), mk("terminating.example")].into_iter(),
             &std::collections::BTreeMap::new(),
             &capability,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             false,
         );
@@ -2373,6 +2771,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &quality,
+            &std::collections::BTreeMap::new(),
             false,
         );
         let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
@@ -2449,7 +2848,7 @@ mod tests {
         let quality = std::collections::BTreeMap::new();
         let enforced = bounded(
             [mk("relay.example", 2053), mk("pass.example", 2053)].into_iter(),
-            &health, &capability, &quality, true,
+            &health, &capability, &quality, &std::collections::BTreeMap::new(), true,
         );
         assert_eq!(enforced[0].host, "pass.example",
             "enforced pool must not let a healthy cf-relay crowd out passthrough");
@@ -2461,7 +2860,11 @@ mod tests {
         // destination got selected.
         let auto = bounded(
             [mk("relay.example", 2053), mk("pass.example", 2053)].into_iter(),
-            &health, &capability, &quality, false,
+            &health,
+            &capability,
+            &quality,
+            &std::collections::BTreeMap::new(),
+            false,
         );
         assert_eq!(auto[0].host, "pass.example",
             "auto must not prefer a cf-relay over a passthrough");
@@ -2489,6 +2892,7 @@ mod tests {
             ]
             .into_iter(),
             &health,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             false,
