@@ -336,8 +336,10 @@ async fn state(req: &Request, env: &Env) -> Result<Response> {
         &runtime_candidates,
         fallback,
         country_quality,
-        &snapshot.map(|s| s.quality_by_endpoint).unwrap_or_default(),
+        api::quality_by_endpoint(snapshot.as_ref()),
         super::api::session_winner_view(&outbound_state),
+        snapshot.as_ref(),
+        worker::Date::now().as_millis() / 1000,
     ))
 }
 
@@ -504,10 +506,10 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
             &runtime_candidates,
             None,
             country_quality,
-            &snapshot
-                .map(|s| s.quality_by_endpoint)
-                .unwrap_or_default(),
+            api::quality_by_endpoint(snapshot.as_ref()),
             super::api::session_winner_view(&load_outbound_state(env).await),
+            snapshot.as_ref(),
+            worker::Date::now().as_millis() / 1000,
         );
         return json(&SavedResponse { ok: true, state });
     }
@@ -559,10 +561,10 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         &runtime_candidates,
         None,
         country_quality,
-        &snapshot
-            .map(|s| s.quality_by_endpoint)
-            .unwrap_or_default(),
+        api::quality_by_endpoint(snapshot.as_ref()),
         super::api::session_winner_view(&load_outbound_state(env).await),
+        snapshot.as_ref(),
+        worker::Date::now().as_millis() / 1000,
     );
     Ok(json(&SavedResponse { ok: true, state })?)
 }

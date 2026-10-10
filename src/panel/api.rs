@@ -254,9 +254,14 @@ pub struct State {
     /// rather than silently overwriting whoever saved in between.
     pub rev: u32,
     /// EXACT host:port list the dial path hands to resolve_with_catalog()
-    /// for the current mode/location (verified snapshot derived). Empty when
-    /// the mode contributes no catalog candidates.
-    pub runtime_candidates: Vec<String>,
+        /// for the current mode/location (verified snapshot derived). Empty when
+        /// the mode contributes no catalog candidates.
+        pub runtime_candidates: Vec<String>,
+        /// Per-candidate detail for `runtime_candidates`, in the SAME order, so the
+        /// panel can show why each one ranks where it does instead of a bare
+        /// `host:port`. Every measurement is `Option`: absent means the scanner did
+        /// not measure it, which the UI must render as unknown, never as zero.
+        pub runtime_detail: Vec<CandidateDetail>,
     /// V24.4.4 runtime-only geographic failover (Pool mode). Empty strings =
     /// no fallback active. The configured location is never rewritten.
     pub fallback: Option<crate::panel::api::FallbackView>,
@@ -342,6 +347,200 @@ pub struct CandidateHealth {
     pub score: f64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub error: String,
+}
+
+/// One runtime pool candidate with the evidence behind its rank.
+///
+/// Every measurement is an `Option` on purpose: the scanner publishes a
+/// measurement only where it made one, and "not measured" must reach the panel
+/// as absent so the UI can print Unknown. Coercing a gap to 0 would make a
+/// candidate look measured-and-terrible, and padding it with a default would
+/// make it look measured-and-good.
+///
+/// `dl_bps`/`ul_bps` are the CANDIDATE's own throughput measured by the
+/// scanner over the CF-relay path. They are not user throughput through
+/// Trinity and the panel must not label them as such.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateDetail {
+    /// `host:port`, identical to the matching entry in `runtime_candidates`.
+    pub host: String,
+    pub country: String,
+    /// Stage-C capability class from the feed (`passthrough` / `cf-relay` /
+    /// `sni-terminate`). Empty when the feed carries no classification.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub capability: String,
+    /// Feed quality verdict "risk/type/confidence/source", empty = unmeasured.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub quality: String,
+    /// Worker-vantage liveness: measured and currently usable.
+    pub healthy: bool,
+    /// Bytes/sec the SCANNER measured downstream. None = unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dl_bps: Option<u64>,
+    /// Bytes/sec the SCANNER measured upstream. None = unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ul_bps: Option<u64>,
+    /// Round-trip time in ms as measured by the scanner. None = unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
+    /// Success ratio in basis points (0..=10_000). None = unknown, NOT zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_bp: Option<u32>,
+    /// ISO-8601 UTC timestamp of the underlying observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success: Option<String>,
+    /// Age of that observation in seconds at render time. None = unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_s: Option<u64>,
+    /// True once the observation is older than the freshness window the
+    /// ranking itself uses, so the panel can mark it stale instead of
+    /// presenting old numbers as current evidence.
+    pub stale: bool,
+    /// Plain sentence naming why this candidate sits where it does.
+    pub reason: String,
+}
+
+/// Freshness window for a candidate measurement shown in the panel. Mirrors
+/// `catalog::METRICS_MAX_AGE_H` (12 h), which is the same window the ranking
+/// itself honours, so a row can never look fresher here than it ranks.
+const DETAIL_FRESH_S: u64 = 12 * 3600;
+
+/// The feed's per-endpoint quality verdicts, or an empty map when there is no
+/// snapshot. A borrow, so the caller does not have to clone the map out of the
+/// snapshot just to pass it on.
+pub fn quality_by_endpoint(
+    snapshot: Option<&crate::catalog::Snapshot>,
+) -> &std::collections::BTreeMap<String, String> {
+    static EMPTY: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+        std::sync::OnceLock::new();
+    snapshot.map_or_else(|| EMPTY.get_or_init(Default::default), |s| &s.quality_by_endpoint)
+}
+
+/// Join the runtime pool with the snapshot's evidence, in the pool's own order.
+///
+/// `runtime_candidates` is already eligibility-gated and ranked by
+/// `catalog::bounded`; this only ADDS the evidence behind each position, so it
+/// must not re-sort or re-filter. A candidate missing from every snapshot map
+/// still gets a row — with unknown measurements and a reason saying so — rather
+/// than vanishing, because it is genuinely in the dial plan.
+/// Resolve one endpoint against a feed map keyed by `ip:port`.
+///
+/// Exact `host:port` first, then the bare ip for legacy bare-keyed rows. NO
+/// prefix fallback: every feed key carries its own port, so a unique-prefix
+/// match would hand port 443's measurement to an 8443 candidate that was never
+/// measured. A genuine gap must stay a gap.
+fn resolve<'a, T>(
+    map: &'a std::collections::BTreeMap<String, T>,
+    key: &str,
+    bare: &str,
+) -> Option<&'a T> {
+    map.get(key).or_else(|| map.get(bare))
+}
+
+#[must_use]
+pub fn candidate_details(
+    runtime: &[String],
+    snapshot: Option<&crate::catalog::Snapshot>,
+    geo: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
+    now_s: u64,
+) -> Vec<CandidateDetail> {
+    // Feed and health maps are keyed "ip:port" (health may be a legacy bare
+    // host). One exact lookup, then the bare-ip form, then a unique-prefix
+    // match -- the same resolution order `candidate_health` already uses, so
+    // the two views can never disagree about which row a candidate is.
+    runtime
+        .iter()
+        .map(|host| {
+            let key = host.trim().to_ascii_lowercase();
+            let bare = key.split(':').next().unwrap_or("").to_string();
+            let m = snapshot.and_then(|s| resolve(&s.quality_metrics_by_endpoint, &key, &bare));
+            let capability = snapshot
+                .and_then(|s| resolve(&s.capability_by_endpoint, &key, &bare).cloned())
+                .unwrap_or_default();
+            let quality = snapshot
+                .and_then(|s| resolve(&s.quality_by_endpoint, &key, &bare).cloned())
+                .unwrap_or_default();
+            let health = geo
+                .get(&key)
+                .or_else(|| geo.get(&bare))
+                .or_else(|| {
+                    geo.iter()
+                        .find(|(k, _)| k.split(':').next() == Some(bare.as_str()))
+                        .map(|(_, v)| v)
+                });
+            let healthy = health.is_some_and(crate::relay::outbound_state::Health::healthy);
+            let age_s = m.and_then(|x| {
+                x.last_success
+                    .as_deref()
+                    .and_then(parse_iso8601_s)
+                    .map(|t| now_s.saturating_sub(t))
+            });
+            let stale = age_s.is_some_and(|a| a > DETAIL_FRESH_S);
+            let reason = describe_candidate(healthy, &capability, m.is_some(), stale);
+            CandidateDetail {
+                host: host.clone(),
+                country: health.map(|h| h.country.clone()).unwrap_or_default(),
+                capability,
+                quality,
+                healthy,
+                dl_bps: m.and_then(|x| x.dl_bps),
+                ul_bps: m.and_then(|x| x.ul_bps),
+                rtt_ms: m.and_then(|x| x.rtt_ms),
+                success_bp: m.and_then(|x| x.success_bp),
+                last_success: m.and_then(|x| x.last_success.clone()),
+                age_s,
+                stale,
+                reason,
+            }
+        })
+        .collect()
+}
+
+/// One sentence naming the primary reason for a candidate's position. Measured
+/// candidates lead; an unmeasured one is never dressed up as if it competed.
+fn describe_candidate(healthy: bool, capability: &str, measured: bool, stale: bool) -> String {
+    let mut s = if healthy {
+        "healthy and eligible".to_string()
+    } else {
+        "not confirmed healthy yet".to_string()
+    };
+    if capability == "cf-relay" {
+        s.push_str("; Cloudflare-fronted destinations only");
+    } else if capability == "sni-terminate" {
+        s.push_str("; TLS-terminated, no generic-internet passthrough");
+    }
+    match (measured, stale) {
+        (false, _) => s.push_str("; no measurement — ranked by eligibility alone"),
+        (true, true) => s.push_str("; measurement is stale"),
+        (true, false) => s.push_str("; fresh measurement, ranked above unmeasured"),
+    }
+    s
+}
+
+/// Parse the feed's `YYYY-MM-DDTHH:MM:SSZ` stamp to epoch seconds. Returns
+/// `None` for anything else, so a malformed timestamp reads as unknown rather
+/// than as "measured at the epoch" (which would mark every row stale).
+fn parse_iso8601_s(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[19] != b'Z' {
+        return None;
+    }
+    let field = |r: std::ops::Range<usize>| text.get(r)?.parse::<i64>().ok();
+    let (y, mo, d) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (h, mi, sec) = (field(11..13)?, field(14..16)?, field(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    // Days-from-civil (Howard Hinnant's algorithm), no date crate needed.
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + sec).ok()
 }
 
 /// Join configured candidates with their measured health, best score first.
@@ -487,6 +686,8 @@ pub fn state(
     >,
     quality_by_endpoint: &std::collections::BTreeMap<String, String>,
     session_winner: Option<SessionWinner>,
+    snapshot: Option<&crate::catalog::Snapshot>,
+    now_s: u64,
 ) -> State {
     let clients = bundle::all_clients()
         .into_iter()
@@ -522,6 +723,7 @@ pub fn state(
         enhanced_reachability: settings.enhanced_reachability,
         catalog,
         runtime_candidates: runtime_candidates.to_vec(),
+        runtime_detail: candidate_details(runtime_candidates, snapshot, geo, now_s),
         fallback,
         country_quality,
         rev: settings.rev,
@@ -942,6 +1144,8 @@ mod tests {
             None,
             &Default::default(),
             None,
+            None,
+            0,
         );
         assert_eq!(s.clients.len(), bundle::all_clients().len());
         assert_eq!(s.source, "derived");
@@ -989,6 +1193,8 @@ mod tests {
             None,
             &Default::default(),
             None,
+            None,
+            0,
         );
         let mihomo = s
             .clients
@@ -1018,6 +1224,8 @@ mod tests {
             None,
             &Default::default(),
             None,
+            None,
+            0,
         );
         let first = &s.views[0];
         assert_eq!(first.tag, "a");
@@ -1276,6 +1484,8 @@ mod tests {
             None,
             &Default::default(),
             None,
+            None,
+            0,
         );
         assert!(s.catalog.is_none());
         let meta = crate::catalog::Meta::default();
@@ -1820,3 +2030,155 @@ mod client_egress_tests {
     }
 }
 
+#[cfg(test)]
+mod candidate_detail_tests {
+    use super::*;
+
+    /// A minimal snapshot carrying only the metrics map. Built by parsing a
+    /// feed-shaped document, which also proves these maps load from JSON.
+    fn snap_with(rows: Vec<(&str, crate::catalog::EndpointMetrics)>) -> crate::catalog::Snapshot {
+        let map: std::collections::BTreeMap<String, crate::catalog::EndpointMetrics> =
+            rows.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "upstream_revision": "test",
+            "content_revision": "test",
+            "generated_at": "2027-01-15T07:45:00Z",
+            "countries": {},
+            "quality_metrics_by_endpoint": map,
+        }))
+        .expect("minimal feed-shaped snapshot must parse")
+    }
+
+    fn m(rtt: Option<u32>, dl: Option<u64>, ul: Option<u64>, bp: Option<u32>, at: &str) -> crate::catalog::EndpointMetrics {
+        crate::catalog::EndpointMetrics {
+            rtt_ms: rtt,
+            dl_bps: dl,
+            ul_bps: ul,
+            success_bp: bp,
+            last_success: Some(at.to_string()),
+        }
+    }
+
+    const NOW: u64 = 1_800_000_000; // 2027-01-15T08:00:00Z
+
+    #[test]
+    fn unmeasured_candidate_reports_unknown_not_zero() {
+        let snap = snap_with(vec![("1.2.3.4:443", m(Some(120), Some(900_000), None, Some(9000), "2027-01-15T07:50:00Z"))]);
+        let rows = candidate_details(
+            &["1.2.3.4:443".to_string(), "5.6.7.8:443".to_string()],
+            Some(&snap),
+            &Default::default(),
+            NOW,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].dl_bps, Some(900_000));
+        // The unmeasured candidate is absent from the map, NOT zero.
+        assert_eq!(rows[1].dl_bps, None, "missing measurement must not become 0");
+        assert_eq!(rows[1].ul_bps, None);
+        assert_eq!(rows[1].rtt_ms, None);
+        assert_eq!(rows[1].success_bp, None);
+        assert!(!rows[1].stale, "an unmeasured row is unknown, not stale");
+        assert!(rows[1].reason.contains("no measurement"), "{}", rows[1].reason);
+    }
+
+    #[test]
+    fn fresh_and_stale_are_distinguished() {
+        let fresh = snap_with(vec![("1.2.3.4:443", m(Some(90), Some(1_000_000), Some(500_000), Some(10_000), "2027-01-15T07:50:00Z"))]);
+        let stale = snap_with(vec![("1.2.3.4:443", m(Some(90), Some(1_000_000), Some(500_000), Some(10_000), "2026-12-01T00:00:00Z"))]);
+        let r = candidate_details(&["1.2.3.4:443".to_string()], Some(&fresh), &Default::default(), NOW);
+        assert!(!r[0].stale);
+        assert_eq!(r[0].age_s, Some(600));
+        assert!(r[0].reason.contains("fresh measurement"), "{}", r[0].reason);
+        let r = candidate_details(&["1.2.3.4:443".to_string()], Some(&stale), &Default::default(), NOW);
+        assert!(r[0].stale);
+        assert!(r[0].reason.contains("stale"), "{}", r[0].reason);
+        // Values are still shown, just marked stale -- never hidden, never fresh.
+        assert_eq!(r[0].dl_bps, Some(1_000_000));
+    }
+
+    #[test]
+    fn malformed_timestamp_reads_as_unknown_not_stale() {
+        // A garbage stamp must not parse as the epoch (which would mark every
+        // row stale) and must not become a 1970 "last success".
+        assert_eq!(parse_iso8601_s("not-a-time"), None);
+        assert_eq!(parse_iso8601_s("2027-13-45T99:99:99Z"), None);
+        assert_eq!(parse_iso8601_s(""), None);
+        let snap = snap_with(vec![("1.2.3.4:443", m(Some(90), Some(1_000_000), None, Some(10_000), "bad"))]);
+        let r = candidate_details(&["1.2.3.4:443".to_string()], Some(&snap), &Default::default(), NOW);
+        assert_eq!(r[0].age_s, None);
+        assert!(!r[0].stale);
+    }
+
+    #[test]
+    fn valid_iso8601_converts_to_epoch_seconds() {
+        assert_eq!(parse_iso8601_s("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso8601_s("2027-01-15T08:00:00Z"), Some(NOW));
+        // Leap day.
+        assert!(parse_iso8601_s("2028-02-29T12:00:00Z").is_some());
+    }
+
+    #[test]
+    fn two_ports_on_one_ip_are_never_conflated() {
+        // 443 is measured; 8443 is not. An ambiguous bare-ip match must NOT
+        // hand 443's numbers to 8443.
+        let snap = snap_with(vec![("1.2.3.4:443", m(Some(90), Some(2_000_000), None, Some(10_000), "2027-01-15T07:59:00Z"))]);
+        let rows = candidate_details(
+            &["1.2.3.4:443".to_string(), "1.2.3.4:8443".to_string()],
+            Some(&snap),
+            &Default::default(),
+            NOW,
+        );
+        assert_eq!(rows[0].dl_bps, Some(2_000_000));
+        assert_eq!(rows[1].dl_bps, None, "ambiguous prefix match must not borrow a neighbour's data");
+    }
+
+    #[test]
+    fn exact_ip_port_key_wins_over_prefix() {
+        let snap = snap_with(vec![
+            ("1.2.3.4:443", m(Some(90), Some(3_000_000), None, Some(10_000), "2027-01-15T07:59:00Z")),
+            ("1.2.3.4:8443", m(Some(90), Some(1_000_000), None, Some(10_000), "2027-01-15T07:59:00Z")),
+        ]);
+        let rows = candidate_details(
+            &["1.2.3.4:8443".to_string()],
+            Some(&snap),
+            &Default::default(),
+            NOW,
+        );
+        assert_eq!(rows[0].dl_bps, Some(1_000_000), "exact ip:port must resolve to its own row");
+    }
+
+    #[test]
+    fn cf_relay_candidate_states_its_destination_limit() {
+        let mut snap = snap_with(vec![]);
+        snap.capability_by_endpoint
+            .insert("1.2.3.4:443".to_string(), "cf-relay".to_string());
+        let r = candidate_details(&["1.2.3.4:443".to_string()], Some(&snap), &Default::default(), NOW);
+        assert_eq!(r[0].capability, "cf-relay");
+        assert!(r[0].reason.contains("Cloudflare-fronted"), "{}", r[0].reason);
+    }
+
+    #[test]
+    fn no_snapshot_still_yields_a_row_per_runtime_candidate() {
+        let rows = candidate_details(
+            &["1.2.3.4:443".to_string(), "5.6.7.8:443".to_string()],
+            None,
+            &Default::default(),
+            NOW,
+        );
+        assert_eq!(rows.len(), 2, "every dial-plan candidate must render, snapshot or not");
+        assert!(rows.iter().all(|r| r.dl_bps.is_none() && !r.stale));
+    }
+
+    #[test]
+    fn serialized_row_omits_unknown_fields_entirely() {
+        // The panel must be able to tell "absent" from 0, which requires the
+        // key to be missing rather than null-or-zero.
+        let snap = snap_with(vec![("1.2.3.4:443", m(Some(90), Some(5), None, None, "2027-01-15T07:59:00Z"))]);
+        let rows = candidate_details(&["1.2.3.4:443".to_string()], Some(&snap), &Default::default(), NOW);
+        let json = serde_json::to_string(&rows[0]).unwrap();
+        assert!(json.contains(r#""dlBps":5"#), "{json}");
+        assert!(!json.contains("ulBps"), "absent ul must not appear: {json}");
+        assert!(!json.contains("successBp"), "absent ratio must not appear: {json}");
+    }
+}

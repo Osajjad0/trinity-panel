@@ -251,6 +251,27 @@ td,th{overflow-wrap:anywhere}
   color:var(--text-muted);padding-bottom:.45rem;margin-bottom:.55rem;
   border-bottom:1px solid var(--border)}
 .cand-list{display:flex;flex-direction:column;gap:.3rem;min-width:0}
+/* Pool summary + tools. Uses the same vars as the rest of the panel. */
+.pool-sum{display:flex;flex-direction:column;gap:.25rem;margin:.1rem 0 .6rem;padding:.5rem .6rem;border:1px solid var(--border);border-radius:8px;background:var(--card)}
+.pool-sum-row{display:flex;flex-wrap:wrap;gap:.35rem .5rem;align-items:baseline;font-size:.8rem}
+.pool-sum-k{color:var(--muted-foreground);font-size:.72rem;text-transform:uppercase;letter-spacing:.04em}
+.pool-sum-v{font-variant-numeric:tabular-nums}
+.pool-sum-state{margin-top:.35rem;font-size:.76rem;padding-top:.35rem;border-top:1px solid var(--border);color:var(--muted-foreground)}
+.pool-sum-state.ok{color:var(--foreground)}
+.pool-sum-state.warn{color:#b26a00}
+.pool-tools{display:flex;flex-wrap:wrap;gap:.5rem;align-items:end;margin:.5rem 0 .35rem}
+.pool-tool{display:flex;flex-direction:column;gap:.15rem;font-size:.72rem;color:var(--muted-foreground)}
+.pool-count{margin-left:auto;font-size:.74rem;color:var(--muted-foreground)}
+/* One candidate: identity on the left, measurements on the right. */
+.cand-row{display:grid;grid-template-columns:auto 1fr auto;gap:.15rem .5rem;align-items:center;padding:.3rem .4rem;border:1px solid var(--border);border-radius:6px;min-width:0}
+.cand-row.stale{opacity:.72;border-style:dashed}
+.cand-main{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center;min-width:0}
+.cand-host{font-size:.78rem;overflow-wrap:anywhere}
+.cand-metrics{grid-column:2;display:flex;flex-wrap:wrap;gap:.4rem;font-size:.72rem;color:var(--muted-foreground);font-variant-numeric:tabular-nums}
+.cand-metrics .u{color:var(--muted-foreground);opacity:.75}
+.cand-reason{grid-column:2;font-size:.7rem;color:var(--muted-foreground);overflow-wrap:anywhere}
+.cand-unknown{font-style:italic;opacity:.7}
+@media(max-width:520px){.cand-row{grid-template-columns:auto 1fr}.cand-metrics,.cand-reason{grid-column:2}.pool-sum-row{gap:.2rem .4rem}}
 .cand-row{display:flex;align-items:center;gap:.55rem;padding:.42rem .6rem;
   background:var(--surface-raised);border:1px solid var(--border);
   border-radius:var(--radius-sm);min-width:0}
@@ -1182,6 +1203,29 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
           <h3 style="margin:0">Proxy-IP Pool</h3>
           <span class="st st-ready" id="cat-status">never synced</span>
         </div>
+        <!-- Operational summary. Every value comes from the backend state or
+             the catalog snapshot; nothing here is computed from a page render. -->
+        <div class="pool-sum" id="pool-sum">
+          <div class="pool-sum-row">
+            <span class="pool-sum-k">Mode</span>
+            <span class="pool-sum-v" id="sum-mode">—</span>
+            <span class="pool-sum-k">Resolved</span>
+            <span class="pool-sum-v" id="sum-country">—</span>
+          </div>
+          <div class="pool-sum-row">
+            <span class="pool-sum-k">Candidates</span>
+            <span class="pool-sum-v"><b id="sum-healthy">0</b> healthy eligible</span>
+            <span class="pool-sum-k" id="sum-degraded-k">Degraded</span>
+            <span class="pool-sum-v" id="sum-degraded">0</span>
+          </div>
+          <div class="pool-sum-row">
+            <span class="pool-sum-k">Measurements</span>
+            <span class="pool-sum-v" id="sum-coverage">—</span>
+            <span class="pool-sum-k">Last scan</span>
+            <span class="pool-sum-v" id="sum-scan">—</span>
+          </div>
+          <div class="pool-sum-state" id="sum-state">—</div>
+        </div>
         <p class="muted" style="margin:.3rem 0 .5rem">
           <span id="cat-countries">—</span> locations ·
           <span id="cat-endpoints">—</span> verified ·
@@ -1199,6 +1243,32 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
           <strong id="cat-runtime-count">0</strong> runtime candidates ·
           source <span id="cat-runtime-loc">AUTO</span> · revision
           <span id="cat-rev" class="mono">—</span></p>
+        <div class="pool-tools" id="pool-tools" hidden>
+          <label class="pool-tool"><span>Sort</span>
+            <select id="pool-sort">
+              <option value="rank">Rank (backend)</option>
+              <option value="rtt">RTT (low first)</option>
+              <option value="dl">Download (high first)</option>
+              <option value="ul">Upload (high first)</option>
+              <option value="success">Success ratio</option>
+              <option value="fresh">Freshness</option>
+            </select>
+          </label>
+          <label class="pool-tool"><span>Status</span>
+            <select id="pool-filter">
+              <option value="">All</option>
+              <option value="measured">Freshly measured</option>
+              <option value="stale">Stale measurement</option>
+              <option value="unmeasured">Unmeasured</option>
+              <option value="limited">Limited capability</option>
+              <option value="healthy">Healthy only</option>
+            </select>
+          </label>
+          <label class="pool-tool"><span>Search</span>
+            <input id="pool-q" type="search" placeholder="ip or country" autocomplete="off">
+          </label>
+          <span class="pool-count" id="pool-shown"></span>
+        </div>
         <div id="cat-runtime" class="cand-list"></div>
         <div id="cat-capability" class="help" style="margin-top:.25rem"></div>
         <div id="cat-fallback" class="st st-warning" style="margin:.4rem 0 .2rem"></div>
@@ -2061,7 +2131,48 @@ function renderCatalog() {
   // Runtime pool summary + candidate ROWS (V24.5.5 spec 13): one row per
   // candidate — index, monospace host:port, copy button, source badge.
   const runtime = (STATE.runtimeCandidates || []);
+  // Per-candidate evidence, aligned by index. A missing row means the backend
+  // has no detail for that candidate: render the host with "Unknown", never a
+  // fabricated 0.
+  const detail = (STATE.runtimeDetail || []);
   setVal("cat-runtime-count", String(runtime.length));
+  const fmtBps = (v) => {
+    if (v === null || v === undefined) return null;
+    const b = Number(v);
+    if (!isFinite(b) || b < 0) return null;
+    if (b >= 1e9) return (b / 1e9).toFixed(2) + " GB/s";
+    if (b >= 1e6) return (b / 1e6).toFixed(2) + " MB/s";
+    if (b >= 1e3) return (b / 1e3).toFixed(0) + " kB/s";
+    return b + " B/s";
+  };
+  const fmtRtt = (v) => {
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    return isFinite(n) && n >= 0 ? Math.round(n) + " ms" : null;
+  };
+  const fmtAge = (d) => {
+    if (!d || d.ageS === null || d.ageS === undefined) return null;
+    const s = Number(d.ageS);
+    if (!isFinite(s)) return null;
+    if (s < 3600) return Math.max(1, Math.round(s / 60)) + " min ago";
+    if (s < 86400) return Math.round(s / 3600) + " h ago";
+    return Math.round(s / 86400) + " d ago";
+  };
+  const met = (d, key) => (d && d[key] !== undefined ? d[key] : null);
+  const cell = (text, cls) => {
+    const sp = el("span", { textContent: text });
+    if (cls) sp.className = cls;
+    return sp;
+  };
+  // A measurement slot renders "Unknown" when absent. Never 0, never blank.
+  const slot = (parent, label, value) => {
+    parent.append(cell(label + " ", "u"));
+    parent.append(value === null || value === undefined
+      ? cell("Unknown", "cand-unknown")
+      : cell(value));
+  };
+
+  renderPoolSummary(detail, runtime);
   const listBox = $("cat-runtime");
   listBox.textContent = "";
   listBox.className = "cand-list";
@@ -2071,20 +2182,198 @@ function renderCatalog() {
     empty.append(el("p", { className: "muted", textContent: "Sync the feed, or set Location back to Auto to spread across all locations." }));
     listBox.append(empty);
   }
-  const loc = (OUTBOUND.catalogCountry || "AUTO").toUpperCase();
-  runtime.forEach((h, i) => {
-    const row = el("div", { className: "cand-row" });
-    row.append(el("span", { className: "cand-idx", textContent: String(i + 1) }));
-    row.append(el("code", { className: "cand-host", textContent: h }));
-    row.append(el("span", { className: "st st-ready", textContent: "verified" }));
-    const cp = el("button", {
-      type: "button", className: "cand-copy", textContent: "Copy",
-      title: `Copy ${h}`, "aria-label": `Copy ${h}`,
+  renderPoolRows(runtime, detail);
+
+  // ---- Proxy Pool: summary, rows, filters. Backend-ranked order is the
+  // default; sorting only reorders what the backend already returned, it
+  // never decides eligibility.
+
+  function renderPoolSummary(detail, runtime) {
+    const measured = detail.filter((d) => met(d, "rttMs") !== null
+      || met(d, "dlBps") !== null || met(d, "successBp") !== null);
+    const stale = detail.filter((d) => d && d.stale);
+    const healthy = detail.filter((d) => d && d.healthy);
+    const limited = detail.filter((d) => d && d.capability && d.capability !== "passthrough");
+    const unmeasured = detail.filter((d) => !d || (met(d, "rttMs") === null
+      && met(d, "dlBps") === null && met(d, "successBp") === null));
+    const degraded = detail.filter((d) => d && !d.healthy);
+
+    const country = (OUTBOUND.catalogCountry || "").trim();
+    const mode = country === "" || country.toUpperCase() === "AUTO"
+      ? "Automatic (spread across locations)"
+      : "Manual pin: " + country.toUpperCase();
+    setVal("sum-mode", mode);
+    setVal("sum-country", country === "" || country.toUpperCase() === "AUTO"
+      ? "auto spread" : country.toUpperCase());
+    setVal("sum-healthy", String(healthy.length));
+    setVal("sum-degraded", String(degraded.length));
+    setVal("sum-degraded-k", "Degraded / " + limited.length + " limited");
+
+    const pct = detail.length ? Math.round((measured.length / detail.length) * 100) : 0;
+    setVal("sum-coverage", detail.length
+      ? measured.length + "/" + detail.length + " candidates (" + pct + "%)"
+      : "no catalog detail yet");
+    const cat = STATE.catalog || null;
+    setVal("sum-scan", cat && cat.generatedAt ? cat.generatedAt.replace("T", " ").replace("Z", " UTC")
+      : "never synced");
+
+    const st = $("sum-state");
+    let msg, cls = "ok";
+    if (!runtime.length) {
+      msg = "No runtime candidates for this mode/location. Pool is empty."; cls = "warn";
+    } else if (stale.length === detail.length && detail.length) {
+      msg = "RESTRICTED: every measurement here is older than the 12 h freshness window. "
+        + "Ranking used eligibility only."; cls = "warn";
+    } else if (!measured.length) {
+      msg = "INCOMPLETE: no candidate here carries a fresh measurement. "
+        + "Ordering is by eligibility and capability, not speed."; cls = "warn";
+    } else if (stale.length) {
+      msg = "USABLE WITH CAVEATS: " + stale.length + " of " + detail.length
+        + " candidate measurements are stale and are marked as such.";
+    } else if (limited.length === detail.length && detail.length) {
+      msg = "LIMITED: every candidate here is Cloudflare-fronted or TLS-terminated only. "
+        + "Generic (non-Cloudflare) destinations are not served by this pool.";
+    } else {
+      msg = "USABLE: " + measured.length + " of " + detail.length
+        + " candidates carry fresh measurements; the rest are marked unmeasured.";
+    }
+    st.textContent = msg;
+    st.className = "pool-sum-state " + cls;
+  }
+
+  function poolSortValue(d, mode) {
+    switch (mode) {
+      case "rtt": { const v = met(d, "rttMs"); return v === null ? Infinity : Number(v); }
+      case "dl": { const v = met(d, "dlBps"); return v === null ? -1 : Number(v); }
+      case "ul": { const v = met(d, "ulBps"); return v === null ? -1 : Number(v); }
+      case "success": { const v = met(d, "successBp"); return v === null ? -1 : Number(v); }
+      case "fresh": { const v = met(d, "ageS"); return v === null ? Infinity : Number(v); }
+      default: return 0;
+    }
+  }
+  // Higher is better for throughput and success ratio; LOWER is better for
+  // latency and age. `true` means descending (biggest first).
+  function poolSortDesc(mode) { return !(mode === "rtt" || mode === "fresh"); }
+
+  function poolMatches(d, host, filter, q) {
+    if (q) {
+      const hay = (host + " " + ((d && d.country) || "") + " " + ((d && d.capability) || "")).toLowerCase();
+      if (hay.indexOf(q) < 0) return false;
+    }
+    if (!filter) return true;
+    const has = met(d, "rttMs") !== null || met(d, "dlBps") !== null || met(d, "successBp") !== null;
+    switch (filter) {
+      case "measured": return has && !(d && d.stale);
+      case "stale": return !!(d && d.stale);
+      case "unmeasured": return !has;
+      case "limited": return !!(d && d.capability && d.capability !== "passthrough");
+      case "healthy": return !!(d && d.healthy);
+      default: return true;
+    }
+  }
+
+  function renderPoolRows(runtime, detail) {
+    const listBox = $("cat-runtime");
+    const sortMode = ($("pool-sort") || {}).value || "rank";
+    const filter = ($("pool-filter") || {}).value || "";
+    const q = (($("pool-q") || {}).value || "").trim().toLowerCase();
+    const tools = $("pool-tools");
+    if (tools) tools.hidden = runtime.length === 0;
+
+    // Default order is the backend's; sorting only reorders, never filters.
+    let rows = runtime.map((host, i) => ({ host: host, d: detail[i] || null, i: i }))
+      .filter((r) => poolMatches(r.d, r.host, filter, q));
+    if (sortMode !== "rank") {
+      const desc = poolSortDesc(sortMode);
+      rows = rows.slice().sort((a, b) => {
+        const va = poolSortValue(a.d, sortMode), vb = poolSortValue(b.d, sortMode);
+        if (va === vb) return a.i - b.i;          // stable: keep backend rank
+        return desc ? (va > vb ? -1 : 1) : (va < vb ? -1 : 1);
+      });
+    } else {
+      rows.sort((a, b) => a.i - b.i);
+    }
+    const shown = $("pool-shown");
+    if (shown) {
+      shown.textContent = rows.length === runtime.length
+        ? rows.length + " shown"
+        : rows.length + " of " + runtime.length + " shown";
+    }
+
+    if (!rows.length) {
+      const empty = el("div", { className: "empty-state" });
+      empty.append(el("p", { textContent: runtime.length
+        ? "No candidate matches these filters."
+        : "No verified candidates for this location." }));
+      if (runtime.length) {
+        const clr = el("button", { type: "button", textContent: "Clear filters" });
+        clr.onclick = () => {
+          const f = $("pool-filter"); if (f) f.value = "";
+          const s2 = $("pool-sort"); if (s2) s2.value = "rank";
+          const s3 = $("pool-q"); if (s3) s3.value = "";
+          renderPoolRows(runtime, detail);
+        };
+        empty.append(clr);
+      }
+      listBox.append(empty);
+      return;
+    }
+
+    rows.forEach((r, n) => {
+      const d = r.d;
+      const row = el("div", { className: "cand-row" + (d && d.stale ? " stale" : "") });
+      row.append(el("span", { className: "cand-idx", textContent: String(n + 1) }));
+
+      const main = el("div", { className: "cand-main" });
+      main.append(el("code", { className: "cand-host", textContent: r.host }));
+      if (d && d.capability) {
+        const cap = el("span", { className: "st " + (d.capability === "passthrough" ? "st-ready" : "st-warning"),
+          textContent: d.capability });
+        cap.title = d.capability === "cf-relay"
+          ? "Forwards only to Cloudflare-fronted origins."
+          : d.capability === "sni-terminate"
+            ? "Terminates TLS; no generic-internet passthrough."
+            : d.capability;
+        main.append(cap);
+      }
+      if (d && d.country) main.append(cell(d.country));
+      row.append(main);
+
+      const cp = el("button", { type: "button", className: "cand-copy", textContent: "Copy",
+        title: "Copy " + r.host, "aria-label": "Copy " + r.host });
+      cp.onclick = () => copy(r.host, r.host);
+      row.append(cp);
+
+      const m = el("div", { className: "cand-metrics" });
+      slot(m, "RTT", fmtRtt(met(d, "rttMs")));
+      slot(m, "down", fmtBps(met(d, "dlBps")));
+      slot(m, "up", fmtBps(met(d, "ulBps")));
+      slot(m, "ok", met(d, "successBp") === null || met(d, "successBp") === undefined
+        ? null : (Number(met(d, "successBp")) / 100).toFixed(1) + "%");
+      if (d && d.stale) m.append(cell("stale", "cand-unknown"));
+      row.append(m);
+
+      if (d && d.reason) row.append(el("div", { className: "cand-reason", textContent: d.reason }));
+      // Provenance: where each number came from, and how old it is.
+      const age = fmtAge(d);
+      if (age || (d && d.lastSuccess)) {
+        const src = el("div", { className: "cand-reason" });
+        src.append(cell("scanner measurement, candidate-only throughput" + (age ? ", " + age : "")));
+        row.append(src);
+      }
+      listBox.append(row);
     });
-    cp.onclick = () => copy(h, h);
-    row.append(cp);
-    listBox.append(row);
-  });
+  }
+
+  // Wire the controls once; renderPoolRows is safe to call repeatedly.
+  (function wirePoolTools() {
+    ["pool-sort", "pool-filter", "pool-q"].forEach((id) => {
+      const c = $(id);
+      if (!c) return;
+      c.addEventListener("change", () => renderPoolRows(STATE.runtimeCandidates || [], STATE.runtimeDetail || []));
+      c.addEventListener("input", () => renderPoolRows(STATE.runtimeCandidates || [], STATE.runtimeDetail || []));
+    });
+  })();
   $("cat-runtime-loc").textContent = (OUTBOUND.catalogCountry || "AUTO").toUpperCase();
   // Stage-C capability census for the selected country (fetched separately;
   // absent = older feed). Rendered as its own truth line, never invented.
