@@ -1899,6 +1899,123 @@ mod fallback_tests {
         assert_eq!(back.fallback_at_ms, 42);
     }
 
+    // country_quality counts "generic internet" candidates from the
+    // PER-ENDPOINT capability map, not from capability_counts: an unclassified
+    // endpoint counts as generic (unmeasured, not proven restricted). Fill it
+    // too, or a cf-relay-only country silently grades as `limited` and the tier
+    // contract under test is never exercised.
+    fn snap_with_capabilities_per_endpoint(countries: &[(&str, usize, &[(&str, u32)])]) -> Snapshot {
+        let mut snap = snap_with_capabilities(countries);
+        let mut per = std::collections::BTreeMap::new();
+        for (cc, n, _) in countries {
+            for i in 0..*n {
+                per.insert(
+                    format!("10.{cc}.{i}.1:443").to_ascii_lowercase(),
+                    "passthrough".to_owned(),
+                );
+            }
+        }
+        snap.capability_by_endpoint = per;
+        snap
+    }
+
+// The country dropdown sorts by an eligibility TIER first and only then by
+// measured quality. These tests pin the tier contract the UI's COUNTRY_TIER
+// table depends on: a fast but capability-blocked country must never be
+// presented as fully usable, and an unmeasured country must not be promoted.
+#[test]
+fn dropdown_tiers_are_strictly_ordered_by_eligibility() {
+    // JO: passthrough + alive -> full.   FI: cf-relay only -> cfOnly.
+    // XX: nothing discovered -> unavailable.  NL: passthrough but hard-failing.
+    let mut s = snap_with_capabilities_per_endpoint(&[
+        ("JO", 4, &[("passthrough", 4)]),
+        ("FI", 4, &[("cf-relay", 4)]),
+        ("NL", 2, &[("passthrough", 2)]),
+    ]);
+    // FI's four endpoints are all Cloudflare-fronted -> generic == 0.
+    for i in 0..4 {
+        s.capability_by_endpoint.insert(format!("10.fi.{i}.1:443"), "cf-relay".to_owned());
+    }
+    let mut health = BTreeMap::from([healthy("JO", 1_000), healthy("FI", 1_000)]);
+    // `quarantined()` requires fail_count >= 2 (one failure is not evidence) and
+    // is also what `country_quality` counts as "real failed probes on record".
+    let dead = Health {
+        country: "NL".to_owned(),
+        ok: false,
+        fail_count: 3,
+        error: "tcp connect".to_owned(),
+        updated_at_ms: 1_000,
+        ..Health::default()
+    };
+    // Both NL endpoints must be failing: the rule is "passthrough exists, nothing
+    // healthy, real failed probes on record" -- one survivor still means full.
+    for i in 0..2 {
+        health.insert(format!("10.nl.{i}.1:443"), Health { country: "NL".to_owned(), ..dead.clone() });
+    }
+    let q = country_quality(&s, &health, 2_000);
+
+    assert_eq!(q["JO"].state, "full");
+    assert_eq!(q["FI"].state, "cfOnly");
+    assert_eq!(q["NL"].state, "degraded");
+    // A country the feed never mentions is simply absent from the map -- the UI
+    // sorts an absent entry last (worst tier) without inventing a verdict.
+    assert!(q.get("XX").is_none(), "unknown country must not get a state");
+
+    // Same inputs, deterministic output.
+    let again = country_quality(&s, &health, 2_000);
+    assert_eq!(
+        q.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+        again.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn a_fast_limited_country_never_outscores_a_usable_one() {
+    // FI is large and alive (good success rate) but has ZERO passthrough, so it
+    // is capped and lands in cfOnly. JO has passthrough. The tier, not the raw
+    // score, decides the dropdown order.
+    let mut s = snap_with_capabilities_per_endpoint(&[
+        ("FI", 16, &[("cf-relay", 16)]),
+        ("JO", 4, &[("passthrough", 4)]),
+    ]);
+    for i in 0..16 {
+        s.capability_by_endpoint.insert(format!("10.fi.{i}.1:443"), "cf-relay".to_owned());
+    }
+    let mut health = BTreeMap::new();
+    for i in 0..16 {
+        health.insert(
+            format!("10.fi.{i}.1:443").to_ascii_lowercase(),
+            Health {
+                country: "FI".to_owned(),
+                ok: true,
+                ok_count: 3,
+                updated_at_ms: 1_000,
+                ..Health::default()
+            },
+        );
+    }
+    let (k, v) = healthy("JO", 1_000);
+    health.insert(k, v);
+    let q = country_quality(&s, &health, 2_000);
+    assert_eq!(q["FI"].state, "cfOnly");
+    assert_eq!(q["JO"].state, "full");
+    assert!(
+        q["FI"].quality.unwrap_or(0) < q["JO"].quality.unwrap_or(0),
+        "zero passthrough must score below a passthrough pool even when bigger and healthier"
+    );
+}
+
+#[test]
+fn unmeasured_country_is_full_with_unknown_quality_not_a_fake_zero() {
+    // Eligible but with no health evidence: state full, quality None. The UI
+    // renders "Unknown" and sorts it last inside its tier -- it must never be
+    // read as quality 0 and never as measured-good.
+    let s = snap_with_capabilities_per_endpoint(&[("GB", 8, &[("passthrough", 8)])]);
+    let q = country_quality(&s, &BTreeMap::new(), 1_000);
+    assert_eq!(q["GB"].state, "full");
+    assert_eq!(q["GB"].quality, None, "unmeasured must stay unknown, never 0");
+}
+
     // ---- v1.9.5 country capability & quality (spec §13) ----
 
     use std::collections::BTreeMap;
@@ -1994,7 +2111,7 @@ mod fallback_tests {
         // 09-28 hardening (paste #1/#2/#9): a fresh catalog with verified
         // passthrough and ZERO health evidence is healthy-and-unmeasured,
         // never DEGRADED. Missing liveness data is not failure data.
-        let s = snap_with_capabilities(&[("GB", 8, &[("passthrough", 8)])]);
+        let s = snap_with_capabilities_per_endpoint(&[("GB", 8, &[("passthrough", 8)])]);
         let q = country_quality(&s, &BTreeMap::new(), 1_000);
         assert_eq!(q["GB"].state, "full");
     }

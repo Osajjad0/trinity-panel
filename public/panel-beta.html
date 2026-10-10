@@ -2054,6 +2054,26 @@ const COUNTRY_NAMES = {
   ZW:"Zimbabwe",
 };
 
+// Country dropdown order: eligibility tier first, measured quality second,
+// code as the deterministic tailbreak. Pure, so the browser battery can assert
+// it directly instead of inferring order from rendered markup.
+const COUNTRY_TIER = { full: 0, degraded: 1, limited: 2, cfOnly: 3, unavailable: 4 };
+function countryTier(cq) {
+  return cq && COUNTRY_TIER[cq.state] !== undefined ? COUNTRY_TIER[cq.state] : 4;
+}
+function countryRank(a, qaMap, b, qbMap) {
+  const qa = qaMap[a], qb = qbMap[b];
+  const ra = countryTier(qa), rb = countryTier(qb);
+  if (ra !== rb) return ra - rb;
+  if (ra !== 4) {
+    // Unmeasured (null) sorts LAST inside its tier, never as a fake 0.
+    const ka = qa.quality == null ? -1 : qa.quality;
+    const kb = qb.quality == null ? -1 : qb.quality;
+    if (ka !== kb) return kb - ka;
+  }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function renderCatalog() {
   const c = STATE.catalog || null;
 
@@ -2071,14 +2091,15 @@ function renderCatalog() {
   const counts = (c && c.countryCounts) || {};
   const codes = [...((c && c.countries) || [])];
   const q = STATE.countryQuality || {};
-  const RANK = { full: 0, degraded: 1, limited: 2, unavailable: 3 };
-  codes.sort((a, b) => {
-    const qa = q[a], qb = q[b];
-    const ra = qa ? RANK[qa.state] : 4, rb = qb ? RANK[qb.state] : 4;
-    if (ra !== rb) return ra - rb;
-    if (ra !== 4 && qa.quality !== qb.quality) return (qb.quality ?? -1) - (qa.quality ?? -1);
-    return codes.indexOf(a) - codes.indexOf(b);
-  });
+  // Tier order is ELIGIBILITY first, quality second -- a fast cf-relay country
+  // never outranks a fully usable one, whatever its raw speed.
+  //
+  // `cfOnly` was missing from this table while the backend has emitted it all
+  // along: RANK["cfOnly"] was undefined, every `ra - rb` was NaN, and Array.sort
+  // silently returned the input order -- i.e. the alphabetical feed order. A
+  // lookup miss must fall back to the WORST tier, never produce NaN.
+  codes.sort((a, b) => countryRank(a, q, b, q));
+
   let lastState = null;
   for (const code of codes) {
     const n = counts[code];
@@ -2088,6 +2109,7 @@ function renderCatalog() {
       value: code,
       textContent: `${flag(code)} ${COUNTRY_NAMES[code] || code}` +
         (st === "limited" ? "   [LIMITED]"
+          : st === "cfOnly" ? "   [CLOUDFLARE ONLY]"
           : st === "degraded" ? "   [DEGRADED]"
           : st === "unavailable" ? "   [UNAVAILABLE]" : ""),
     });
