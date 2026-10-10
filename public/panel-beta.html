@@ -2254,8 +2254,8 @@ function renderCatalog() {
     const rest = $("sum-restricted");
     const parts = [];
     if (limited) parts.push(limited + " limited");
-    if (unavailable) parts.push(unavailable + " not healthy");
-    if (unverified) parts.push(unverified + " unverified");
+    if (unavailable) parts.push(unavailable + " failed the connection test");
+    if (unverified) parts.push(unverified + " not confirmed current");
     rest.hidden = parts.length === 0;
     rest.textContent = parts.join(" · ");
     rest.className = "pool-chip warn";
@@ -2269,8 +2269,9 @@ function renderCatalog() {
     } else if (!ready) {
       // Name the actual blocker rather than assuming it is the capability.
       const why = limited === rows.length ? "every candidate is limited"
-        : unavailable === rows.length ? "every candidate is failing"
-        : unverified === rows.length ? "every measurement is too old to trust"
+        : unavailable === rows.length ? "every candidate failed its connection test"
+        : unverified === rows.length
+          ? "no candidate has a current connection test yet"
         : "none is both unrestricted and freshly healthy";
       st.textContent = "No ready candidate right now — " + why + ".";
       st.className = "pool-sub warn";
@@ -2469,9 +2470,17 @@ function renderCatalog() {
   // on screen at the same time.
   //
   // Order is most-restrictive-first and is part of the contract:
-  //   limited -> unavailable -> degraded -> unverified -> healthy
+  //   limited -> failed -> stale -> not-checked -> healthy
+  //
   // A capability restriction outranks a health verdict, because a candidate that
   // cannot carry generic traffic is not "healthy" whatever its probe says.
+  //
+  // ONE predicate, four honest states. Precedence: capability restriction,
+  // then a REAL recent failure, then stale evidence, then no current evidence.
+  // The backend sends `liveness` ("ok" | "failed" | "unknown") so this never
+  // has to guess: `healthy: false` alone cannot tell an unprobed candidate
+  // from one that just failed, and guessing "unavailable" there is exactly
+  // what made an 8/8 pool read as broken.
   function classify(d) {
     const cap = d.capability;
     if (cap && cap !== "passthrough") {
@@ -2486,22 +2495,33 @@ function renderCatalog() {
             : "Limited: " + cap,
       };
     }
-    if (d.healthy === false) {
+    // Absent `liveness` = an older build. Fall back to the old reading rather
+    // than mislabelling, so a stale API can never claim a healthy row.
+    const live = d.liveness || (d.healthy === false ? "unknown" : "ok");
+    if (live === "failed") {
       return {
         state: "unavailable",
-        label: "Not healthy",
+        label: "Failed",
         cls: "off",
-        title: d.reason || "Recent probes report this candidate failing.",
+        title: d.reason || "A recent connection test failed.",
       };
     }
     if (d.stale) {
       const age = fmtAge(d);
       return {
         state: "unverified",
-        label: "Unverified",
+        label: "Stale",
         cls: "warn",
         title: (age ? "Measurement is " + age + " old. " : "") +
           "Too old to count as current evidence.",
+      };
+    }
+    if (live === "unknown") {
+      return {
+        state: "unverified",
+        label: "Not checked",
+        cls: "warn",
+        title: d.reason || "No current connection test for this candidate.",
       };
     }
     return { state: "healthy", label: "Healthy", cls: "ok", title: "" };

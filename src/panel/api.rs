@@ -24,6 +24,7 @@
 //! Every other route requires a valid session, and a deployment with no
 //! password configured has no panel at all rather than an open one.
 
+use crate::catalog::FRESH_MS;
 use serde::{Deserialize, Serialize};
 
 use crate::config::model::{ClientTarget, Node};
@@ -388,8 +389,13 @@ pub struct CandidateDetail {
     /// Feed quality verdict "risk/type/confidence/source", empty = unmeasured.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub quality: String,
-    /// Worker-vantage liveness: measured and currently usable.
+    /// Worker-vantage liveness: measured and currently usable. `false` means
+    /// only "no successful probe" - read `liveness` to learn whether that is
+    /// a failure or merely the absence of evidence.
     pub healthy: bool,
+    /// "ok" | "failed" | "unknown". The frontend's only basis for calling a
+    /// candidate unavailable; see `liveness`.
+    pub liveness: &'static str,
     /// Bytes/sec the SCANNER measured downstream. None = unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dl_bps: Option<u64>,
@@ -420,6 +426,67 @@ pub struct CandidateDetail {
 /// `catalog::METRICS_MAX_AGE_H` (12 h), which is the same window the ranking
 /// itself honours, so a row can never look fresher here than it ranks.
 const DETAIL_FRESH_S: u64 = 12 * 3600;
+
+/// How current a candidate's live health evidence is.
+///
+/// `healthy: false` is ambiguous on its own: it means "no successful live probe",
+/// which covers both "never probed" and "just failed". Only the second is
+/// evidence of failure. Every consumer - the API row, the frontend `classify()`,
+/// the country summary - reads this one enum so none can re-derive a different
+/// answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Liveness {
+    /// A successful, recent probe established health.
+    Ok,
+    /// A recent, trustworthy probe FAILED. The only state that may be shown as
+    /// unavailable.
+    Failed,
+    /// No current evidence either way: never probed, aged past `2 * FRESH_MS`,
+    /// inconclusive, or the last error was ours rather than the candidate's.
+    Unknown,
+}
+
+impl Liveness {
+    /// Wire value the frontend switches on.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One shared verdict for every consumer: a single recent failure says
+/// "unavailable", an aged or absent record says nothing at all.
+///
+/// `FRESH_MS` (not `DETAIL_FRESH_S`) is the window: that is the same 24 h the
+/// ranking uses for health records, so a row can never claim a verdict the
+/// ranking would not honour.
+#[must_use]
+pub fn liveness(health: Option<&crate::relay::outbound_state::Health>, now_ms: u64) -> Liveness {
+    let Some(h) = health else {
+        return Liveness::Unknown;
+    };
+    if now_ms.saturating_sub(h.updated_at_ms) >= 2 * FRESH_MS {
+        return Liveness::Unknown;
+    }
+    if h.healthy() {
+        return Liveness::Ok;
+    }
+    // The SHIPPED verdict, not a re-derivation: `quarantined()` already encodes
+    // "our error, not the candidate's" and "a hard connect failure counts on the
+    // first miss, anything soft needs two". Reusing it is what guarantees the
+    // panel cannot call a candidate unavailable for a reason the dial path would
+    // still happily route through.
+    if h.quarantined() {
+        Liveness::Failed
+    } else {
+        Liveness::Unknown
+    }
+}
 
 /// The feed's per-endpoint quality verdicts, or an empty map when there is no
 /// snapshot. A borrow, so the caller does not have to clone the map out of the
@@ -485,6 +552,7 @@ pub fn candidate_details(
                         .map(|(_, v)| v)
                 });
             let healthy = health.is_some_and(crate::relay::outbound_state::Health::healthy);
+            let live = liveness(health, now_s.saturating_mul(1000));
             let age_s = m.and_then(|x| {
                 x.last_success
                     .as_deref()
@@ -492,13 +560,14 @@ pub fn candidate_details(
                     .map(|t| now_s.saturating_sub(t))
             });
             let stale = age_s.is_some_and(|a| a > DETAIL_FRESH_S);
-            let reason = describe_candidate(healthy, &capability, m.is_some(), stale);
+            let reason = describe_candidate(live, &capability, m.is_some(), stale);
             CandidateDetail {
                 host: host.clone(),
                 country: health.map(|h| h.country.clone()).unwrap_or_default(),
                 capability,
                 quality,
                 healthy,
+                liveness: live.as_str(),
                 dl_bps: m.and_then(|x| x.dl_bps),
                 ul_bps: m.and_then(|x| x.ul_bps),
                 rtt_ms: m.and_then(|x| x.rtt_ms),
@@ -514,11 +583,11 @@ pub fn candidate_details(
 
 /// One sentence naming the primary reason for a candidate's position. Measured
 /// candidates lead; an unmeasured one is never dressed up as if it competed.
-fn describe_candidate(healthy: bool, capability: &str, measured: bool, stale: bool) -> String {
-    let mut s = if healthy {
-        "healthy and eligible".to_string()
-    } else {
-        "not confirmed healthy yet".to_string()
+fn describe_candidate(live: Liveness, capability: &str, measured: bool, stale: bool) -> String {
+    let mut s = match live {
+        Liveness::Ok => "healthy and eligible".to_string(),
+        Liveness::Failed => "recent connection test failed".to_string(),
+        Liveness::Unknown => "not checked recently".to_string(),
     };
     if capability == "cf-relay" {
         s.push_str("; Cloudflare-fronted destinations only");
@@ -2220,5 +2289,105 @@ mod candidate_detail_tests {
         assert!(json.contains(r#""dlBps":5"#), "{json}");
         assert!(!json.contains("ulBps"), "absent ul must not appear: {json}");
         assert!(!json.contains("successBp"), "absent ratio must not appear: {json}");
+    }
+
+    // ---- candidate liveness: unprobed is NOT failed ----------------------
+    use crate::relay::outbound_state::Health;
+    const NOW_MS: u64 = 1_800_000_000_000;
+    const HOUR_MS: u64 = 3600 * 1000;
+    fn h(ok: bool, country: &str, fail_count: u32, ok_count: u32, age_ms: u64) -> Health {
+        Health {
+            country: country.into(),
+            colo: String::new(),
+            exit_ip: "203.0.113.7".into(),
+            latency_ms: 120,
+            ok,
+            ok_count,
+            fail_count,
+            rotating: false,
+            updated_at_ms: NOW_MS.saturating_sub(age_ms),
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn no_probe_is_unknown_never_failed() {
+        // THE regression this change exists for: no geo record at all.
+        assert_eq!(liveness(None, NOW_MS), Liveness::Unknown);
+        // A record that concluded nothing must not become a failure either.
+        let inconclusive = h(false, "", 0, 0, HOUR_MS);
+        assert_eq!(liveness(Some(&inconclusive), NOW_MS), Liveness::Unknown);
+    }
+
+    #[test]
+    fn a_fresh_real_failure_is_the_only_unavailable() {
+        assert_eq!(
+            liveness(Some(&h(false, "", 2, 1, HOUR_MS)), NOW_MS),
+            Liveness::Failed
+        );
+        // A hard connect failure quarantines on the FIRST miss.
+        let mut hard = h(false, "", 1, 0, HOUR_MS);
+        hard.error = "tcp connect".into();
+        assert_eq!(liveness(Some(&hard), NOW_MS), Liveness::Failed);
+        assert_eq!(Liveness::Failed.as_str(), "failed");
+        // ONE soft failure must NOT condemn: the candidate is demoted, still
+        // eligible, so the panel must not call it unavailable.
+        let mut soft = h(false, "", 1, 3, HOUR_MS);
+        soft.error = "tls handshake".into();
+        assert_eq!(liveness(Some(&soft), NOW_MS), Liveness::Unknown);
+    }
+
+    #[test]
+    fn a_fresh_success_is_ok_and_an_old_one_decays_to_unknown() {
+        assert_eq!(
+            liveness(Some(&h(true, "US", 0, 4, HOUR_MS)), NOW_MS),
+            Liveness::Ok
+        );
+        // 2x FRESH_MS is the decay point: past it, evidence is current in
+        // NEITHER direction, so it can neither confirm nor condemn.
+        let aged = 2 * FRESH_MS + 1;
+        assert_eq!(
+            liveness(Some(&h(true, "US", 0, 4, aged)), NOW_MS),
+            Liveness::Unknown
+        );
+        assert_eq!(
+            liveness(Some(&h(false, "", 3, 1, aged)), NOW_MS),
+            Liveness::Unknown
+        );
+    }
+
+    #[test]
+    fn fresh_recovery_beats_an_older_failure() {
+        let recovered = h(true, "US", 1, 5, HOUR_MS);
+        assert_eq!(liveness(Some(&recovered), NOW_MS), Liveness::Ok);
+    }
+
+    #[test]
+    fn a_platform_error_is_not_candidate_evidence() {
+        let mut runtime = h(false, "", 1, 0, HOUR_MS);
+        runtime.error = "Too many subrequests by single Worker invocation".into();
+        assert_eq!(liveness(Some(&runtime), NOW_MS), Liveness::Unknown);
+    }
+
+    #[test]
+    fn a_success_without_a_country_is_not_a_health_claim() {
+        let no_country = h(true, "", 0, 1, HOUR_MS);
+        assert_eq!(liveness(Some(&no_country), NOW_MS), Liveness::Unknown);
+    }
+
+    #[test]
+    fn describe_candidate_names_the_three_real_states() {
+        // The user-facing sentence must not say "not confirmed" for a failure.
+        assert!(describe_candidate(Liveness::Failed, "", true, false)
+            .starts_with("recent connection test failed"));
+        assert!(describe_candidate(Liveness::Unknown, "", false, false)
+            .starts_with("not checked recently"));
+        // A capability restriction survives a healthy transport verdict.
+        let limited = describe_candidate(Liveness::Ok, "cf-relay", true, false);
+        assert!(limited.starts_with("healthy and eligible"), "{limited}");
+        assert!(
+            limited.contains("Cloudflare-fronted destinations only"),
+            "{limited}"
+        );
     }
 }

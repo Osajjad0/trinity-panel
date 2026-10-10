@@ -1087,7 +1087,9 @@ pub struct CountryQuality {
 }
 
 /// Freshness window for health records feeding the score (spec §9).
-const FRESH_MS: u64 = 24 * 60 * 60 * 1000;
+/// Public: `panel::api::liveness` honours the SAME window so a row cannot be
+/// marked fresh by one module and stale by the other.
+pub const FRESH_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[must_use]
 pub fn country_quality(
