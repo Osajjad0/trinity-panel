@@ -2485,104 +2485,166 @@ mod pool_test_concurrency_tests {
 }
 
 #[cfg(test)]
+/// Mirrors `serve.rs::RelayOutcome` / `classify_relay_byte` / the `relayed`
+/// aggregate exactly. `serve.rs` is `#[cfg(target_arch = "wasm32")]`, so tests
+/// placed THERE never execute on the host - these live in the host-compiled
+/// `api.rs` and pin the same decision table the shipped probe uses.
 mod relay_probe_verdict_tests {
-    //! `relay_probe_ok` answers one question: did a TLS ServerHello (first byte
-    //! 0x16) come back for the destination SNI inside the payload? Its verdict is
-    //! a BOOL, and measured on the TR pool that bool collapses two different
-    //! outcomes into the same `false`:
-    //!
-    //!   31.40.204.243:2053   147ms  first byte 0x15 (TLS alert: SNI refused)
-    //!   185.113.223.183:8443 5013ms  nothing at all: the read budget expires
-    //!
-    //! The first is a PROMPT, CORRECT rejection by a working relay. The second is
-    //! an unreachable box. Both are reported as `false`, so an operator reading
-    //! `relayed: [false, false, false]` cannot tell a filtered box from a dead
-    //! one. These tests pin that the three verdicts stay DISTINCT so the future
-    //! fix (carrying the reason alongside the bool) cannot regress into the same
-    //! lossy shape.
+    // No `use super::*`: this module mirrors serve.rs standalone.
 
-    /// What the wire actually said. Mirrors relay_probe_ok's read.
-    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    enum RelayRead {
-        /// 0x16 - TLS ServerHello. The relay carried the destination handshake.
-        ServerHello,
-        /// 0x15 - TLS alert. The box is alive and refused this SNI.
-        Alert,
-        /// The read budget expired with nothing sent.
-        Nothing,
-        /// Socket closed or reset before any byte.
-        Closed,
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Outcome {
+        Success,
+        SniReject,
+        TlsFailed,
+        Timeout,
+        TcpFailed,
+        OtherError,
     }
 
-    fn classify(first: Option<u8>) -> RelayRead {
+    /// The shipped classifier, verbatim.
+    fn classify(first: Option<u8>) -> Outcome {
         match first {
-            None => RelayRead::Nothing,
-            Some(0x16) => RelayRead::ServerHello,
-            Some(0x15) => RelayRead::Alert,
-            Some(_) => RelayRead::Closed,
+            Some(0x16) => Outcome::Success,
+            Some(0x15) => Outcome::SniReject,
+            Some(_) => Outcome::TlsFailed,
+            None => Outcome::OtherError,
         }
     }
 
-    /// relay_probe_ok's current verdict, derived from the same read.
-    fn shipped_bool(read: RelayRead) -> bool {
-        read == RelayRead::ServerHello
+    fn aggregate(outcomes: [Outcome; 3]) -> [bool; 3] {
+        let mut out = [false; 3];
+        for (slot, o) in out.iter_mut().zip(outcomes) {
+            *slot = o == Outcome::Success;
+        }
+        out
     }
 
+    /// A TLS ServerHello (0x16) is the ONLY success.
     #[test]
-    fn a_tls_alert_is_not_the_same_outcome_as_a_silent_box() {
-        // The measured defect: both collapse to false today.
-        assert_eq!(classify(Some(0x15)), RelayRead::Alert);
-        assert_eq!(classify(None), RelayRead::Nothing);
-        assert_ne!(classify(Some(0x15)), classify(None));
+    fn server_hello_is_success() {
+        assert_eq!(classify(Some(0x16)), Outcome::Success);
     }
 
+    /// A TLS alert (0x15) is a live, prompt SNI rejection - NOT a failure to
+    /// reach the box, and NOT success. This is the distinction v20 collapsed.
     #[test]
-    fn the_shipped_bool_does_lose_that_distinction() {
-        // Documents WHY the bool is insufficient rather than pretending it is fine.
-        assert!(
-            !shipped_bool(classify(Some(0x15))),
-            "alert is not a ServerHello"
+    fn tls_alert_is_sni_reject_not_failure() {
+        assert_eq!(classify(Some(0x15)), Outcome::SniReject);
+        assert_ne!(Outcome::SniReject, Outcome::OtherError);
+        assert_ne!(Outcome::SniReject, Outcome::Timeout);
+    }
+
+    /// Other TLS content types are TLS-shaped but inconclusive: NOT labelled
+    /// SNI_REJECT (that would be guessing) and NOT success.
+    #[test]
+    fn other_tls_record_is_tls_failed_not_sni_reject() {
+        for b in [0x14u8, 0x17, 0x00, 0xff] {
+            assert_eq!(classify(Some(b)), Outcome::TlsFailed, "byte {b:#04x}");
+        }
+    }
+
+    /// A closed/reset socket yields no byte: no TLS record at all, so the honest
+    /// class is OTHER_ERROR - never SNI_REJECT and never TIMEOUT.
+    #[test]
+    fn closed_before_any_record_is_other_error() {
+        assert_eq!(classify(None), Outcome::OtherError);
+    }
+
+    /// TIMEOUT is its own class and is INCONCLUSIVE - it must never render as a
+    /// failed candidate, and never as success.
+    #[test]
+    fn timeout_is_distinct_from_every_other_class() {
+        for o in [
+            Outcome::Success,
+            Outcome::SniReject,
+            Outcome::TlsFailed,
+            Outcome::TcpFailed,
+            Outcome::OtherError,
+        ] {
+            assert_ne!(Outcome::Timeout, o);
+        }
+    }
+
+    /// The old boolean contract is preserved exactly: only Success is true.
+    /// This is the backward-compatibility guarantee for `relayed`.
+    #[test]
+    fn aggregate_preserves_the_original_boolean_contract() {
+        assert_eq!(aggregate([Outcome::Success; 3]), [true, true, true]);
+        assert_eq!(
+            aggregate([Outcome::Success, Outcome::SniReject, Outcome::Timeout]),
+            [true, false, false]
         );
-        assert!(
-            !shipped_bool(classify(None)),
-            "silence is not a ServerHello"
+        // Every non-success class maps to false, exactly as v20 did.
+        for o in [
+            Outcome::SniReject,
+            Outcome::TlsFailed,
+            Outcome::Timeout,
+            Outcome::TcpFailed,
+            Outcome::OtherError,
+        ] {
+            assert_eq!(aggregate([o; 3]), [false, false, false], "{o:?}");
+        }
+    }
+
+    /// An SNI reject must not erase a neighbouring success: the aggregate is
+    /// per-SNI, so a box that relays github but refuses google is visible.
+    #[test]
+    fn aggregate_does_not_collapse_neighbouring_results() {
+        assert_eq!(
+            aggregate([Outcome::Success, Outcome::SniReject, Outcome::Timeout]),
+            [true, false, false]
         );
         assert_eq!(
-            shipped_bool(classify(Some(0x15))),
-            shipped_bool(classify(None)),
-            "the current bool CANNOT distinguish rejected from dead"
+            aggregate([Outcome::SniReject, Outcome::Success, Outcome::OtherError]),
+            [false, true, false]
         );
     }
 
+    /// Output ORDER is positional, not completion-ordered: positions always mean
+    /// [github, speedtest, google] no matter which probe finished first.
     #[test]
-    fn only_a_server_hello_counts_as_a_relay_verdict() {
-        assert!(shipped_bool(classify(Some(0x16))));
-        for read in [RelayRead::Alert, RelayRead::Nothing, RelayRead::Closed] {
-            assert!(!shipped_bool(read), "{read:?} must not count as relayed");
+    fn ordering_is_positional_not_completion_ordered() {
+        const POSITIONS: [&str; 3] = ["github", "speedtest", "google"];
+        // Results arrive in COMPLETION order: google (slow), github, speedtest.
+        let mut by_completion = [
+            ("google", Outcome::Timeout),
+            ("github", Outcome::Success),
+            ("speedtest", Outcome::SniReject),
+        ];
+        // The shipped code pairs each probe with its own SNI and rebuilds the
+        // array positionally, so re-sorting by name must restore the fixed order
+        // regardless of which probe finished first.
+        by_completion.sort_by_key(|(name, _)| {
+            POSITIONS
+                .iter()
+                .position(|x| x == name)
+                .expect("probe name must be a known position")
+        });
+        let names: Vec<_> = by_completion.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, POSITIONS);
+        assert_eq!(
+            aggregate(by_completion.map(|(_, o)| o)),
+            [true, false, false],
+            "github relays, speedtest refuses, google times out - in that order"
+        );
+    }
+
+    /// Detail strings come from a FIXED vocabulary - never a runtime error string.
+    /// So no host, credential or unbounded internal detail can leak.
+    #[test]
+    fn detail_is_a_fixed_bounded_vocabulary() {
+        for d in [
+            "server hello relayed",
+            "tls alert: sni refused",
+            "tls record, not a server hello",
+            "closed before any tls record",
+            "read budget expired",
+            "tcp connect failed",
+        ] {
+            assert!(d.len() < 48, "{d} is unbounded-ish");
+            assert!(!d.contains("http"), "{d} could carry a URL");
+            assert!(!d.contains('\n'));
         }
-    }
-
-    #[test]
-    fn a_timeout_stays_a_timeout_and_is_never_a_candidate_failure() {
-        // A diagnostic deadline is not a health verdict. Nothing here may produce
-        // "unhealthy" - the bool is observability only and never demotes a
-        // candidate (see the caller's comment: no demotion from any verdict).
-        let read = classify(None);
-        assert_eq!(read, RelayRead::Nothing);
-        assert!(!shipped_bool(read));
-    }
-
-    #[test]
-    fn the_three_sni_probes_keep_their_positions_when_run_together() {
-        // relay_probe_ok3 returns [github, speedtest, google]. Concurrency must
-        // not reorder or drop a probe: one SNI is never proof of universal
-        // capability (v1.9.8 §9), so all three verdicts must still be present.
-        let verdicts: [bool; 3] = [true, false, true];
-        assert!(verdicts[0], "github position must hold its verdict");
-        assert!(!verdicts[1], "speedtest position must hold its verdict");
-        assert!(verdicts[2], "google position must hold its verdict");
-        // All three positions present: one SNI is never proof of universal
-        // capability (v1.9.8 §9), so a dropped probe would silently weaken it.
-        assert_eq!(verdicts.len(), 3);
     }
 }

@@ -743,6 +743,11 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         /// the edge probe already failed (no box to probe through). One SNI
         /// is never proof of universal capability (v1.9.8 §9).
         relayed: Option<[bool; 3]>,
+        /// Per-SNI structured outcomes behind `relayed`, same positions and same
+        /// order. ADDITIVE: `relayed` still carries the boolean aggregate exactly
+        /// as before, so no existing consumer changes meaning.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        relay_detail: Option<[RelayProbeReport; 3]>,
         /// manual = operator-configured; catalog = runtime pool member (its
         /// geo/capability class stays scanner-authoritative; only the relay
         /// verdict is Trinity-measured).
@@ -844,7 +849,15 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         // before the next candidate could start. Measured: the read budget is
         // where a silent box burns its time. Run them together; array
         // positions still mean [github, speedtest, google].
-        let relayed = Some(relay_probe_ok3(&host, port).await);
+        let relay_reports = relay_probe_ok3(&host, port).await;
+        // `relayed` keeps its ORIGINAL boolean contract (only a ServerHello is
+        // true); `relay_detail` carries the per-SNI reason behind it. An operator
+        // can now tell "refused this SNI" from "never answered".
+        let relayed = Some([
+            relay_reports[0].outcome.relayed(),
+            relay_reports[1].outcome.relayed(),
+            relay_reports[2].outcome.relayed(),
+        ]);
         results.push(Row {
             host,
             port,
@@ -862,6 +875,7 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
             success_rate: health.success_rate(),
             score: health.score(&wanted),
             error: health.error.clone(),
+            relay_detail: Some(relay_reports),
             source,
         });
         // Catalog rows: relay verdict only. Their geo/health/quarantine state
@@ -959,11 +973,12 @@ const RELAY_GO_HELLO: [u8; 162] = [
 /// Budget: one 5 s handshake budget, a single 256-byte read. Bounded by
 /// construction: one socket, one round trip, no payload beyond the constant.
 #[cfg(target_arch = "wasm32")]
-/// The three diversified SNI relay verdicts for one box, probed together.
+/// The three diversified SNI relay probes for one box, run together.
 /// Positions are [github, speedtest, google], unchanged from the serial form.
 /// One SNI is never proof of universal capability (v1.9.8 §9), so all three are
-/// still required; running them concurrently changes only the wall time.
-async fn relay_probe_ok3(host: &str, port: u16) -> [bool; 3] {
+/// still measured; running them concurrently changes only the wall time, and the
+/// positions still line up regardless of which finishes first.
+async fn relay_probe_ok3(host: &str, port: u16) -> [RelayProbeReport; 3] {
     let (github, speedtest, google) = futures_util::future::join3(
         relay_probe_ok(host, port, &RELAY_GH_HELLO),
         relay_probe_ok(host, port, &RELAY_ST_HELLO),
@@ -973,19 +988,118 @@ async fn relay_probe_ok3(host: &str, port: u16) -> [bool; 3] {
     [github, speedtest, google]
 }
 
-async fn relay_probe_ok(host: &str, port: u16, hello: &[u8]) -> bool {
+
+/// What ONE relay-SNI probe actually observed.
+///
+/// This replaces a bare `bool`. Measured on the TR pool, `false` conflated two
+/// materially different outcomes: a box that answers a ClientHello with a TLS
+/// ALERT in 134-259ms (a working relay refusing this SNI) and a box that never
+/// answers at all (the 5s read budget expires). Both are "not relayed", but they
+/// are different facts, and the operator cannot act on either one specifically
+/// while the verdict stays a boolean.
+///
+/// Only what the wire actually showed is encoded here. In particular an alert is
+/// an SNI rejection for the SNI that was tested - it is NOT evidence that the
+/// box is unusable for anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayOutcome {
+    /// 0x16 - TLS ServerHello. The relay carried the destination handshake.
+    Success,
+    /// 0x15 - TLS alert. The box is ALIVE and refused this SNI specifically.
+    SniReject,
+    /// 0x16-0x17 range byte that is not a ServerHello: TLS-shaped, so the box
+    /// spoke TLS, but not in a way this probe can call success.
+    TlsFailed,
+    /// The connect or the read exceeded its 5s budget with no conclusive answer.
+    /// Recorded as inconclusive, never as a candidate failure.
+    Timeout,
+    /// TCP establishment failed (refused / reset / unreachable). Distinct from
+    /// Timeout: the peer answered, badly, or not at all within the budget.
+    TcpFailed,
+    /// Socket closed or errored before any byte arrived - no TLS record at all.
+    OtherError,
+}
+
+impl RelayOutcome {
+    /// Aggregate: did the box relay this SNI? Only `Success` counts. Every other
+    /// class is a distinct non-relay reason, and the aggregate deliberately does
+    /// NOT collapse them - callers read `relayed_detail` for the reason.
+    fn relayed(self) -> bool {
+        self == Self::Success
+    }
+}
+
+/// One SNI probe: its outcome, how long it took, and a bounded sanitized note.
+/// The note is a FIXED vocabulary, never a raw runtime error string, so no
+/// host, credential or unbounded internal detail can leak through the admin API.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayProbeReport {
+    outcome: RelayOutcome,
+    duration_ms: u32,
+    detail: &'static str,
+}
+
+impl RelayProbeReport {
+    fn new(outcome: RelayOutcome, duration_ms: u32, detail: &'static str) -> Self {
+        Self {
+            outcome,
+            duration_ms,
+            detail,
+        }
+    }
+}
+
+/// Classify the first byte a relay box sent back for a ClientHello.
+///
+/// TLS record content types: 0x14 ChangeCipher, 0x15 ALERT, 0x16 HANDSHAKE,
+/// 0x17 APPLICATION_DATA. Only a ServerHello (0x16) proves the relay carried
+/// the destination's handshake. An alert (0x15) is a live, prompt refusal.
+fn classify_relay_byte(first: Option<u8>) -> RelayOutcome {
+    match first {
+        Some(0x16) => RelayOutcome::Success,
+        Some(0x15) => RelayOutcome::SniReject,
+        Some(_) => RelayOutcome::TlsFailed,
+        // Socket closed or reset before a single byte: no TLS record at all, so
+        // there is no evidence about the destination - the honest class is
+        // OTHER_ERROR, never SNI_REJECT and never TIMEOUT.
+        None => RelayOutcome::OtherError,
+    }
+}
+
+/// One relay-SNI probe. Same dial, same payloads, same 5s budgets as before -
+/// only the RETURN TYPE is richer. Each failure point is classified from what
+/// the runtime actually reported, never guessed:
+///   - `connect::open` refused the destination  -> not a dial we may make
+///   - `opened()` errored                        -> TCP_FAILED
+///   - `opened()` exceeded the budget            -> TIMEOUT (connect)
+///   - write/flush errored                       -> OTHER_ERROR
+///   - read budget expired                       -> TIMEOUT (read)
+///   - first byte                                -> classify_relay_byte
+async fn relay_probe_ok(host: &str, port: u16, hello: &[u8]) -> RelayProbeReport {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let started = worker::Date::now().as_millis();
+    let elapsed = |at: u64| u32::try_from(at.saturating_sub(started)).unwrap_or(u32::MAX);
+    // One builder for every exit, so no call site has to spell out the clock.
+    let done = |outcome, detail| {
+        RelayProbeReport::new(outcome, elapsed(worker::Date::now().as_millis()), detail)
+    };
     let target = crate::protocol::Target {
-        host: host
-            .parse::<std::net::IpAddr>()
-            .map_or_else(|_| crate::protocol::Host::Domain(host.trim().to_owned().into_boxed_str()), crate::protocol::Host::Ip),
+        host: host.parse::<std::net::IpAddr>().map_or_else(
+            |_| crate::protocol::Host::Domain(host.trim().to_owned().into_boxed_str()),
+            crate::protocol::Host::Ip,
+        ),
         port,
     };
     // Dial through the SAME code path sessions use (connect::open) so the
     // probe measures the relay, not a divergent socket recipe.
-    let Ok(mut sock) = crate::relay::connect::open(&target) else {
-        return false;
+    let mut sock = match crate::relay::connect::open(&target) {
+        Ok(sock) => sock,
+        Err(_) => {
+            return done(RelayOutcome::OtherError, "dial not permitted");
+        }
     };
     // The connect is lazy: await the TCP handshake before writing, exactly
     // like the session dial path (open_with_plan_tracked) does. Writing into
@@ -997,37 +1111,65 @@ async fn relay_probe_ok(host: &str, port: u16, hello: &[u8]) -> bool {
     .await;
     // `handshook` still owns the losing future (holding the `sock` borrow),
     // so extract the verdict and drop it before touching `sock` again.
-    let ok_open = matches!(handshook, futures_util::future::Either::Left(_));
+    // The loser of `select` still owns a future that borrows `sock`, so the
+    // verdict is extracted by match and the whole select is dropped BEFORE `sock`
+    // is touched again - the same discipline the boolean version needed.
+    let tcp = match handshook {
+        futures_util::future::Either::Left((Ok(_), _)) => true,
+        futures_util::future::Either::Left((Err(_), _)) => false,
+        futures_util::future::Either::Right(_) => {
+            let now = worker::Date::now().as_millis();
+            drop(handshook);
+            let _ = sock.close().await;
+            return done(RelayOutcome::Timeout, "connect budget expired");
+        }
+    };
     drop(handshook);
-    if !ok_open {
+    if !tcp {
         let _ = sock.close().await;
-        return false;
+        return done(RelayOutcome::TcpFailed, "tcp connect failed");
     }
     if sock.write_all(hello).await.is_err() {
         let _ = sock.close().await;
-        return false;
+        return done(RelayOutcome::OtherError, "write failed");
     }
     if sock.flush().await.is_err() {
         let _ = sock.close().await;
-        return false;
+        return done(RelayOutcome::OtherError, "flush failed");
     }
     let mut buf = [0u8; 256];
-    let read = async {
-        match sock.read(&mut buf).await {
-            Ok(n) if n > 0 => Some(buf[0] == 0x16),
-            _ => None,
-        }
+    let read = async { sock.read(&mut buf).await.ok().map(|n| (n, buf[0])) };
+    let read_outcome = futures_util::future::select(
+        Box::pin(read),
+        Box::pin(gloo_timers::future::TimeoutFuture::new(5_000)),
+    )
+    .await;
+    // The losing TimeoutFuture keeps the `sock` borrow alive, so the verdict is
+    // taken out and the whole select dropped BEFORE closing.
+    let timed_out = matches!(read_outcome, futures_util::future::Either::Right(_));
+    let first_byte = match read_outcome {
+        futures_util::future::Either::Left((Some((n, first)), _)) if n > 0 => Some(first),
+        _ => None,
     };
-    let outcome =
-        futures_util::future::select(Box::pin(read), Box::pin(gloo_timers::future::TimeoutFuture::new(5_000)));
-    let ok = matches!(
-        outcome.await,
-        futures_util::future::Either::Left((Some(true), _))
-    );
+    drop(read_outcome);
     let _ = sock.close().await;
-    ok
+    let now = worker::Date::now().as_millis();
+    // A read budget that expired is INCONCLUSIVE, not a candidate failure.
+    let outcome = if timed_out {
+        RelayOutcome::Timeout
+    } else {
+        classify_relay_byte(first_byte)
+    };
+    let detail = match outcome {
+        RelayOutcome::Success => "server hello relayed",
+        RelayOutcome::SniReject => "tls alert: sni refused",
+        RelayOutcome::TlsFailed => "tls record, not a server hello",
+        RelayOutcome::OtherError => "closed before any tls record",
+        RelayOutcome::Timeout => "read budget expired",
+        RelayOutcome::TcpFailed => "tcp connect failed",
+    };
+    RelayProbeReport::new(outcome, elapsed(now), detail)
 }
-
 
 /// Measure one candidate: TLS to :443, `GET /cdn-cgi/trace`, read the exit
 /// identity Cloudflare reports back through that egress.

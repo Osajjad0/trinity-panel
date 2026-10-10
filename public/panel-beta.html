@@ -1735,7 +1735,16 @@ function renderHealth() {
     const rl = r.relayed == null ? null : r.relayed;
     const relayTxt = rl == null ? "—" : `GH ${rl[0] ? "✓" : "✗"} · ST ${rl[1] ? "✓" : "✗"} · GO ${rl[2] ? "✓" : "✗"}`;
     const relayCls = rl == null ? "muted" : rl.every(Boolean) ? "" : rl.some(Boolean) ? "" : "sev-degraded";
-    const relayTitle = rl == null ? "not probed" : `github=${rl[0]} speedtest=${rl[1]} google=${rl[2]} — one SNI is not proof of universal relay capability`;
+    // v21: a bare ✗ hid WHY. relay_detail carries the observed class per SNI, so the tooltip now
+    // says SNI_REJECT / TIMEOUT / TCP_FAILED instead of just "false". Detail text is a fixed
+    // vocabulary from the Worker, never a raw error string.
+    const rd = r.relayDetail == null ? null : r.relayDetail;
+    const SNI = ["github", "speedtest", "google"];
+    const relayTitle = rl == null
+      ? "not probed"
+      : rl
+          .map((v, i) => `${SNI[i]}=${v}${rd ? ` (${rd[i].outcome}, ${rd[i].durationMs} ms — ${rd[i].detail})` : ""}`)
+          .join(" ") + " — one SNI is not proof of universal relay capability";
     tr.append(el("td", { style: "padding:.25rem .5rem", className: relayCls, textContent: relayTxt, title: relayTitle }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.measured ? `${r.latencyMs} ms` : "—" }));
     tr.append(el("td", { style: "padding:.25rem .5rem", className: "muted", textContent: r.ok ? `${r.country || "?"}${r.colo ? " · " + r.colo : ""}` : "—" }));
