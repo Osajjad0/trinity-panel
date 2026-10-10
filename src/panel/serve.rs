@@ -417,7 +417,11 @@ async fn load_catalog_meta(env: &Env) -> Option<crate::catalog::Meta> {
         .await
         .ok()
         .flatten()?;
+    // `next_refresh_at` is DERIVED here, never read from the document: the
+    // field is `skip_deserializing`, so what the panel counts down to is
+    // always recomputed from the cron schedule at this instant.
     crate::catalog::Meta::from_json(&raw)
+        .map(|m| m.with_next_refresh(worker::Date::now().as_millis()))
 }
 
 /// The probe's health map, or empty when nothing has been measured yet.

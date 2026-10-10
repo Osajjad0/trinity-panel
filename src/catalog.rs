@@ -651,9 +651,56 @@ pub async fn stored(env: &worker::Env) -> Option<Snapshot> {
     serde_json::from_value(document.get("snapshot")?.clone()).ok()
 }
 
+/// The next fire of `23 */6 * * *` UTC strictly after `now_ms`.
+///
+/// `now_iso` counts from the Unix epoch, so hour 0 of the schedule is epoch
+/// hour 0 and `hour % 6 == 0` lines up with UTC without a timezone table.
+/// Strictly-after matters: at exactly :23:00.000 the current fire is running,
+/// so the next one is 6 h out, not "now".
+fn next_cron_fire_ms(now_ms: u64) -> u64 {
+    const HOUR_MS: u64 = 3_600_000;
+    let hour = now_ms / HOUR_MS;
+    let base = (hour / CATALOG_CRON_PERIOD_H) * CATALOG_CRON_PERIOD_H;
+    // This period's fire, and the one after it: pick whichever is strictly later
+    // than now. Using only the period boundary overshoots by up to a full hour
+    // when the clock sits between :23 and :00 of the next scheduled hour.
+    let first = base * HOUR_MS + CATALOG_CRON_MINUTE * 60_000;
+    if first > now_ms {
+        first
+    } else {
+        first + CATALOG_CRON_PERIOD_H * HOUR_MS
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 fn now_iso(ms: u64) -> String {
     worker::Date::new(worker::DateInit::Millis(ms)).to_string()
+}
+
+/// Host-safe ISO-8601 UTC for the same instant. Keeps the schedule maths
+/// testable off-target: `worker::Date` does not exist in a host build, and the
+/// countdown must be provable there.
+#[cfg(not(target_arch = "wasm32"))]
+fn now_iso(ms: u64) -> String {
+    let (days, rem) = ((ms / 86_400_000) as i64, (ms % 86_400_000) / 1000);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+        if m <= 2 { y + 1 } else { y },
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1388,7 +1435,22 @@ pub struct Meta {
     /// older stored metas.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+    /// When the deploy-registered cron next fires, as ISO-8601 UTC. Computed
+    /// per READ from the real schedule, never stored: a persisted value would
+    /// be a guess from whenever it was written. `skip_deserializing` so an
+    /// older KV document (or a stale value already on disk) can never win over
+    /// the computed one, and so the sync path cannot persist a guess.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub next_refresh_at: Option<String>,
 }
+
+/// The deploy-registered catalog cron, `23 */6 * * *` UTC: minute 23 of every
+/// sixth UTC hour. `deploy_fresh3b_identity.py` registers the same expression
+/// in the Worker's scheduled metadata, and the panel's refresh countdown is
+/// derived from it here so the UI cannot drift from what actually fires.
+/// ponytail: a cron parser is not worth it — one fixed schedule, one place.
+const CATALOG_CRON_MINUTE: u64 = 23;
+const CATALOG_CRON_PERIOD_H: u64 = 6;
 
 impl Default for Meta {
     fn default() -> Self {
@@ -1402,6 +1464,7 @@ impl Default for Meta {
             endpoint_count: 0,
             country_counts: Default::default(),
             source_url: None,
+            next_refresh_at: None,
         }
     }
 }
@@ -1425,7 +1488,17 @@ impl Meta {
                 .map(|(k, v)| (k.clone(), v.len()))
                 .collect(),
             source_url: Some(FEED_URL.to_owned()),
+            next_refresh_at: None,
         }
+    }
+
+    /// Fill in the next scheduled refresh for `now_ms`. Purely derived from the
+    /// cron constant, so it is correct for any read time and needs no stored
+    /// state. Never called on the sync path: only on read.
+    #[must_use]
+    pub fn with_next_refresh(mut self, now_ms: u64) -> Self {
+        self.next_refresh_at = Some(now_iso(next_cron_fire_ms(now_ms)));
+        self
     }
 
     /// Parse the small KV meta document. Any malformed input yields `None`.
@@ -3210,5 +3283,62 @@ mod tests {
         // Duplicate entries are preserved as-is; the dial layer dedupes by
         // candidate key, so a duplicate here costs an attempt, not a bug.
         assert_eq!(snap.countries["DE"].len(), 2);
+    }
+}
+
+/// The countdown must come from the schedule, never from a stored guess, and
+/// must be strictly in the future at every read time.
+#[cfg(test)]
+mod next_refresh_tests {
+    use super::{next_cron_fire_ms, now_iso, CATALOG_CRON_MINUTE, CATALOG_CRON_PERIOD_H, Meta};
+
+    const HOUR_MS: u64 = 3_600_000;
+
+    #[test]
+    fn fires_at_23_past_every_sixth_hour() {
+        // 2026-10-10T02:00:00Z is not a scheduled hour -> next is 06:23.
+        let now = 1_780_000_000_000; // arbitrary fixed instant
+        let next = next_cron_fire_ms(now);
+        let hour = (next / HOUR_MS) % 24;
+        let minute = (next / 60_000) % 60;
+        assert_eq!(minute, CATALOG_CRON_MINUTE);
+        assert_eq!(hour % CATALOG_CRON_PERIOD_H, 0);
+    }
+
+    #[test]
+    fn is_always_strictly_in_the_future_and_within_one_period() {
+        let mut t = 0u64;
+        for _ in 0..200 {
+            let now = t;
+            let next = next_cron_fire_ms(now);
+            assert!(next > now, "fire must be strictly after {now}");
+            assert!(next - now <= CATALOG_CRON_PERIOD_H * HOUR_MS);
+            // Walk to just past the fire, so the boundary case is covered.
+            t = next + 1;
+        }
+    }
+
+    #[test]
+    fn exactly_on_the_minute_rolls_forward_a_full_period() {
+        let fire = next_cron_fire_ms(1_780_000_000_000);
+        let next = next_cron_fire_ms(fire);
+        assert_eq!(next - fire, CATALOG_CRON_PERIOD_H * HOUR_MS);
+    }
+
+    #[test]
+    fn meta_exposes_the_next_refresh_and_never_persists_it() {
+        let now = 1_780_000_000_000u64;
+        let meta = Meta::default().with_next_refresh(now);
+        let iso = meta.next_refresh_at.clone().expect("next refresh");
+        assert_eq!(iso, now_iso(next_cron_fire_ms(now)));
+        // The field must not survive a round trip through KV: on read it is
+        // always recomputed, so a stale stored guess can never be served.
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("nextRefreshAt"), "the panel reads this field");
+        // skip_deserializing: a stored value can never win over the computed
+        // one, so a stale guess on disk cannot be served as "next refresh".
+        let stale = r#"{"nextRefreshAt":"1999-01-01T00:00:00.000Z"}"#;
+        let back: Meta = serde_json::from_str(stale).unwrap();
+        assert_eq!(back.next_refresh_at, None);
     }
 }

@@ -250,34 +250,59 @@ td,th{overflow-wrap:anywhere}
   font-size:.8rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
   color:var(--text-muted);padding-bottom:.45rem;margin-bottom:.55rem;
   border-bottom:1px solid var(--border)}
-.cand-list{display:flex;flex-direction:column;gap:.3rem;min-width:0}
-/* Pool summary + tools. Uses the same vars as the rest of the panel. */
-.pool-sum{display:flex;flex-direction:column;gap:.25rem;margin:.1rem 0 .6rem;padding:.5rem .6rem;border:1px solid var(--border);border-radius:8px;background:var(--card)}
-.pool-sum-row{display:flex;flex-wrap:wrap;gap:.35rem .5rem;align-items:baseline;font-size:.8rem}
-.pool-sum-k{color:var(--muted-foreground);font-size:.72rem;text-transform:uppercase;letter-spacing:.04em}
-.pool-sum-v{font-variant-numeric:tabular-nums}
-.pool-sum-state{margin-top:.35rem;font-size:.76rem;padding-top:.35rem;border-top:1px solid var(--border);color:var(--muted-foreground)}
-.pool-sum-state.ok{color:var(--foreground)}
-.pool-sum-state.warn{color:#b26a00}
-.pool-tools{display:flex;flex-wrap:wrap;gap:.5rem;align-items:end;margin:.5rem 0 .35rem}
-.pool-tool{display:flex;flex-direction:column;gap:.15rem;font-size:.72rem;color:var(--muted-foreground)}
+.cand-list{display:flex;flex-direction:column;min-width:0}
+/* Pool status bar: one row of chips, one secondary line, one refresh line. */
+.pool-bar{display:flex;flex-wrap:wrap;gap:.3rem;align-items:center;margin:.1rem 0 .25rem}
+.pool-chip{padding:.12rem .45rem;border:1px solid var(--border);border-radius:999px;
+  font-size:.76rem;background:var(--surface-raised);white-space:nowrap}
+.pool-chip.ok{border-color:var(--ok,#3a7);color:var(--ok,#3a7)}
+.pool-chip.warn{border-color:#b26a00;color:#b26a00}
+.pool-sub{margin:.1rem 0;font-size:.76rem;color:var(--muted-foreground)}
+.pool-sub.warn{color:#b26a00}
+.pool-refresh{margin:.15rem 0 .35rem;font-variant-numeric:tabular-nums}
+.pool-adv{margin:.2rem 0 .35rem;font-size:.74rem}
+.pool-adv>summary{cursor:pointer;color:var(--muted-foreground)}
+.pool-adv-body{display:grid;grid-template-columns:auto 1fr;gap:.15rem .5rem;
+  padding:.35rem 0 .1rem;color:var(--muted-foreground);overflow-wrap:anywhere}
+.pool-sum-k{color:var(--muted-foreground);font-size:.72rem}
+.pool-loc{margin:.35rem 0 .2rem}
+.pool-tools{display:flex;flex-wrap:wrap;gap:.4rem;align-items:end;margin:.35rem 0 .3rem}
+.pool-tool{display:flex;flex-direction:column;gap:.1rem;font-size:.72rem;color:var(--muted-foreground)}
 .pool-count{margin-left:auto;font-size:.74rem;color:var(--muted-foreground)}
-/* One candidate: identity on the left, measurements on the right. */
-.cand-row{display:grid;grid-template-columns:auto 1fr auto;gap:.15rem .5rem;align-items:center;padding:.3rem .4rem;border:1px solid var(--border);border-radius:6px;min-width:0}
-.cand-row.stale{opacity:.72;border-style:dashed}
-.cand-main{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center;min-width:0}
-.cand-host{font-size:.78rem;overflow-wrap:anywhere}
-.cand-metrics{grid-column:2;display:flex;flex-wrap:wrap;gap:.4rem;font-size:.72rem;color:var(--muted-foreground);font-variant-numeric:tabular-nums}
-.cand-metrics .u{color:var(--muted-foreground);opacity:.75}
-.cand-reason{grid-column:2;font-size:.7rem;color:var(--muted-foreground);overflow-wrap:anywhere}
+/* One candidate per row, one line each: rank, address, status, three numbers.
+   `min-width:0` + `white-space:nowrap` on the address is what keeps an IPv6
+   address and its port on ONE line: the cell truncates instead of wrapping, and
+   the full value stays in `title` and in the Copy button. */
+.cand-list{display:flex;flex-direction:column;min-width:0}
+.cand-row{display:grid;align-items:center;gap:.45rem;padding:.1rem .35rem;
+  /* FIVE children: rank, address, copy, status, measurements. Four columns
+     silently wrapped the measurements onto row 2, where they rendered flush
+     against the card edge and got clipped. */
+  grid-template-columns:1.4rem minmax(0,max-content) auto auto 1fr;
+  border-bottom:1px solid var(--border);min-width:0}
+.cand-row:first-child{border-top:1px solid var(--border)}
+.cand-row.stale .cand-host{opacity:.6}
+.cand-idx{color:var(--text-subtle);font-size:.74rem;text-align:right;
+  font-variant-numeric:tabular-nums}
+.cand-host{font-family:var(--mono);font-size:.8rem;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;min-width:0}
+.cand-copy{padding:.15rem .45rem;min-height:26px;font-size:.72rem;justify-self:start}
+.cand-flag{font-size:.7rem;white-space:nowrap}
+.cand-flag.ok{color:var(--ok,#3a7)}
+.cand-flag.warn{color:#b26a00}
+.cand-flag.off{color:var(--muted-foreground);opacity:.75;font-style:italic}
+.cand-metrics{justify-self:end;display:flex;gap:.55rem;font-size:.74rem;
+  color:var(--muted-foreground);font-variant-numeric:tabular-nums;white-space:nowrap;
+  min-width:0;overflow:hidden}
+.cand-metrics b{font-weight:500;color:var(--foreground)}
+.cand-metrics .u{opacity:.7;margin-right:.15rem}
 .cand-unknown{font-style:italic;opacity:.7}
-@media(max-width:520px){.cand-row{grid-template-columns:auto 1fr}.cand-metrics,.cand-reason{grid-column:2}.pool-sum-row{gap:.2rem .4rem}}
-.cand-row{display:flex;align-items:center;gap:.55rem;padding:.42rem .6rem;
-  background:var(--surface-raised);border:1px solid var(--border);
-  border-radius:var(--radius-sm);min-width:0}
-.cand-idx{flex:none;width:1.3rem;text-align:right;color:var(--text-subtle);font-size:.8rem}
-.cand-host{font-family:var(--mono);font-size:.84rem;overflow-wrap:anywhere;min-width:0;flex:1}
-.cand-copy{flex:none;padding:.25rem .6rem;min-height:0;font-size:.78rem}
+@media(max-width:560px){
+  .cand-row{grid-template-columns:1.2rem minmax(0,1fr) auto;
+    grid-template-areas:"i h f" "s s s" "m m m";gap:.15rem .4rem;padding:.3rem .35rem}
+  .cand-idx{grid-area:i}.cand-host{grid-area:h}.cand-copy{grid-area:f}
+  .cand-flag{grid-area:s}.cand-metrics{grid-area:m;justify-self:start;flex-wrap:wrap}
+}
 .err-wrap{display:inline}
 .err-details{display:inline;margin-left:.35rem}
 .err-details summary{display:inline;cursor:pointer;color:var(--accent);text-decoration:underline}
@@ -1203,71 +1228,61 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
           <h3 style="margin:0">Proxy-IP Pool</h3>
           <span class="st st-ready" id="cat-status">never synced</span>
         </div>
-        <!-- Operational summary. Every value comes from the backend state or
-             the catalog snapshot; nothing here is computed from a page render. -->
-        <div class="pool-sum" id="pool-sum">
-          <div class="pool-sum-row">
-            <span class="pool-sum-k">Mode</span>
-            <span class="pool-sum-v" id="sum-mode">—</span>
-            <span class="pool-sum-k">Resolved</span>
-            <span class="pool-sum-v" id="sum-country">—</span>
-          </div>
-          <div class="pool-sum-row">
-            <span class="pool-sum-k">Candidates</span>
-            <span class="pool-sum-v"><b id="sum-healthy">0</b> healthy eligible</span>
-            <span class="pool-sum-k" id="sum-degraded-k">Degraded</span>
-            <span class="pool-sum-v" id="sum-degraded">0</span>
-          </div>
-          <div class="pool-sum-row">
-            <span class="pool-sum-k">Measurements</span>
-            <span class="pool-sum-v" id="sum-coverage">—</span>
-            <span class="pool-sum-k">Last scan</span>
-            <span class="pool-sum-v" id="sum-scan">—</span>
-          </div>
-          <div class="pool-sum-state" id="sum-state">—</div>
+        <!-- Compact status: one line of chips, one secondary line, and the
+             refresh countdown. Advanced facts live in <details> below, so the
+             default view never shows source URLs or revision hashes. -->
+        <div class="pool-bar">
+          <span class="pool-chip" id="sum-mode">—</span>
+          <span class="pool-chip" id="sum-country">—</span>
+          <span class="pool-chip" id="sum-healthy">—</span>
+          <span class="pool-chip" id="sum-restricted" hidden>—</span>
         </div>
-        <p class="muted" style="margin:.3rem 0 .5rem">
-          <span id="cat-countries">—</span> locations ·
-          <span id="cat-endpoints">—</span> verified ·
-          last sync <span id="cat-sync-time">—</span><br>
-          pulls <span id="cat-source" class="mono">—</span> every 6 h
-          (auto; next pull + verification <span id="cat-next" class="mono">—</span>)</p>
-        <div class="field" style="max-width:340px">
-          <label for="cat-country">Location</label>
-          <select id="cat-country">
-            <option value="">Auto: spread across locations</option>
-          </select>
-          <div class="help">Only this location's verified candidates.</div>
-        </div>
-        <p class="muted" style="margin:.2rem 0 .4rem">
-          <strong id="cat-runtime-count">0</strong> runtime candidates ·
-          source <span id="cat-runtime-loc">AUTO</span> · revision
-          <span id="cat-rev" class="mono">—</span></p>
+        <p class="pool-sub" id="sum-state">—</p>
+        <p class="pool-sub pool-refresh" id="pool-refresh">—</p>
+        <details class="pool-adv">
+          <summary>Details</summary>
+          <div class="pool-adv-body">
+            <div class="pool-sum-k">Pool</div>
+            <div id="sum-detail">—</div>
+            <div class="pool-sum-k">Source</div>
+            <div><span id="cat-countries">—</span> locations ·
+                 <span id="cat-endpoints">—</span> verified ·
+                 revision <span id="cat-rev" class="mono">—</span><br>
+                 <span id="cat-source" class="mono">—</span></div>
+          </div>
+        </details>
         <div class="pool-tools" id="pool-tools" hidden>
           <label class="pool-tool"><span>Sort</span>
             <select id="pool-sort">
-              <option value="rank">Rank (backend)</option>
-              <option value="rtt">RTT (low first)</option>
-              <option value="dl">Download (high first)</option>
-              <option value="ul">Upload (high first)</option>
-              <option value="success">Success ratio</option>
-              <option value="fresh">Freshness</option>
+              <option value="rank">Best</option>
+              <option value="rtt">Ping</option>
+              <option value="dl">Download</option>
+              <option value="ul">Upload</option>
+              <option value="success">Reliability</option>
+              <option value="fresh">Newest</option>
             </select>
           </label>
           <label class="pool-tool"><span>Status</span>
             <select id="pool-filter">
               <option value="">All</option>
-              <option value="measured">Freshly measured</option>
-              <option value="stale">Stale measurement</option>
+              <option value="measured">Measured</option>
+              <option value="stale">Stale</option>
               <option value="unmeasured">Unmeasured</option>
-              <option value="limited">Limited capability</option>
-              <option value="healthy">Healthy only</option>
+              <option value="limited">Limited</option>
+              <option value="healthy">Healthy</option>
             </select>
           </label>
-          <label class="pool-tool"><span>Search</span>
+          <label class="pool-tool"><span>Find</span>
             <input id="pool-q" type="search" placeholder="ip or country" autocomplete="off">
           </label>
           <span class="pool-count" id="pool-shown"></span>
+        </div>
+        <div class="pool-loc">
+          <label class="pool-tool"><span>Location</span>
+            <select id="cat-country">
+              <option value="">Automatic</option>
+            </select>
+          </label>
         </div>
         <div id="cat-runtime" class="cand-list"></div>
         <div id="cat-capability" class="help" style="margin-top:.25rem"></div>
@@ -1389,6 +1404,9 @@ let NODES = [];        // working copy; saved as a whole
 let CURRENT = 0;       // index into NODES
 let OUTBOUND = null;   // working copy of outbound routing config
 let DIRTY = false;
+// Holds the refresh countdown's interval so a state reload replaces it
+// instead of stacking a second ticker.
+const POOL_TIMER = { timer: null };
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, kids = []) => {
@@ -2038,26 +2056,6 @@ const COUNTRY_NAMES = {
 
 function renderCatalog() {
   const c = STATE.catalog || null;
-  const status = $("cat-status");
-  status.textContent = !c ? "never synced"
-    : c.contentRevision ? "READY: verified feed" : "ERROR: unavailable";
-  status.className = "st " + (!c ? "" : c.contentRevision ? "st-ready" : "st-error");
-  $("cat-rev").textContent = c && c.contentRevision ? c.contentRevision.slice(0, 12) + "…" : "—";
-  $("cat-sync-time").textContent = c && c.fetchedAt ? new Date(c.fetchedAt).toLocaleString() : "—";
-  const src = c && c.sourceUrl ? c.sourceUrl.replace(/^https:\/\//, "") : null;
-  $("cat-source").textContent = src || "public verified feed";
-  // §20: next scheduled pull — the deploy-registered cron fires at :23 of
-  // every 6th UTC hour ("23 */6 * * *"); compute the next fire locally.
-  {
-    const now = new Date();
-    const next = new Date(now); // strict: first 6th-hour :23 strictly after now
-    next.setUTCMinutes(23, 0, 0);
-    next.setUTCHours(Math.floor(next.getUTCHours() / 6) * 6);
-    if (next <= now) next.setUTCHours(next.getUTCHours() + 6);
-    $("cat-next").textContent = next.toISOString().slice(11, 16) + " UTC";
-  }
-  setVal("cat-countries", c ? String(c.countryCount ?? "—") : "—");
-  setVal("cat-endpoints", c ? String(c.endpointCount ?? "—") : "—");
 
   // Country options: Auto + the countries the catalog actually has, sorted
   // by VERIFIED capability (v1.9.5 country quality): Auto first, then
@@ -2069,7 +2067,7 @@ function renderCatalog() {
   const saved = (OUTBOUND.catalogCountry || "").toUpperCase();
   const sel = $("cat-country");
   sel.textContent = "";
-  sel.append(el("option", { value: "", textContent: "Auto (catalog spread)" }));
+  sel.append(el("option", { value: "", textContent: "Automatic" }));
   const counts = (c && c.countryCounts) || {};
   const codes = [...((c && c.countries) || [])];
   const q = STATE.countryQuality || {};
@@ -2135,7 +2133,6 @@ function renderCatalog() {
   // has no detail for that candidate: render the host with "Unknown", never a
   // fabricated 0.
   const detail = (STATE.runtimeDetail || []);
-  setVal("cat-runtime-count", String(runtime.length));
   const fmtBps = (v) => {
     if (v === null || v === undefined) return null;
     const b = Number(v);
@@ -2183,77 +2180,150 @@ function renderCatalog() {
     listBox.append(empty);
   }
   renderPoolRows(runtime, detail);
+  // The countdown reads `catalog.nextRefreshAt` from the last loaded state and
+  // re-arms here, so a state reload replaces the ticker instead of stacking a
+  // second one. It never fetches: the tick is local, the instant is not.
+  renderRefresh();
 
   // ---- Proxy Pool: summary, rows, filters. Backend-ranked order is the
   // default; sorting only reorders what the backend already returned, it
   // never decides eligibility.
 
   function renderPoolSummary(detail, runtime) {
-    const measured = detail.filter((d) => met(d, "rttMs") !== null
-      || met(d, "dlBps") !== null || met(d, "successBp") !== null);
-    const stale = detail.filter((d) => d && d.stale);
-    const healthy = detail.filter((d) => d && d.healthy);
-    const limited = detail.filter((d) => d && d.capability && d.capability !== "passthrough");
-    const unmeasured = detail.filter((d) => !d || (met(d, "rttMs") === null
-      && met(d, "dlBps") === null && met(d, "successBp") === null));
-    const degraded = detail.filter((d) => d && !d.healthy);
+    const c = STATE.catalog || {};
+    const rows = (detail || []).filter(Boolean);
+    const healthy = rows.filter((d) => d.healthy !== false && d.capability === "passthrough").length;
+    const limited = rows.filter((d) => d.capability && d.capability !== "passthrough").length;
+    const measured = rows.filter((d) => met(d, "rttMs") !== null || met(d, "dlBps") !== null).length;
+    const pct = rows.length ? Math.round((measured / rows.length) * 100) : 0;
 
-    const country = (OUTBOUND.catalogCountry || "").trim();
-    const mode = country === "" || country.toUpperCase() === "AUTO"
-      ? "Automatic (spread across locations)"
-      : "Manual pin: " + country.toUpperCase();
-    setVal("sum-mode", mode);
-    setVal("sum-country", country === "" || country.toUpperCase() === "AUTO"
-      ? "auto spread" : country.toUpperCase());
-    setVal("sum-healthy", String(healthy.length));
-    setVal("sum-degraded", String(degraded.length));
-    setVal("sum-degraded-k", "Degraded / " + limited.length + " limited");
+    const mode = $("sum-mode");
+    const cc = (OUTBOUND.catalogCountry || "").trim();
+    mode.textContent = cc ? cc.toUpperCase() : "Automatic";
+    mode.title = cc ? "Pinned to one location." : "Spread across all locations.";
 
-    const pct = detail.length ? Math.round((measured.length / detail.length) * 100) : 0;
-    setVal("sum-coverage", detail.length
-      ? measured.length + "/" + detail.length + " candidates (" + pct + "%)"
-      : "no catalog detail yet");
-    const cat = STATE.catalog || null;
-    setVal("sum-scan", cat && cat.generatedAt ? cat.generatedAt.replace("T", " ").replace("Z", " UTC")
-      : "never synced");
+    const resolved = (runtime[0] ? countryOf(runtime[0], detail) : null)
+      || (cc ? cc.toUpperCase() : null);
+    const country = $("sum-country");
+    // Two identical country chips read as a bug, so the second one only
+    // appears when it actually disagrees with the pinned mode.
+    country.hidden = !resolved || resolved === cc.toUpperCase();
+    country.textContent = resolved || "—";
+    country.title = "The location actually in effect.";
 
+    const h = $("sum-healthy");
+    h.textContent = healthy + " ready";
+    h.className = "pool-chip" + (healthy ? " ok" : " warn");
+
+    const rest = $("sum-restricted");
+    const other = rows.length - healthy;
+    rest.hidden = other === 0;
+    rest.textContent = other ? other + " limited or unverified" : "";
+    rest.className = "pool-chip warn";
+
+    // One honest sentence, and never a green light over a degraded pool.
     const st = $("sum-state");
-    let msg, cls = "ok";
-    if (!runtime.length) {
-      msg = "No runtime candidates for this mode/location. Pool is empty."; cls = "warn";
-    } else if (stale.length === detail.length && detail.length) {
-      msg = "RESTRICTED: every measurement here is older than the 12 h freshness window. "
-        + "Ranking used eligibility only."; cls = "warn";
-    } else if (!measured.length) {
-      msg = "INCOMPLETE: no candidate here carries a fresh measurement. "
-        + "Ordering is by eligibility and capability, not speed."; cls = "warn";
-    } else if (stale.length) {
-      msg = "USABLE WITH CAVEATS: " + stale.length + " of " + detail.length
-        + " candidate measurements are stale and are marked as such.";
-    } else if (limited.length === detail.length && detail.length) {
-      msg = "LIMITED: every candidate here is Cloudflare-fronted or TLS-terminated only. "
-        + "Generic (non-Cloudflare) destinations are not served by this pool.";
+    if (!rows.length) {
+      st.textContent = c.fetchedAt ? "Waiting for the first refresh." : "No verified candidates yet.";
+      st.className = "pool-sub warn";
+    } else if (!healthy) {
+      st.textContent = "No full-access candidate right now — every candidate is limited.";
+      st.className = "pool-sub warn";
     } else {
-      msg = "USABLE: " + measured.length + " of " + detail.length
-        + " candidates carry fresh measurements; the rest are marked unmeasured.";
+      st.textContent = "Pool ready. Measurements cover " + pct + "% of candidates" +
+        (measured === rows.length ? "" : "; the rest are unverified.") +
+        (c.fetchedAt ? " Updated " + fmtAgo(c.fetchedAt) + "." : "");
+      st.className = "pool-sub";
     }
-    st.textContent = msg;
-    st.className = "pool-sum-state " + cls;
+
+    // Advanced block: the provenance and counters the default view drops.
+    setVal("sum-detail", rows.length
+      ? rows.length + " candidates · " + measured + " measured · " + fmtAgo(c.fetchedAt || "")
+      : "No snapshot.");
+    setVal("cat-countries", c ? String(c.countryCount ?? "—") : "—");
+    setVal("cat-endpoints", c ? String(c.endpointCount ?? "—") : "—");
+    const rev = $("cat-rev");
+    if (rev) rev.textContent = c.contentRevision ? c.contentRevision.slice(0, 12) + "…" : "—";
+    const src = $("cat-source");
+    if (src) src.textContent = c.sourceUrl ? c.sourceUrl.replace(/^https:\/\//, "") : "public verified feed";
+    const stt = $("cat-status");
+    if (stt) {
+      stt.textContent = !c ? "never synced" : c.contentRevision ? "READY" : "unavailable";
+      stt.className = "st " + (!c ? "" : c.contentRevision ? "st-ready" : "st-error");
+    }
   }
 
-  function poolSortValue(d, mode) {
-    switch (mode) {
-      case "rtt": { const v = met(d, "rttMs"); return v === null ? Infinity : Number(v); }
-      case "dl": { const v = met(d, "dlBps"); return v === null ? -1 : Number(v); }
-      case "ul": { const v = met(d, "ulBps"); return v === null ? -1 : Number(v); }
-      case "success": { const v = met(d, "successBp"); return v === null ? -1 : Number(v); }
-      case "fresh": { const v = met(d, "ageS"); return v === null ? Infinity : Number(v); }
-      default: return 0;
-    }
+  // "Updated 5h ago" from an ISO timestamp. Absent -> empty, never "just now".
+  function fmtAgo(iso) {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return "";
+    const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    return Math.floor(s / 86400) + "d ago";
   }
-  // Higher is better for throughput and success ratio; LOWER is better for
-  // latency and age. `true` means descending (biggest first).
-  function poolSortDesc(mode) { return !(mode === "rtt" || mode === "fresh"); }
+
+  // The country of the first runtime candidate, when the detail rows carry one.
+  function countryOf(host, detail) {
+    const i = (STATE.runtimeCandidates || []).indexOf(host);
+    const d = (detail || [])[i];
+    return d && d.country ? d.country.toUpperCase() : null;
+  }
+
+  // The refresh countdown. The instant comes from the backend
+  // (`catalog.nextRefreshAt`, derived server-side from the deploy-registered
+  // cron) and is only re-read when panel state reloads -- the ticker itself
+  // never calls the network.
+  function renderRefresh() {
+    const box = $("pool-refresh");
+    if (!box) return;
+    // Read the instant on EVERY tick, never once at arm time: a panel reload
+    // replaces `STATE.catalog` behind this closure, and a countdown that kept
+    // the old target would keep counting to a stale fire.
+    const tick = () => {
+      const cat = STATE.catalog || {};
+      const iso = cat.nextRefreshAt;
+      const target = typeof iso === "string" ? Date.parse(iso) : NaN;
+      if (!Number.isFinite(target)) {
+        box.textContent = "Next refresh: unknown";
+        box.className = "pool-sub pool-refresh warn";
+        return;
+      }
+      const lastSync = Date.parse(cat.fetchedAt || "");
+      const left = Math.floor((target - Date.now()) / 1000);
+      if (left > 0) {
+        const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60);
+        // padStart on the HOUR field too: a 2-field clock is what the user is
+        // asked to read, and "633139:09:38" is neither.
+        const mm = String(m).padStart(2, "0"), ss = String(left % 60).padStart(2, "0");
+        box.textContent = "Next Proxy Pool refresh in " +
+          (h ? h + ":" + mm + ":" + ss : mm + ":" + ss);
+        box.className = "pool-sub pool-refresh";
+        box.title = "New IPs appear only if the published catalog actually changes.";
+        return;
+      }
+      // Expired. Say what is true: we do NOT know whether it arrived, and we
+      // must not sit at 00:00:00 claiming success.
+      // Past the fire: we do NOT know yet whether the pull succeeded, and we
+      // must never sit at 00:00:00. "Refreshing" is shown briefly, then
+      // "delayed" once the next fire is itself more than one period out --
+      // measured from the FIRE, not from the last sync, because a pool that was
+      // synced 5 h ago is perfectly healthy right up to its 6 h fire.
+      const sinceFire = (Date.now() - target) / 1000;
+      if (sinceFire > 30 * 60) {
+        box.textContent = "Refresh delayed — still showing the last known pool";
+      } else {
+        box.textContent = "Refreshing the Proxy Pool…";
+        box.title = "New IPs appear only if the published catalog actually changes.";
+      }
+      box.className = "pool-sub pool-refresh warn";
+      void lastSync;
+    };
+    tick();
+    if (POOL_TIMER) clearInterval(POOL_TIMER.timer);
+    POOL_TIMER.timer = setInterval(tick, 1000);
+  }
 
   function poolMatches(d, host, filter, q) {
     if (q) {
@@ -2296,10 +2366,11 @@ function renderCatalog() {
     const shown = $("pool-shown");
     if (shown) {
       shown.textContent = rows.length === runtime.length
-        ? rows.length + " shown"
-        : rows.length + " of " + runtime.length + " shown";
+        ? String(rows.length)
+        : rows.length + " of " + runtime.length;
     }
 
+    listBox.textContent = "";
     if (!rows.length) {
       const empty = el("div", { className: "empty-state" });
       empty.append(el("p", { textContent: runtime.length
@@ -2320,49 +2391,55 @@ function renderCatalog() {
     }
 
     rows.forEach((r, n) => {
-      const d = r.d;
-      const row = el("div", { className: "cand-row" + (d && d.stale ? " stale" : "") });
+      const d = r.d || {};
+      const row = el("div", { className: "cand-row" + (d.stale ? " stale" : "") });
       row.append(el("span", { className: "cand-idx", textContent: String(n + 1) }));
 
-      const main = el("div", { className: "cand-main" });
-      main.append(el("code", { className: "cand-host", textContent: r.host }));
-      if (d && d.capability) {
-        const cap = el("span", { className: "st " + (d.capability === "passthrough" ? "st-ready" : "st-warning"),
-          textContent: d.capability });
-        cap.title = d.capability === "cf-relay"
-          ? "Forwards only to Cloudflare-fronted origins."
-          : d.capability === "sni-terminate"
-            ? "Terminates TLS; no generic-internet passthrough."
-            : d.capability;
-        main.append(cap);
-      }
-      if (d && d.country) main.append(cell(d.country));
-      row.append(main);
+      // The address keeps its full value in title/copy even when the cell
+      // truncates, so a long IPv6 is never lost.
+      row.append(el("code", { className: "cand-host", textContent: r.host, title: r.host }));
 
       const cp = el("button", { type: "button", className: "cand-copy", textContent: "Copy",
         title: "Copy " + r.host, "aria-label": "Copy " + r.host });
       cp.onclick = () => copy(r.host, r.host);
       row.append(cp);
 
-      const m = el("div", { className: "cand-metrics" });
-      slot(m, "RTT", fmtRtt(met(d, "rttMs")));
-      slot(m, "down", fmtBps(met(d, "dlBps")));
-      slot(m, "up", fmtBps(met(d, "ulBps")));
-      slot(m, "ok", met(d, "successBp") === null || met(d, "successBp") === undefined
-        ? null : (Number(met(d, "successBp")) / 100).toFixed(1) + "%");
-      if (d && d.stale) m.append(cell("stale", "cand-unknown"));
-      row.append(m);
+      row.append(statusFlag(d));
 
-      if (d && d.reason) row.append(el("div", { className: "cand-reason", textContent: d.reason }));
-      // Provenance: where each number came from, and how old it is.
-      const age = fmtAge(d);
-      if (age || (d && d.lastSuccess)) {
-        const src = el("div", { className: "cand-reason" });
-        src.append(cell("scanner measurement, candidate-only throughput" + (age ? ", " + age : "")));
-        row.append(src);
-      }
+      const m = el("div", { className: "cand-metrics" });
+      slot(m, "Ping", fmtRtt(met(d, "rttMs")));
+      slot(m, "Down", fmtBps(met(d, "dlBps")));
+      slot(m, "Up", fmtBps(met(d, "ulBps")));
+      row.append(m);
       listBox.append(row);
     });
+  }
+
+  // The one visible status chip: health first, then the capability restriction
+  // that actually limits this candidate. Absent stays absent.
+  function statusFlag(d) {
+    const cap = d.capability;
+    if (cap && cap !== "passthrough") {
+      const f = el("span", { className: "cand-flag warn", textContent: "Limited" });
+      f.title = cap === "cf-relay"
+        ? "Limited: reaches Cloudflare-fronted sites only."
+        : cap === "sni-terminate"
+          ? "Limited: terminates TLS, no passthrough to other sites."
+          : "Limited: " + cap;
+      return f;
+    }
+    if (d.healthy === false) {
+      const f = el("span", { className: "cand-flag off", textContent: "Not healthy" });
+      if (d.reason) f.title = d.reason;
+      return f;
+    }
+    if (d.stale) {
+      const f = el("span", { className: "cand-flag warn", textContent: "Stale" });
+      const age = fmtAge(d);
+      if (age) f.title = "Measurement is " + age + " old.";
+      return f;
+    }
+    return el("span", { className: "cand-flag ok", textContent: "Healthy" });
   }
 
   // Wire the controls once; renderPoolRows is safe to call repeatedly.
@@ -2374,7 +2451,6 @@ function renderCatalog() {
       c.addEventListener("input", () => renderPoolRows(STATE.runtimeCandidates || [], STATE.runtimeDetail || []));
     });
   })();
-  $("cat-runtime-loc").textContent = (OUTBOUND.catalogCountry || "AUTO").toUpperCase();
   // Stage-C capability census for the selected country (fetched separately;
   // absent = older feed). Rendered as its own truth line, never invented.
   const capBox = $("cat-capability");
