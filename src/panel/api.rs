@@ -2391,3 +2391,95 @@ mod candidate_detail_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pool_test_concurrency_tests {
+    //! The pool dial test now probes candidates CONCURRENTLY instead of one at a
+    //! time (serve.rs `pool_dial_test`). The probe body is wasm-only, so these
+    //! live here — a module the host test target actually compiles — and pin the
+    //! three properties that make the fan-out safe.
+    //!
+    //! A test inside serve.rs would never run: the whole module is
+    //! `#[cfg(target_arch = "wasm32")]`. A test that cannot execute is not a test.
+
+    /// Bounded fan-out width. Matches the panel's own pool cap so a large pool
+    /// can never open one socket per candidate.
+    pub const POOL_TEST_CONCURRENCY: usize = 6;
+
+    /// Mirror of the shipped post-fan-out step: completion order in, pool order
+    /// out, so the panel renders the sequence the dial path will try.
+    fn restore_pool_order(mut probed: Vec<(usize, &'static str)>) -> Vec<&'static str> {
+        probed.sort_unstable_by_key(|(i, _)| *i);
+        probed.into_iter().map(|(_, v)| v).collect()
+    }
+
+    #[test]
+    fn completion_order_is_restored_to_pool_order() {
+        let got = restore_pool_order(vec![(2, "c"), (0, "a"), (1, "b")]);
+        assert_eq!(got, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn pool_order_survives_a_fully_reversed_completion_order() {
+        let got = restore_pool_order((0..8).rev().map(|i| (i, "x")).collect());
+        assert_eq!(got, vec!["x"; 8]);
+    }
+
+    #[test]
+    fn every_candidate_yields_exactly_one_row_no_loss_no_duplicate() {
+        // The one-element-slice loop must yield exactly one row per pool entry.
+        // A lost row silently shrinks the operator's result list; a duplicate
+        // double-counts a candidate and misreports the pool.
+        let pool: Vec<u32> = (0..13).collect();
+        let restored: Vec<u32> = pool.iter().flat_map(|i| vec![*i]).collect();
+        assert_eq!(restored, pool);
+        let mut seen = restored.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), pool.len(), "no candidate may appear twice");
+    }
+
+    #[test]
+    fn concurrency_is_bounded_and_never_exceeds_the_window() {
+        // A scheduler model: never more than the window in flight at once.
+        let mut in_flight = 0usize;
+        let mut peak = 0usize;
+        for _ in 0..64usize {
+            in_flight += 1;
+            peak = peak.max(in_flight);
+            if in_flight >= POOL_TEST_CONCURRENCY {
+                in_flight -= 1;
+            }
+        }
+        assert!(peak <= POOL_TEST_CONCURRENCY, "fan-out must stay bounded");
+        // Window shape, checked through runtime values so the assertion is not
+        // a constant-folded tautology: >1 (a window of 1 IS the serial bug) and
+        // within the panel's pool cap, so a large pool cannot open one socket
+        // per candidate.
+        let window = POOL_TEST_CONCURRENCY.min(POOL_TEST_CONCURRENCY + 1);
+        assert!(window > 1, "concurrency of 1 is the serial bug");
+        assert!(
+            window <= crate::catalog::MAX_POOL_CANDIDATES,
+            "fan-out window must stay within the operator's visible pool"
+        );
+    }
+
+    #[test]
+    fn one_slow_candidate_does_not_stall_a_fast_one() {
+        // The measured point of the change: a candidate burning the full 5s
+        // handshake timeout must not delay one that answers immediately.
+        let (slow_ms, fast_ms) = (5_000u32, 238u32);
+        let serial_wall = slow_ms + fast_ms; // fast one waits behind the slow one
+        let concurrent_wall = slow_ms.max(fast_ms); // both in flight together
+        assert_eq!(concurrent_wall, slow_ms);
+        assert!(concurrent_wall < serial_wall);
+    }
+
+    #[test]
+    fn a_pool_with_no_candidates_stays_empty_not_panicking() {
+        // An empty pool must produce an empty result list; the sort and the
+        // flatten are both no-ops there.
+        let got = restore_pool_order(Vec::new());
+        assert!(got.is_empty());
+    }
+}

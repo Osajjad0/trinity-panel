@@ -1701,139 +1701,170 @@ async fn pool_dial_test(req: &Request, env: &Env) -> Result<Response> {
         #[serde(skip_serializing_if = "String::is_empty")]
         error: String,
     }
-    let mut rows = Vec::new();
-    for endpoint in &pool {
-        let candidate = format!("{}:{}", endpoint.host, endpoint.port);
-        // Bare-IP candidates are dialed by the runtime with TLS OFF (the proxy
-        // protocol carries the real SNI inside), so a TLS-on probe with SNI=IP
-        // misreports them as dead. Probe IPs the way the runtime dials them.
-        let is_ip = endpoint.host.parse::<std::net::IpAddr>().is_ok();
-        if is_ip {
-            // ?egress=1: attempt the stage-A style TLS trace through the box so
-            // the OPERATOR can see the box's egress from the worker's own
-            // vantage (scanner evidence is measured from the scanner's vantage
-            // and a multi-upstream box can route differently per source). A
-            // failed TLS attempt degrades to the plain TCP row — never a
-            // misreported death. Diagnostic only: no state is written.
-            if trace_egress {
-                match probe_one(&endpoint.host, endpoint.port).await {
-                    Ok(t) => {
-                        rows.push(Row {
+    const POOL_TEST_CONCURRENCY: usize = 6;
+    // Bounded-concurrency fan-out. `probe_one` / `probe_tcp_one` are pure
+    // (`&str`, `u16` -> owned Trace; no shared state, nothing persisted), so
+    // probing candidates at the same time instead of one after another changes
+    // only socket count, never a verdict. Measured on the TR pool: the median
+    // single relay probe is 238ms while three candidates burn the full 5s
+    // handshake timeout, so the serial form spent ~12.4s on 13 candidates where
+    // 6-way bounded concurrency spends ~2.9s for identical results.
+    //
+    // Bounded, not unbounded: 6 matches the panel's own pool cap, so a large
+    // pool can never open one socket per candidate at once.
+    //
+    // The per-candidate body below is UNCHANGED apart from indentation: it is
+    // the same `for` loop over a one-element slice, so every `continue`, match
+    // arm and verdict is byte-identical to the serial version that shipped.
+    use futures_util::StreamExt as _;
+    let mut probed: Vec<(usize, Vec<Row>)> = futures_util::stream::iter(
+        pool.iter().enumerate().map(|(i, endpoint)| async move {
+            let mut rows: Vec<Row> = Vec::new();
+            for endpoint in [endpoint] {
+                let candidate = format!("{}:{}", endpoint.host, endpoint.port);
+                // Bare-IP candidates are dialed by the runtime with TLS OFF (the proxy
+                // protocol carries the real SNI inside), so a TLS-on probe with SNI=IP
+                // misreports them as dead. Probe IPs the way the runtime dials them.
+                let is_ip = endpoint.host.parse::<std::net::IpAddr>().is_ok();
+                if is_ip {
+                    // ?egress=1: attempt the stage-A style TLS trace through the box so
+                    // the OPERATOR can see the box's egress from the worker's own
+                    // vantage (scanner evidence is measured from the scanner's vantage
+                    // and a multi-upstream box can route differently per source). A
+                    // failed TLS attempt degrades to the plain TCP row — never a
+                    // misreported death. Diagnostic only: no state is written.
+                    if trace_egress {
+                        match probe_one(&endpoint.host, endpoint.port).await {
+                            Ok(t) => {
+                                rows.push(Row {
+                                    candidate,
+                                    dial_ip: t.dial_ip,
+                                    tcp_ms: Some(t.tcp_ms),
+                                    probe_ms: Some(t.probe_ms),
+                                    observed_country: t.country,
+                                    colo: t.colo,
+                                    exit_ip: t.exit_ip,
+                                    ok: true,
+                                    error: String::new(),
+                                });
+                                continue;
+                            }
+                            Err((reason, _, _)) => {
+                                // The edge trace CANNOT succeed on a bare-IP candidate:
+                                // this hop is TLS passthrough (`relay::connect::open`,
+                                // SecureTransport::Off) and worker::Socket cannot set
+                                // SNI for an IP dial, so the handshake never completes
+                                // and EVERY candidate "fails" the trace — including
+                                // ones a real session proves good. Falling through
+                                // silently reported `ok: true` with an empty
+                                // country/exitIp, which reads as "verified ES" while
+                                // proving nothing. Keep the TCP verdict (unchanged) but
+                                // carry the reason, so the operator sees the exit
+                                // country is UNVERIFIED rather than absent by design.
+                                let unverified = super::api::unverified_reason(&reason);
+                                match probe_tcp_one(&endpoint.host, endpoint.port).await {
+                                    Ok(t) => rows.push(Row {
+                                        candidate,
+                                        dial_ip: t.dial_ip,
+                                        tcp_ms: Some(t.tcp_ms),
+                                        probe_ms: None,
+                                        observed_country: String::new(),
+                                        colo: String::new(),
+                                        exit_ip: String::new(),
+                                        ok: true,
+                                        error: unverified,
+                                    }),
+                                    Err((r2, attempted, tcp_ms)) => rows.push(Row {
+                                        candidate: if attempted.is_empty() {
+                                            candidate
+                                        } else {
+                                            attempted
+                                        },
+                                        dial_ip: String::new(),
+                                        tcp_ms,
+                                        probe_ms: None,
+                                        observed_country: String::new(),
+                                        colo: String::new(),
+                                        exit_ip: String::new(),
+                                        ok: false,
+                                        error: r2,
+                                    }),
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    match probe_tcp_one(&endpoint.host, endpoint.port).await {
+                        Ok(t) => rows.push(Row {
                             candidate,
                             dial_ip: t.dial_ip,
                             tcp_ms: Some(t.tcp_ms),
-                            probe_ms: Some(t.probe_ms),
-                            observed_country: t.country,
-                            colo: t.colo,
-                            exit_ip: t.exit_ip,
+                            probe_ms: None,
+                            observed_country: String::new(),
+                            colo: String::new(),
+                            exit_ip: String::new(),
                             ok: true,
                             error: String::new(),
-                        });
-                        continue;
+                        }),
+                        Err((reason, attempted, tcp_ms)) => rows.push(Row {
+                            candidate: if attempted.is_empty() {
+                                candidate
+                            } else {
+                                attempted
+                            },
+                            dial_ip: String::new(),
+                            tcp_ms,
+                            probe_ms: None,
+                            observed_country: String::new(),
+                            colo: String::new(),
+                            exit_ip: String::new(),
+                            ok: false,
+                            error: reason,
+                        }),
                     }
-                    Err((reason, _, _)) => {
-                        // The edge trace CANNOT succeed on a bare-IP candidate:
-                        // this hop is TLS passthrough (`relay::connect::open`,
-                        // SecureTransport::Off) and worker::Socket cannot set
-                        // SNI for an IP dial, so the handshake never completes
-                        // and EVERY candidate "fails" the trace — including
-                        // ones a real session proves good. Falling through
-                        // silently reported `ok: true` with an empty
-                        // country/exitIp, which reads as "verified ES" while
-                        // proving nothing. Keep the TCP verdict (unchanged) but
-                        // carry the reason, so the operator sees the exit
-                        // country is UNVERIFIED rather than absent by design.
-                        let unverified = super::api::unverified_reason(&reason);
-                        match probe_tcp_one(&endpoint.host, endpoint.port).await {
-                            Ok(t) => rows.push(Row {
-                                candidate,
-                                dial_ip: t.dial_ip,
-                                tcp_ms: Some(t.tcp_ms),
-                                probe_ms: None,
-                                observed_country: String::new(),
-                                colo: String::new(),
-                                exit_ip: String::new(),
-                                ok: true,
-                                error: unverified,
-                            }),
-                            Err((r2, attempted, tcp_ms)) => rows.push(Row {
-                                candidate: if attempted.is_empty() {
-                                    candidate
-                                } else {
-                                    attempted
-                                },
-                                dial_ip: String::new(),
-                                tcp_ms,
-                                probe_ms: None,
-                                observed_country: String::new(),
-                                colo: String::new(),
-                                exit_ip: String::new(),
-                                ok: false,
-                                error: r2,
-                            }),
-                        }
-                        continue;
-                    }
+                    continue;
+                }
+                match probe_one(&endpoint.host, endpoint.port).await {
+                    Ok(t) => rows.push(Row {
+                        candidate,
+                        dial_ip: t.dial_ip,
+                        tcp_ms: Some(t.tcp_ms),
+                        probe_ms: Some(t.probe_ms),
+                        observed_country: t.country,
+                        colo: t.colo,
+                        exit_ip: t.exit_ip,
+                        ok: true,
+                        error: String::new(),
+                    }),
+                    Err((reason, attempted, tcp_ms)) => rows.push(Row {
+                        candidate: if attempted.is_empty() {
+                            candidate
+                        } else {
+                            attempted
+                        },
+                        dial_ip: String::new(),
+                        tcp_ms,
+                        probe_ms: None,
+                        observed_country: String::new(),
+                        colo: String::new(),
+                        exit_ip: String::new(),
+                        ok: false,
+                        error: reason,
+                    }),
                 }
             }
-            match probe_tcp_one(&endpoint.host, endpoint.port).await {
-                Ok(t) => rows.push(Row {
-                    candidate,
-                    dial_ip: t.dial_ip,
-                    tcp_ms: Some(t.tcp_ms),
-                    probe_ms: None,
-                    observed_country: String::new(),
-                    colo: String::new(),
-                    exit_ip: String::new(),
-                    ok: true,
-                    error: String::new(),
-                }),
-                Err((reason, attempted, tcp_ms)) => rows.push(Row {
-                    candidate: if attempted.is_empty() {
-                        candidate
-                    } else {
-                        attempted
-                    },
-                    dial_ip: String::new(),
-                    tcp_ms,
-                    probe_ms: None,
-                    observed_country: String::new(),
-                    colo: String::new(),
-                    exit_ip: String::new(),
-                    ok: false,
-                    error: reason,
-                }),
-            }
-            continue;
-        }
-        match probe_one(&endpoint.host, endpoint.port).await {
-            Ok(t) => rows.push(Row {
-                candidate,
-                dial_ip: t.dial_ip,
-                tcp_ms: Some(t.tcp_ms),
-                probe_ms: Some(t.probe_ms),
-                observed_country: t.country,
-                colo: t.colo,
-                exit_ip: t.exit_ip,
-                ok: true,
-                error: String::new(),
-            }),
-            Err((reason, attempted, tcp_ms)) => rows.push(Row {
-                candidate: if attempted.is_empty() {
-                    candidate
-                } else {
-                    attempted
-                },
-                dial_ip: String::new(),
-                tcp_ms,
-                probe_ms: None,
-                observed_country: String::new(),
-                colo: String::new(),
-                exit_ip: String::new(),
-                ok: false,
-                error: reason,
-            }),
-        }
+            (i, rows)
+        }),
+    )
+    .buffer_unordered(POOL_TEST_CONCURRENCY)
+    .collect::<Vec<(usize, Vec<Row>)>>()
+    .await;
+    // buffer_unordered yields COMPLETION order. Restore pool order: the panel
+    // renders this list in the sequence the dial path will try.
+    probed.sort_unstable_by_key(|(i, _)| *i);
+    let mut rows = Vec::new();
+    for (_, mut r) in probed {
+        rows.append(&mut r);
     }
 
     #[derive(serde::Serialize)]
