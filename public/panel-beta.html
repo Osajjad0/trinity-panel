@@ -2214,42 +2214,65 @@ function renderCatalog() {
   function renderPoolSummary(detail, runtime) {
     const c = STATE.catalog || {};
     const rows = (detail || []).filter(Boolean);
-    const healthy = rows.filter((d) => d.healthy !== false && d.capability === "passthrough").length;
-    const limited = rows.filter((d) => d.capability && d.capability !== "passthrough").length;
+    const ready = rows.filter(isReady).length;
+    const limited = rows.filter((d) => classify(d).state === "limited").length;
+    const unavailable = rows.filter((d) => classify(d).state === "unavailable").length;
+    const unverified = rows.filter((d) => classify(d).state === "unverified").length;
     const measured = rows.filter((d) => met(d, "rttMs") !== null || met(d, "dlBps") !== null).length;
     const pct = rows.length ? Math.round((measured / rows.length) * 100) : 0;
 
     const mode = $("sum-mode");
     const cc = (OUTBOUND.catalogCountry || "").trim();
-    mode.textContent = cc ? cc.toUpperCase() : "Automatic";
-    mode.title = cc ? "Pinned to one location." : "Spread across all locations.";
+    const isAuto = !cc || cc.toUpperCase() === "AUTO";
+    mode.textContent = isAuto ? "Automatic" : cc.toUpperCase();
+    mode.title = isAuto
+      ? "Automatic: the best country the current measurements support."
+      : "Pinned to one location. Automatic is not used.";
 
-    const resolved = (runtime[0] ? countryOf(runtime[0], detail) : null)
+    // Automatic resolves server-side from the same evidence the dial path uses.
+    // Prefer that answer; the first runtime candidate is only a fallback read.
+    const auto = STATE.autoCountry;
+    const resolved = (cc ? "" : (auto && auto.country) || null)
+      || (runtime[0] ? countryOf(runtime[0], detail) : null)
       || (cc ? cc.toUpperCase() : null);
     const country = $("sum-country");
     // Two identical country chips read as a bug, so the second one only
     // appears when it actually disagrees with the pinned mode.
-    country.hidden = !resolved || resolved === cc.toUpperCase();
+    country.hidden = !resolved || (resolved === cc.toUpperCase() && !isAuto);
     country.textContent = resolved || "—";
-    country.title = "The location actually in effect.";
+    country.title = isAuto
+      ? "The country Automatic chose from the current evidence."
+      : "The location actually in effect.";
 
     const h = $("sum-healthy");
-    h.textContent = healthy + " ready";
-    h.className = "pool-chip" + (healthy ? " ok" : " warn");
+    h.textContent = ready + " ready";
+    h.className = "pool-chip" + (ready ? " ok" : " warn");
+    h.title = "Candidates that are unrestricted, currently healthy and freshly measured.";
 
+    // The honest mixture. Each count names its own reason, so a pool that is
+    // partly limited never reads as simply "not ready".
     const rest = $("sum-restricted");
-    const other = rows.length - healthy;
-    rest.hidden = other === 0;
-    rest.textContent = other ? other + " limited or unverified" : "";
+    const parts = [];
+    if (limited) parts.push(limited + " limited");
+    if (unavailable) parts.push(unavailable + " not healthy");
+    if (unverified) parts.push(unverified + " unverified");
+    rest.hidden = parts.length === 0;
+    rest.textContent = parts.join(" · ");
     rest.className = "pool-chip warn";
+    rest.title = "Limited = cannot reach every destination. Not healthy = failing now. Unverified = measurement too old.";
 
     // One honest sentence, and never a green light over a degraded pool.
     const st = $("sum-state");
     if (!rows.length) {
       st.textContent = c.fetchedAt ? "Waiting for the first refresh." : "No verified candidates yet.";
       st.className = "pool-sub warn";
-    } else if (!healthy) {
-      st.textContent = "No full-access candidate right now — every candidate is limited.";
+    } else if (!ready) {
+      // Name the actual blocker rather than assuming it is the capability.
+      const why = limited === rows.length ? "every candidate is limited"
+        : unavailable === rows.length ? "every candidate is failing"
+        : unverified === rows.length ? "every measurement is too old to trust"
+        : "none is both unrestricted and freshly healthy";
+      st.textContent = "No ready candidate right now — " + why + ".";
       st.className = "pool-sub warn";
     } else {
       st.textContent = "Pool ready. Measurements cover " + pct + "% of candidates" +
@@ -2354,12 +2377,15 @@ function renderCatalog() {
     }
     if (!filter) return true;
     const has = met(d, "rttMs") !== null || met(d, "dlBps") !== null || met(d, "successBp") !== null;
+    // Every status filter reads the SAME classifier as the row chip and the
+    // summary counts. The old "healthy" case was `!!d.healthy`, which counted
+    // stale and capability-restricted rows as healthy -- a third definition.
     switch (filter) {
-      case "measured": return has && !(d && d.stale);
-      case "stale": return !!(d && d.stale);
+      case "measured": return has && classify(d).state !== "unverified";
+      case "stale": return classify(d).state === "unverified";
       case "unmeasured": return !has;
-      case "limited": return !!(d && d.capability && d.capability !== "passthrough");
-      case "healthy": return !!(d && d.healthy);
+      case "limited": return classify(d).state === "limited";
+      case "healthy": return isReady(d);
       default: return true;
     }
   }
@@ -2437,31 +2463,66 @@ function renderCatalog() {
     });
   }
 
-  // The one visible status chip: health first, then the capability restriction
-  // that actually limits this candidate. Absent stays absent.
-  function statusFlag(d) {
+  // The one candidate classifier. Rows, the summary counts, the filters and the
+  // country badges all read this -- there is deliberately no second predicate,
+  // because two predicates is how "0 ready" and a row saying "Not healthy" end up
+  // on screen at the same time.
+  //
+  // Order is most-restrictive-first and is part of the contract:
+  //   limited -> unavailable -> degraded -> unverified -> healthy
+  // A capability restriction outranks a health verdict, because a candidate that
+  // cannot carry generic traffic is not "healthy" whatever its probe says.
+  function classify(d) {
     const cap = d.capability;
     if (cap && cap !== "passthrough") {
-      const f = el("span", { className: "cand-flag warn", textContent: "Limited" });
-      f.title = cap === "cf-relay"
-        ? "Limited: reaches Cloudflare-fronted sites only."
-        : cap === "sni-terminate"
-          ? "Limited: terminates TLS, no passthrough to other sites."
-          : "Limited: " + cap;
-      return f;
+      return {
+        state: "limited",
+        label: "Limited",
+        cls: "warn",
+        title: cap === "cf-relay"
+          ? "Limited: reaches Cloudflare-fronted sites only."
+          : cap === "sni-terminate"
+            ? "Limited: terminates TLS, no passthrough to other sites."
+            : "Limited: " + cap,
+      };
     }
     if (d.healthy === false) {
-      const f = el("span", { className: "cand-flag off", textContent: "Not healthy" });
-      if (d.reason) f.title = d.reason;
-      return f;
+      return {
+        state: "unavailable",
+        label: "Not healthy",
+        cls: "off",
+        title: d.reason || "Recent probes report this candidate failing.",
+      };
     }
     if (d.stale) {
-      const f = el("span", { className: "cand-flag warn", textContent: "Stale" });
       const age = fmtAge(d);
-      if (age) f.title = "Measurement is " + age + " old.";
-      return f;
+      return {
+        state: "unverified",
+        label: "Unverified",
+        cls: "warn",
+        title: (age ? "Measurement is " + age + " old. " : "") +
+          "Too old to count as current evidence.",
+      };
     }
-    return el("span", { className: "cand-flag ok", textContent: "Healthy" });
+    return { state: "healthy", label: "Healthy", cls: "ok", title: "" };
+  }
+
+  // Exposed for the browser battery: these two ARE the product contract for
+  // candidate status, so the test drives the shipped function, not a copy.
+  window.classify = classify;
+
+  // Only a healthy, unrestricted, non-stale candidate is "ready". Used by the
+  // summary counts, so the chip and the count can never disagree.
+  function isReady(d) {
+    return classify(d).state === "healthy";
+  }
+
+  // Row chip: the same verdict the summary counted.
+  function statusFlag(d) {
+    const v = classify(d);
+    const f = el("span", { className: "cand-flag " + v.cls, textContent: v.label });
+    if (v.title) f.title = v.title;
+    return f;
   }
 
   // Wire the controls once; renderPoolRows is safe to call repeatedly.

@@ -713,10 +713,23 @@ async fn own_session(ctx: OwnerContext) {
             || outbound_cfg.mode == crate::relay::outbound::ProxyMode::Pool)
     {
         if let Some(snapshot) = snapshot.as_ref() {
+            // Automatic resolves to ONE country through the persisted
+            // OutboundState: stable across sessions, and the resolved country
+            // is recorded instead of being re-spread on every request.
+            let state = crate::catalog::auto_state_for_dial(
+                env,
+                &outbound_cfg,
+                &known_state,
+                Some(snapshot),
+                worker::Date::now().as_millis(),
+            )
+            .await;
             if let Some(pool) = crate::catalog::pool_for_with_health(
                 &outbound_cfg,
                 Some(snapshot),
                 &known_state.geo,
+                worker::Date::now().as_millis(),
+                Some(&state),
             ) {
                 generated = pool
                     .into_iter()

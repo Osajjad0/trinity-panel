@@ -112,6 +112,44 @@ pub struct OutboundState {
     /// [`fallback_fresh`].
     #[serde(default)]
     pub fallback_at_ms: u64,
+    /// Country Automatic mode resolved to. Persisted here (not in the panel
+    /// config) so the mode stays `AUTO` in settings while the *decision* stays
+    /// stable across sessions and Worker restarts. Empty until the first
+    /// resolution. A manual country never consults this.
+    #[serde(default)]
+    pub auto_country: String,
+    /// When `auto_country` was last (re)resolved. Hysteresis: an ordinary score
+    /// wobble cannot move the country before [`AUTO_DWELL_MS`]; a collapsed pool
+    /// bypasses the dwell (see `auto_stable`).
+    #[serde(default)]
+    pub auto_resolved_at_ms: u64,
+}
+
+/// Minimum time Automatic holds a resolved country when the pool is still
+/// healthy. Long enough to stop per-scan oscillation, short enough to follow
+/// real deterioration on the next few scans.
+pub const AUTO_DWELL_MS: u64 = 6 * 3600 * 1000;
+
+/// How far a challenger must beat the incumbent before an ordinary switch.
+/// Stale incumbents lose their claim, so a fresh better country wins next scan.
+pub const AUTO_HYSTERESIS_BP: u32 = 1_000;
+
+impl OutboundState {
+    /// Whether the persisted Automatic choice still stands.
+    ///
+    /// `unusable` is the measured collapse of the incumbent's eligible pool --
+    /// that clears the dwell immediately, because holding a country that cannot
+    /// serve is worse than switching.
+    #[must_use]
+    pub fn auto_stable(&self, now_ms: u64, incumbent_usable: bool) -> bool {
+        if self.auto_country.is_empty() {
+            return false;
+        }
+        // An unusable incumbent is never stable, however fresh the decision is:
+        // holding a country that cannot serve is worse than switching. Only a
+        // still-usable country earns the dwell.
+        incumbent_usable && now_ms.saturating_sub(self.auto_resolved_at_ms) < AUTO_DWELL_MS
+    }
 }
 
 /// Accept both the current record shape and the older country-string shape.
@@ -364,6 +402,7 @@ impl OutboundState {
             fallback_primary: self.fallback_primary,
             fallback_active: self.fallback_active,
             fallback_at_ms: self.fallback_at_ms,
+            ..self
         }
     }
 
@@ -377,6 +416,7 @@ impl OutboundState {
             fallback_primary: self.fallback_primary,
             fallback_active: self.fallback_active,
             fallback_at_ms: self.fallback_at_ms,
+            ..self
         }
     }
 }

@@ -296,7 +296,9 @@ async fn state(req: &Request, env: &Env) -> Result<Response> {
     let outbound_state = load_outbound_state(env).await;
     let geo = outbound_state.geo.clone();
     let catalog = load_catalog_meta(env).await;
-    let catalog_hosts = catalog_hosts_for_state(env, &settings.outbound).await;
+    // The pool is resolved upstream and stored on the config; the panel view is
+    // a read, not a second selection point.
+    let catalog_hosts = settings.outbound.verified_catalog_candidates.clone();
     // V24.6 §3: the panel may pass its LOCAL location selection (?preview_country=XX).
     // The runtime preview then derives from the UI selection instead of the persisted
     // config, so the panel can never show "Location=US, source=DE". Read-only:
@@ -388,23 +390,17 @@ async fn runtime_candidates_for_state(
     // Trinity's worker-vantage verdicts gate eligibility here exactly as on
     // the dial path: the panel never shows a pool the runtime would refuse.
     let state = load_outbound_state(env).await;
-    crate::catalog::pool_for_with_health(cfg, Some(&snapshot), &state.geo)
-        .unwrap_or_default()
-        .into_iter()
+    crate::catalog::pool_for_with_health(
+        cfg,
+        Some(&snapshot),
+        &state.geo,
+        worker::Date::now().as_millis(),
+        Some(&state),
+    )
+    .unwrap_or_default()
+    .into_iter()
         .map(|e| format!("{}:{}", e.host, e.port))
         .collect()
-}
-
-/// The generated (healthy-only) catalog candidates for the panel view.
-#[cfg(target_arch = "wasm32")]
-async fn catalog_hosts_for_state(
-    env: &Env,
-    cfg: &crate::relay::outbound::OutboundConfig,
-) -> Vec<String> {
-    if !cfg.catalog_pool {
-        return Vec::new();
-    }
-    cfg.verified_catalog_candidates.clone()
 }
 
 /// The stored catalog sync metadata, or `None` when never synced. Tiny read:
@@ -489,7 +485,7 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
         let xhttp_path = var(env, "XHTTP_PATH");
         let geo = load_health(env).await;
         let catalog = load_catalog_meta(env).await;
-        let catalog_hosts = catalog_hosts_for_state(env, &stored.outbound).await;
+        let catalog_hosts = stored.outbound.verified_catalog_candidates.clone();
         let runtime_candidates =
             runtime_candidates_for_state(env, &stored.outbound).await;
         let snapshot = crate::catalog::stored(env).await;
@@ -545,7 +541,9 @@ async fn save(req: &mut Request, env: &Env) -> Result<Response> {
     // list on every save until the next reload.
     let geo = load_health(env).await;
     let catalog = load_catalog_meta(env).await;
-    let catalog_hosts = catalog_hosts_for_state(env, &settings.outbound).await;
+    // The pool is resolved upstream and stored on the config; the panel view is
+    // a read, not a second selection point.
+    let catalog_hosts = settings.outbound.verified_catalog_candidates.clone();
     let runtime_candidates = runtime_candidates_for_state(env, &settings.outbound).await;
     let snapshot = crate::catalog::stored(env).await;
     let country_quality = snapshot.as_ref().map(|snapshot| {
@@ -1676,7 +1674,13 @@ async fn pool_dial_test(req: &Request, env: &Env) -> Result<Response> {
     cfg.catalog_country = location.to_ascii_uppercase();
     let health_state = load_outbound_state(env).await;
     let Some(pool) =
-        crate::catalog::pool_for_with_health(&cfg, Some(&snapshot), &health_state.geo)
+        crate::catalog::pool_for_with_health(
+            &cfg,
+            Some(&snapshot),
+            &health_state.geo,
+            worker::Date::now().as_millis(),
+            Some(&health_state),
+        )
     else {
         return refuse(&format!(
             "No verified Proxy-IP candidates available for {location}."

@@ -780,6 +780,19 @@ fn short(revision: &str) -> String {
 /// Bounded maximum catalog candidates appended to a dial plan behind direct.
 pub const MAX_POOL_CANDIDATES: usize = 8;
 
+/// Borrowed default so the pure `pool_for_*` signatures stay `&`-only.
+static DEFAULT_STATE: crate::relay::outbound_state::OutboundState =
+    crate::relay::outbound_state::OutboundState {
+        preferred: None,
+        updated_at_ms: 0,
+        geo: std::collections::BTreeMap::new(),
+        fallback_primary: String::new(),
+        fallback_active: String::new(),
+        fallback_at_ms: 0,
+        auto_country: String::new(),
+        auto_resolved_at_ms: 0,
+    };
+
 /// AUTO spread size when a feed ships no auto list (verified feed).
 pub const MAX_AUTO_FALLBACK: usize = 48;
 
@@ -791,7 +804,13 @@ pub fn pool_for(
     cfg: &crate::relay::outbound::OutboundConfig,
     snapshot: Option<&Snapshot>,
 ) -> Option<Vec<Endpoint>> {
-    pool_for_with_health(cfg, snapshot, &std::collections::BTreeMap::new())
+    pool_for_with_health(
+        cfg,
+        snapshot,
+        &std::collections::BTreeMap::new(),
+        0,
+        None,
+    )
 }
 
 /// [`pool_for`], plus Trinity's own health evidence: candidates with a known
@@ -802,47 +821,38 @@ pub fn pool_for_with_health(
     cfg: &crate::relay::outbound::OutboundConfig,
     snapshot: Option<&Snapshot>,
     health: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
+    now_ms: u64,
+    state: Option<&crate::relay::outbound_state::OutboundState>,
 ) -> Option<Vec<Endpoint>> {
     // Pool enabled = the legacy flag OR Pool mode itself (mode drives it now).
     if !cfg.catalog_pool && cfg.mode != crate::relay::outbound::ProxyMode::Pool {
         return None;
     }
     let snapshot = snapshot?;
-    // Location semantics: "AUTO" = the deterministic spread, "" or unknown =
-    // no catalog contribution at all, an explicit code = that country ONLY.
+    // Location semantics: "" or unknown = no catalog contribution at all, an
+    // explicit code = that country ONLY, "AUTO" = the best country the measured
+    // evidence supports (resolved through `state`, so the decision is stable
+    // across sessions instead of being re-spread every call).
     let country = cfg.catalog_country.trim();
-    if country.is_empty() || country.eq_ignore_ascii_case("AUTO") {
-        if country.is_empty() {
-            return None;
-        }
-        // AUTO: the feed's deterministic spread; if the feed has none (the
-        // verified feed has no auto list), build one — 2 per country, sorted
-        // country order, capped at MAX_AUTO.
-        if snapshot.auto.is_empty() {
-            let mut spread: Vec<Endpoint> = Vec::new();
-            for list in snapshot.countries.values() {
-                spread.extend(list.iter().take(2).cloned());
-                if spread.len() >= crate::catalog::MAX_AUTO_FALLBACK {
-                    break;
-                }
-            }
-            spread.truncate(crate::catalog::MAX_AUTO_FALLBACK);
-            return Some(bounded(
-                spread.into_iter(),
-                health,
-                &snapshot.capability_by_endpoint,
-                &snapshot.quality_by_endpoint,
-                &snapshot.quality_metrics_by_endpoint,
-                false,
-            ));
-        }
+    if country.is_empty() {
+        return None;
+    }
+    if country.eq_ignore_ascii_case("AUTO") {
+        let state = state.unwrap_or(&DEFAULT_STATE);
+        let Some(cc) = resolve_auto_country(snapshot, health, now_ms, state) else {
+            // No country is provably usable. Returning an empty pool is honest
+            // and strict: the dial plan stays as it is rather than reaching for
+            // an arbitrary spread that may be entirely capability-blocked.
+            return Some(Vec::new());
+        };
+        let selected = snapshot.pool(Some(&cc))?;
         return Some(bounded(
-            snapshot.auto.iter().cloned(),
+            selected.iter().cloned(),
             health,
             &snapshot.capability_by_endpoint,
             &snapshot.quality_by_endpoint,
             &snapshot.quality_metrics_by_endpoint,
-            false,
+            cfg.enforces_location(),
         ));
     }
     let selected = snapshot.pool(Some(country))?;
@@ -854,6 +864,111 @@ pub fn pool_for_with_health(
         &snapshot.quality_metrics_by_endpoint,
         cfg.enforces_location(),
     ))
+}
+
+/// Resolve `AUTO` to one country from measured evidence. `None` when no country
+/// is provably usable -- callers then keep their pool empty rather than dial an
+/// arbitrary spread.
+///
+/// Ranking is tier-first (the same eligibility ladder the dropdown shows), so a
+/// fast capability-blocked country can never win. Inside a tier, the aggregate
+/// [`country_quality`] score orders; an unmeasured country scores unknown and
+/// loses to any measured peer. Hysteresis keeps the incumbent unless a challenger
+/// beats it by [`AUTO_HYSTERESIS_BP`] basis points AND the dwell has expired --
+/// unless the incumbent's pool has collapsed, which fails over immediately.
+#[must_use]
+pub fn resolve_auto_country(
+    snapshot: &Snapshot,
+    health: &std::collections::BTreeMap<String, crate::relay::outbound_state::Health>,
+    now_ms: u64,
+    state: &crate::relay::outbound_state::OutboundState,
+) -> Option<String> {
+    use crate::relay::outbound_state::AUTO_HYSTERESIS_BP;
+
+    let quality = country_quality(snapshot, health, now_ms);
+    // One predicate for "may Automatic dial this country": fully usable state,
+    // a measured quality score, and a non-empty pool behind it. cfOnly/limited/
+    // degraded/unavailable and unmeasured countries are all excluded here, so the
+    // ranking and the incumbent check can never disagree.
+    let eligible = |cc: &str| -> bool {
+        quality
+            .get(cc)
+            .is_some_and(|q| q.state == "full" && q.quality.is_some())
+            && snapshot.pool(Some(cc)).is_some_and(|p| !p.is_empty())
+    };
+
+    // Deterministic tie-break: equal scores resolve by ISO code, never by map
+    // iteration order.
+    let (top_score, top_cc) = {
+        let mut ranked: Vec<(u32, String)> = quality
+            .iter()
+            .filter(|(cc, _)| eligible(cc))
+            .map(|(cc, cq)| (cq.quality.unwrap_or(0), cc.clone()))
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        ranked.into_iter().next()?
+    };
+
+    let incumbent = state.auto_country.trim().to_ascii_uppercase();
+    if incumbent.is_empty() {
+        return Some(top_cc);
+    }
+    // A held incumbent that is still usable stays put until the dwell expires.
+    if state.auto_stable(now_ms, eligible(&incumbent)) {
+        return Some(incumbent);
+    }
+    // Dwell expired (or the pool collapsed): switch only on a real margin, so
+    // two near-equal countries cannot ping-pong.
+    let incumbent_score = quality.get(&incumbent).and_then(|q| q.quality).unwrap_or(0);
+    if incumbent_score.saturating_add(AUTO_HYSTERESIS_BP) >= top_score && eligible(&incumbent) {
+        return Some(incumbent);
+    }
+    Some(top_cc)
+}
+
+/// State to use for a dial when the mode is `AUTO`: resolves the country once
+/// and records it, so the next request reads the same decision instead of
+/// re-deriving it. Returns the incoming state unchanged for a manual country
+/// (manual stays pinned) and when there is no snapshot to judge.
+///
+/// The write is conditional: an unchanged resolution costs nothing, and a KV
+/// write only happens when the decision genuinely moves or expires.
+#[cfg(target_arch = "wasm32")]
+pub async fn auto_state_for_dial(
+    env: &worker::Env,
+    cfg: &crate::relay::outbound::OutboundConfig,
+    state: &crate::relay::outbound_state::OutboundState,
+    snapshot: Option<&Snapshot>,
+    now_ms: u64,
+) -> crate::relay::outbound_state::OutboundState {
+    use crate::relay::outbound_state::OutboundState;
+    if !cfg.catalog_country.trim().eq_ignore_ascii_case("AUTO") {
+        return state.clone();
+    }
+    let Some(snapshot) = snapshot else {
+        return state.clone();
+    };
+    let Some(cc) = resolve_auto_country(snapshot, &state.geo, now_ms, state) else {
+        return state.clone();
+    };
+    if state.auto_country == cc && state.auto_stable(now_ms, true) {
+        return state.clone();
+    }
+    let next = OutboundState {
+        auto_country: cc,
+        auto_resolved_at_ms: now_ms,
+        ..state.clone()
+    };
+    // Same binding, key and serializer the rest of the panel uses: one
+    // document, one writer.
+    // `put` returns the pending write (queued on the platform), not a future --
+    // match how the panel persists this same document.
+    if let Ok(kv) = env.kv("SETTINGS") {
+        if let Ok(body) = serde_json::to_string(&next) {
+            let _ = kv.put(crate::relay::outbound_state::KV_KEY, body);
+        }
+    }
+    next
 }
 
 /// Coarse region classification for fallback preference. ISO-2 codes only;
@@ -1917,6 +2032,233 @@ mod fallback_tests {
         }
         snap.capability_by_endpoint = per;
         snap
+    }
+
+    // ---- Automatic country selection: evidence, stability, failover ----
+    //
+    // These pin the behaviour the panel promises: Automatic picks the best
+    // sufficiently-evidenced eligible country, holds it against score wobble,
+    // fails over fast when the incumbent's pool collapses, and refuses to answer
+    // at all rather than promoting an unmeasured or capability-blocked country.
+
+    /// Snapshot with `n` passthrough endpoints per country.
+    fn auto_snap(pairs: &[(&str, usize)]) -> Snapshot {
+        // Every endpoint is passthrough; only the per-endpoint map decides
+        // eligibility, so the capability_counts total is irrelevant here.
+        let mut snap = Snapshot {
+            countries: std::collections::BTreeMap::new(),
+            capability_by_endpoint: std::collections::BTreeMap::new(),
+            ..snap_with_capabilities(&[])
+        };
+        for (cc, n) in pairs {
+            snap.countries.insert(
+                (*cc).to_owned(),
+                (0..*n)
+                    .map(|i| Endpoint {
+                        host: format!("10.{cc}.{i}.1").to_ascii_lowercase(),
+                        port: 443,
+                    })
+                    .collect(),
+            );
+            for i in 0..*n {
+                snap.capability_by_endpoint.insert(
+                    format!("10.{cc}.{i}.1:443").to_ascii_lowercase(),
+                    "passthrough".to_owned(),
+                );
+            }
+            // country_quality reads the passthrough census from
+            // capability_counts, not from the per-endpoint map.
+            snap.capability_counts.insert(
+                cc.to_string(),
+                BTreeMap::from([("passthrough".to_owned(), *n as u32)]),
+            );
+        }
+        snap
+    }
+
+    /// Health map marking one healthy endpoint per country.
+    fn auto_health(pairs: &[(&str, usize)], now_ms: u64) -> BTreeMap<String, Health> {
+        let mut h = BTreeMap::new();
+        for (cc, n) in pairs {
+            for i in 0..*n {
+                h.insert(
+                    format!("10.{}.{}.1:443", cc.to_ascii_lowercase(), i),
+                    Health {
+                        country: (*cc).to_owned(),
+                        ok: true,
+                        ok_count: 3,
+                        updated_at_ms: now_ms,
+                        ..Health::default()
+                    },
+                );
+            }
+        }
+        h
+    }
+
+    fn auto_state(cc: &str, at_ms: u64) -> crate::relay::outbound_state::OutboundState {
+        crate::relay::outbound_state::OutboundState {
+            auto_country: cc.to_owned(),
+            auto_resolved_at_ms: at_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn auto_picks_the_best_evidenced_country_not_a_geographic_spread() {
+        // GB has more endpoints but SG has the better aggregate quality; both
+        // are full. The decision must be ONE country, chosen on evidence.
+        let pairs = [("GB", 8usize), ("SG", 2), ("DE", 3)];
+        let snap = auto_snap(&pairs);
+        let now = 2_000u64;
+        let health = auto_health(&[("SG", 2), ("DE", 3)], now);
+        let mut h = health;
+        for i in 0..8 {
+            h.insert(
+                format!("10.gb.{i}.1:443"),
+                Health {
+                    country: "GB".to_owned(),
+                    ok: false,
+                    fail_count: 3,
+                    error: "tcp connect".to_owned(),
+                    updated_at_ms: now,
+                    ..Health::default()
+                },
+            );
+        }
+        let state = crate::relay::outbound_state::OutboundState::default();
+        let cc = resolve_auto_country(&snap, &h, now, &state).expect("a usable country exists");
+        assert!(
+            ["SG", "DE"].contains(&cc.as_str()),
+            "auto chose {cc}; a degraded GB must not win"
+        );
+        // And the pool is that ONE country, not a 2-per-country spread.
+        let cfg = crate::relay::outbound::OutboundConfig {
+            mode: crate::relay::outbound::ProxyMode::Pool,
+            catalog_country: "AUTO".into(),
+            ..Default::default()
+        };
+        let pool = pool_for_with_health(&cfg, Some(&snap), &h, now, Some(&state)).expect("pool");
+        assert!(!pool.is_empty());
+        let hosts: std::collections::BTreeSet<String> =
+            pool.iter().map(|e| e.host.to_ascii_lowercase()).collect();
+        // Automatic must commit to ONE country: every host carries the same
+        // 2-letter label. (The previous form compared `cc` with itself, so it
+        // asserted nothing -- a vacuous check that still passed.)
+        let mut labels: Vec<&str> = hosts
+            .iter()
+            .map(|h| {
+                let parts: Vec<&str> = h.split('.').collect();
+                assert_eq!(parts.len(), 4, "unexpected host shape {h}");
+                assert_eq!(parts[0], "10", "unexpected octet in {h}");
+                parts[1]
+            })
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            1,
+            "auto pool must be single-country, saw {hosts:?}"
+        );
+        assert_eq!(
+            labels[0], "de",
+            "auto must pick the highest-quality country, got {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn auto_never_promotes_an_unmeasured_or_blocked_country() {
+        let pairs = [("FI", 6usize), ("JO", 3)];
+        let mut snap = auto_snap(&pairs);
+        // FI is Cloudflare-fronted only: zero passthrough census, every endpoint
+        // cf-relay -> cfOnly, never an Automatic answer. (The census matters:
+        // `country_quality` grades `full` from pt>0 before it ever looks at the
+        // per-endpoint map, so a cf-relay label alone would not demote it.)
+        snap.capability_counts.insert(
+            "FI".to_owned(),
+            BTreeMap::from([("cf-relay".to_owned(), 6u32)]),
+        );
+        for i in 0..6 {
+            snap.capability_by_endpoint
+                .insert(format!("10.fi.{i}.1:443"), "cf-relay".to_owned());
+        }
+        let now = 2_000u64;
+        // Only FI has health evidence; JO is eligible but unmeasured.
+        let health = auto_health(&[("FI", 6)], now);
+        let state = crate::relay::outbound_state::OutboundState::default();
+        let cc = resolve_auto_country(&snap, &health, now, &state);
+        assert_eq!(
+            cc, None,
+            "no measured, unrestricted country exists -> stay unresolved, never invent one"
+        );
+    }
+
+    #[test]
+    fn hysteresis_holds_the_country_against_score_wobble() {
+        let pairs = [("AA", 4usize), ("BB", 4)];
+        let snap = auto_snap(&pairs);
+        let now = 2_000u64;
+        let health = auto_health(&pairs, now);
+        // BB currently leads; AA is the persisted incumbent from moments ago.
+        let state = auto_state("AA", now);
+        assert_eq!(
+            resolve_auto_country(&snap, &health, now, &state),
+            Some("AA".to_owned()),
+            "inside the dwell a better score must not move the country"
+        );
+    }
+
+    #[test]
+    fn persistent_failure_fails_over_without_waiting_for_the_dwell() {
+        let pairs = [("AA", 4usize), ("BB", 4)];
+        let snap = auto_snap(&pairs);
+        let now = 2_000u64;
+        let state = auto_state("AA", now); // just resolved, dwell not expired
+        // AA's whole pool now quarantined; BB is healthy.
+
+        let mut health = auto_health(&[("BB", 4)], now);
+        for i in 0..4 {
+            health.insert(
+                format!("10.aa.{i}.1:443"),
+                Health {
+                    country: "AA".to_owned(),
+                    ok: false,
+                    fail_count: 4,
+                    error: "tcp connect".to_owned(),
+                    updated_at_ms: now,
+                    ..Health::default()
+                },
+            );
+        }
+        assert_eq!(
+            resolve_auto_country(&snap, &health, now, &state),
+            Some("BB".to_owned()),
+            "a collapsed pool must fail over immediately, not sit in the dwell"
+        );
+    }
+
+    #[test]
+    fn manual_country_is_never_consulted_by_auto_resolution() {
+        let pairs = [("AA", 4usize)];
+        let snap = auto_snap(&pairs);
+        let now = 2_000u64;
+        let health = auto_health(&pairs, now);
+        // A manual country with a stale AUTO decision on record: the manual pool
+        // must be exactly that country, and the AUTO field must not leak in.
+        let cfg = crate::relay::outbound::OutboundConfig {
+            mode: crate::relay::outbound::ProxyMode::Pool,
+            catalog_country: "AA".into(),
+            ..Default::default()
+        };
+        let mut state = auto_state("ZZ", now); // stale, wrong country
+        state.auto_country = "ZZ".to_owned();
+        let pool =
+            pool_for_with_health(&cfg, Some(&snap), &health, now, Some(&state)).expect("pool");
+        assert!(!pool.is_empty());
+        assert!(pool
+            .iter()
+            .all(|e| e.host.to_ascii_lowercase().starts_with("10.aa.")));
     }
 
 // The country dropdown sorts by an eligibility TIER first and only then by
@@ -3214,9 +3556,14 @@ mod tests {
             catalog_country: "AUTO".into(),
             ..Default::default()
         };
-        let pool = pool_for(&cfg, Some(&snap)).expect("auto pool");
-        assert_eq!(pool.len(), 1);
-        assert_eq!(pool[0].host, "198.51.100.1");
+        // AUTO resolves on evidence. This fixture has no per-endpoint capability
+        // or health map, so nothing is provably "full": the honest answer is an
+        // empty pool, not an arbitrary spread.
+        let pool = pool_for(&cfg, Some(&snap)).expect("auto resolves to a pool slot");
+        assert!(
+            pool.is_empty(),
+            "unevidenced countries must not be auto-selected"
+        );
         // Case-insensitive.
         let cfg = crate::relay::outbound::OutboundConfig {
             catalog_country: "auto".into(),
@@ -3271,7 +3618,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pool = pool_for_with_health(&cfg, Some(&snap), &health).expect("pool");
+        let pool = pool_for_with_health(&cfg, Some(&snap), &health, 2_000, None).expect("pool");
         let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
         assert_eq!(hosts, vec!["9.9.9.3", "9.9.9.2", "9.9.9.1"]); // healthy, unknown, dead
     }
@@ -3300,8 +3647,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_fallback_spreads_across_verified_countries() {
-        // Verified-feed shape: no auto list, multiple country pools.
+    fn auto_without_evidence_returns_an_empty_pool_not_a_spread() {
+        // Verified-feed shape: no auto list, multiple country pools, and no
+        // capability/health evidence at all. The old behaviour spread 2-per-country
+        // here; the contract now is an EMPTY pool -- Automatic must not dial a
+        // country it cannot prove is usable.
         let feed = r#"{"schema_version":1,"upstream_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generated_at":"2026-09-21T03:00:00Z","counts":{},"countries":{"DE":[["198.51.100.1",443],["198.51.100.2",443],["198.51.100.3",443]],"FR":[["198.51.101.1",443]]}}"#;
         let snap = Snapshot::parse(feed.as_bytes()).expect("parses");
         let cfg = crate::relay::outbound::OutboundConfig {
@@ -3309,10 +3659,12 @@ mod tests {
             catalog_country: "AUTO".into(),
             ..Default::default()
         };
-        let pool = pool_for(&cfg, Some(&snap)).expect("auto pool");
-        // 2 per country, DE first (sorted), capped.
-        let hosts: Vec<&str> = pool.iter().map(|e| e.host.as_str()).collect();
-        assert_eq!(hosts, vec!["198.51.100.1", "198.51.100.2", "198.51.101.1"]);
+        let pool = pool_for(&cfg, Some(&snap)).expect("auto pool slot");
+        assert!(
+            pool.is_empty(),
+            "no evidence -> empty pool, got {:?}",
+            pool.iter().map(|e| e.host.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

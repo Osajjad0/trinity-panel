@@ -265,6 +265,10 @@ pub struct State {
     /// V24.4.4 runtime-only geographic failover (Pool mode). Empty strings =
     /// no fallback active. The configured location is never rewritten.
     pub fallback: Option<crate::panel::api::FallbackView>,
+    /// Automatic mode's current resolved country. `None` unless the mode is
+    /// AUTO, so a manual country never shows a competing resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_country: Option<AutoCountryView>,
     /// Per-country verified capability + quality (v1.9.5): the aggregation the
     /// country selector sorts and badges by. `None` = no catalog snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -322,6 +326,17 @@ pub struct FallbackView {
     pub primary: String,
     /// Temporarily active runtime location.
     pub active: String,
+}
+
+/// What Automatic resolved to, so the panel can show the decision separately
+/// from the mode. The setting stays `AUTO`; this is the country it picked.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoCountryView {
+    /// Resolved country, or empty when no country is provably usable.
+    pub country: String,
+    /// When the decision was last made (ms). Drives "chosen Nh ago".
+    pub resolved_at_ms: u64,
 }
 
 /// One proxy candidate as the panel should render it: what the operator
@@ -725,6 +740,31 @@ pub fn state(
         runtime_candidates: runtime_candidates.to_vec(),
         runtime_detail: candidate_details(runtime_candidates, snapshot, geo, now_s),
         fallback,
+        // Automatic's decision is derived here from the same snapshot and health
+        // evidence the dial path uses, so the panel never shows a different
+        // country than the one actually dialed. Only for AUTO; a manual country
+        // has no resolution to show.
+        auto_country: if settings
+            .outbound
+            .catalog_country
+            .trim()
+            .eq_ignore_ascii_case("AUTO")
+        {
+            snapshot.and_then(|snap| {
+                crate::catalog::resolve_auto_country(
+                    snap,
+                    geo,
+                    now_s.saturating_mul(1000),
+                    &crate::relay::outbound_state::OutboundState::default(),
+                )
+                .map(|country| AutoCountryView {
+                    country,
+                    resolved_at_ms: 0,
+                })
+            })
+        } else {
+            None
+        },
         country_quality,
         rev: settings.rev,
         common: settings.common.clone(),
