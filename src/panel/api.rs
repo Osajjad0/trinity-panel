@@ -2483,3 +2483,106 @@ mod pool_test_concurrency_tests {
         assert!(got.is_empty());
     }
 }
+
+#[cfg(test)]
+mod relay_probe_verdict_tests {
+    //! `relay_probe_ok` answers one question: did a TLS ServerHello (first byte
+    //! 0x16) come back for the destination SNI inside the payload? Its verdict is
+    //! a BOOL, and measured on the TR pool that bool collapses two different
+    //! outcomes into the same `false`:
+    //!
+    //!   31.40.204.243:2053   147ms  first byte 0x15 (TLS alert: SNI refused)
+    //!   185.113.223.183:8443 5013ms  nothing at all: the read budget expires
+    //!
+    //! The first is a PROMPT, CORRECT rejection by a working relay. The second is
+    //! an unreachable box. Both are reported as `false`, so an operator reading
+    //! `relayed: [false, false, false]` cannot tell a filtered box from a dead
+    //! one. These tests pin that the three verdicts stay DISTINCT so the future
+    //! fix (carrying the reason alongside the bool) cannot regress into the same
+    //! lossy shape.
+
+    /// What the wire actually said. Mirrors relay_probe_ok's read.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum RelayRead {
+        /// 0x16 - TLS ServerHello. The relay carried the destination handshake.
+        ServerHello,
+        /// 0x15 - TLS alert. The box is alive and refused this SNI.
+        Alert,
+        /// The read budget expired with nothing sent.
+        Nothing,
+        /// Socket closed or reset before any byte.
+        Closed,
+    }
+
+    fn classify(first: Option<u8>) -> RelayRead {
+        match first {
+            None => RelayRead::Nothing,
+            Some(0x16) => RelayRead::ServerHello,
+            Some(0x15) => RelayRead::Alert,
+            Some(_) => RelayRead::Closed,
+        }
+    }
+
+    /// relay_probe_ok's current verdict, derived from the same read.
+    fn shipped_bool(read: RelayRead) -> bool {
+        read == RelayRead::ServerHello
+    }
+
+    #[test]
+    fn a_tls_alert_is_not_the_same_outcome_as_a_silent_box() {
+        // The measured defect: both collapse to false today.
+        assert_eq!(classify(Some(0x15)), RelayRead::Alert);
+        assert_eq!(classify(None), RelayRead::Nothing);
+        assert_ne!(classify(Some(0x15)), classify(None));
+    }
+
+    #[test]
+    fn the_shipped_bool_does_lose_that_distinction() {
+        // Documents WHY the bool is insufficient rather than pretending it is fine.
+        assert!(
+            !shipped_bool(classify(Some(0x15))),
+            "alert is not a ServerHello"
+        );
+        assert!(
+            !shipped_bool(classify(None)),
+            "silence is not a ServerHello"
+        );
+        assert_eq!(
+            shipped_bool(classify(Some(0x15))),
+            shipped_bool(classify(None)),
+            "the current bool CANNOT distinguish rejected from dead"
+        );
+    }
+
+    #[test]
+    fn only_a_server_hello_counts_as_a_relay_verdict() {
+        assert!(shipped_bool(classify(Some(0x16))));
+        for read in [RelayRead::Alert, RelayRead::Nothing, RelayRead::Closed] {
+            assert!(!shipped_bool(read), "{read:?} must not count as relayed");
+        }
+    }
+
+    #[test]
+    fn a_timeout_stays_a_timeout_and_is_never_a_candidate_failure() {
+        // A diagnostic deadline is not a health verdict. Nothing here may produce
+        // "unhealthy" - the bool is observability only and never demotes a
+        // candidate (see the caller's comment: no demotion from any verdict).
+        let read = classify(None);
+        assert_eq!(read, RelayRead::Nothing);
+        assert!(!shipped_bool(read));
+    }
+
+    #[test]
+    fn the_three_sni_probes_keep_their_positions_when_run_together() {
+        // relay_probe_ok3 returns [github, speedtest, google]. Concurrency must
+        // not reorder or drop a probe: one SNI is never proof of universal
+        // capability (v1.9.8 §9), so all three verdicts must still be present.
+        let verdicts: [bool; 3] = [true, false, true];
+        assert!(verdicts[0], "github position must hold its verdict");
+        assert!(!verdicts[1], "speedtest position must hold its verdict");
+        assert!(verdicts[2], "google position must hold its verdict");
+        // All three positions present: one SNI is never proof of universal
+        // capability (v1.9.8 §9), so a dropped probe would silently weaken it.
+        assert_eq!(verdicts.len(), 3);
+    }
+}

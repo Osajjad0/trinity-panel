@@ -838,11 +838,13 @@ async fn probe_proxy_live(env: &Env) -> Result<Response> {
         // edge probe legitimately fails there while the relay path (no TLS
         // at the dial, destination SNI inside the payload) stays fully
         // testable. Observability only — no demotion from any verdict.
-        let relayed = Some([
-            relay_probe_ok(&host, port, &RELAY_GH_HELLO).await,
-            relay_probe_ok(&host, port, &RELAY_ST_HELLO).await,
-            relay_probe_ok(&host, port, &RELAY_GO_HELLO).await,
-        ]);
+        // The three SNIs are independent probes of the SAME box: a
+        // diversified sample, not a sequence. Awaiting them one after
+        // another meant a box that never answers cost 3x the read budget
+        // before the next candidate could start. Measured: the read budget is
+        // where a silent box burns its time. Run them together; array
+        // positions still mean [github, speedtest, google].
+        let relayed = Some(relay_probe_ok3(&host, port).await);
         results.push(Row {
             host,
             port,
@@ -957,6 +959,20 @@ const RELAY_GO_HELLO: [u8; 162] = [
 /// Budget: one 5 s handshake budget, a single 256-byte read. Bounded by
 /// construction: one socket, one round trip, no payload beyond the constant.
 #[cfg(target_arch = "wasm32")]
+/// The three diversified SNI relay verdicts for one box, probed together.
+/// Positions are [github, speedtest, google], unchanged from the serial form.
+/// One SNI is never proof of universal capability (v1.9.8 §9), so all three are
+/// still required; running them concurrently changes only the wall time.
+async fn relay_probe_ok3(host: &str, port: u16) -> [bool; 3] {
+    let (github, speedtest, google) = futures_util::future::join3(
+        relay_probe_ok(host, port, &RELAY_GH_HELLO),
+        relay_probe_ok(host, port, &RELAY_ST_HELLO),
+        relay_probe_ok(host, port, &RELAY_GO_HELLO),
+    )
+    .await;
+    [github, speedtest, google]
+}
+
 async fn relay_probe_ok(host: &str, port: u16, hello: &[u8]) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
