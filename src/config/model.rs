@@ -52,6 +52,10 @@ pub enum ClientTarget {
     SingBoxUpstream,
     Mihomo,
     NekoBox,
+    /// PattN (Windows) and PattNG (Android) - v2rayN/v2rayNG forks whose
+    /// share-link parsers carry XHTTP tuning in one `extra` JSON blob.
+    /// Verified from source in both forks; see `subscription::uri`.
+    PattN,
 }
 
 impl ClientTarget {
@@ -59,7 +63,7 @@ impl ClientTarget {
     #[must_use]
     pub const fn core(self) -> Core {
         match self {
-            Self::V2rayN | Self::V2rayNg => Core::Xray,
+            Self::V2rayN | Self::V2rayNg | Self::PattN => Core::Xray,
             Self::Hiddify | Self::Karing | Self::SingBoxUpstream | Self::NekoBox => Core::SingBox,
             Self::Mihomo => Core::Mihomo,
         }
@@ -77,7 +81,7 @@ impl ClientTarget {
     #[allow(clippy::match_same_arms)]
     pub const fn supports_xhttp(self) -> bool {
         match self {
-            Self::V2rayN | Self::V2rayNg | Self::Mihomo => true,
+            Self::V2rayN | Self::V2rayNg | Self::Mihomo | Self::PattN => true,
             // Ship patched sing-box forks carrying transport/v2rayxhttp.
             Self::Hiddify | Self::Karing => true,
             Self::SingBoxUpstream | Self::NekoBox => false,
@@ -94,6 +98,7 @@ impl ClientTarget {
             Self::SingBoxUpstream => "sing-box",
             Self::Mihomo => "mihomo / Clash Meta",
             Self::NekoBox => "NekoBox",
+            Self::PattN => "PattN / PattNG",
         }
     }
 }

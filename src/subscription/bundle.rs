@@ -246,13 +246,16 @@ pub fn client_from_name(name: &str) -> Option<ClientTarget> {
         "sing-box" => Some(ClientTarget::SingBoxUpstream),
         "mihomo" | "clash" | "clash-meta" | "clashmeta" => Some(ClientTarget::Mihomo),
         "nekobox" => Some(ClientTarget::NekoBox),
+        // PattN (Windows) and PattNG (Android) share one link dialect. Verified
+        // in both forks: PattN BaseFmt.cs ToUriQuery, PattNG FmtBase.kt.
+        "pattn" | "pattng" | "patt-n" | "patt-ng" => Some(ClientTarget::PattN),
         _ => None,
     }
 }
 
 /// Every client, for the panel's export list.
 #[must_use]
-pub const fn all_clients() -> [ClientTarget; 7] {
+pub const fn all_clients() -> [ClientTarget; 8] {
     [
         ClientTarget::V2rayN,
         ClientTarget::V2rayNg,
@@ -261,6 +264,7 @@ pub const fn all_clients() -> [ClientTarget; 7] {
         ClientTarget::SingBoxUpstream,
         ClientTarget::Mihomo,
         ClientTarget::NekoBox,
+        ClientTarget::PattN,
     ]
 }
 
@@ -275,6 +279,7 @@ pub const fn client_slug(target: ClientTarget) -> &'static str {
         ClientTarget::SingBoxUpstream => "sing-box",
         ClientTarget::Mihomo => "mihomo",
         ClientTarget::NekoBox => "nekobox",
+        ClientTarget::PattN => "pattn",
     }
 }
 
@@ -335,6 +340,37 @@ mod tests {
     }
 
     #[test]
+    /// The dedicated PattN/PattNG target must be selectable by the slug the
+    /// panel sends and by the names the brief lists, or the export 400s.
+    #[test]
+    fn pattn_target_is_reachable_by_slug_and_name() {
+        assert_eq!(client_slug(ClientTarget::PattN), "pattn");
+        for name in ["pattn", "pattng", "patt-n", "patt-ng", "PattN", " PATTNG "] {
+            assert_eq!(client_from_name(name), Some(ClientTarget::PattN), "{name} must resolve");
+        }
+        // It must not shadow an existing target.
+        assert_ne!(client_from_name("xray"), Some(ClientTarget::PattN));
+        assert_eq!(client_from_name("pattnx"), None);
+    }
+
+    /// The dedicated target is additive: a WS node renders identically for
+    /// every other client, whatever that client supports. Uses WS because
+    /// upstream sing-box and NekoBox legitimately refuse XHTTP, and a test
+    /// that trips on that is testing the wrong thing.
+    #[test]
+    fn pattn_does_not_disturb_other_targets() {
+        let nodes = [ws_node("a")];
+        for target in all_clients() {
+            if target == ClientTarget::PattN {
+                continue;
+            }
+            let other = render(&nodes, target, Shape::ShareLinks, false, &Default::default())
+                .expect("renders");
+            assert!(!other.body.is_empty(), "{target:?} rendered nothing");
+            assert_eq!(other.included, 1, "{target:?} dropped a WS node");
+        }
+    }
+
     fn no_profile_renders_exactly_as_before() {
         let nodes = [xhttp_node("a"), xhttp_node("b")];
         let legacy = render(&nodes, ClientTarget::V2rayN, Shape::FullConfig, false, &Default::default())

@@ -33,21 +33,47 @@ pub fn to_uri(node: &Node, target: ClientTarget, enhanced: bool) -> Result<Strin
     gate(node, target, enhanced)?;
 
     match &node.protocol {
-        Protocol::Vless { uuid, flow } => Ok(vless(node, uuid, *flow, enhanced)),
-        Protocol::Trojan { password } => Ok(trojan(node, password, enhanced)),
-        Protocol::Vmess { uuid, cipher } => vmess(node, uuid, *cipher, enhanced),
+        Protocol::Vless { uuid, flow } => Ok(vless(node, uuid, *flow, enhanced, target)),
+        Protocol::Trojan { password } => Ok(trojan(node, password, enhanced, target)),
+        Protocol::Vmess { uuid, cipher } => vmess(node, uuid, *cipher, enhanced, target),
         Protocol::Shadowsocks { method, password } => {
             shadowsocks(node, method.wire_name(), password, enhanced)
         }
     }
 }
 
+/// The XHTTP tuning blob PattN and PattNG carry under `extra`.
+///
+/// Xray copies this blob into `xhttpSettings.extra`. These are Xray-core's own
+/// `xhttpSettings` field names, taken from `translate::xray`'s emitted block -
+/// NOT `sc*` query keys, which are a share-link convention no client reads
+/// except v2rayN's own dialect. Range-syntax and byte-count fields are strings
+/// even where they look numeric; Xray rejects a number there.
+///
+/// Every key here was confirmed present in the installed Xray 26.10.8 binary
+/// (its `sc*` fields are exactly: scMaxBufferedPosts, scMaxEachPostBytes,
+/// scMinPostsIntervalMs, scStreamUpServerSecs). `scMaxConcurrentPosts` is NOT
+/// one of them, which is why the blob carries only three keys.
+///
+/// Note `xray run -test` does not validate `xhttpSettings` contents - a bogus
+/// key there still passes - so `Configuration OK` is not proof for this blob.
+/// What proves it is the binary's own field table plus `translate::xray`'s
+/// matching output. Kept in one place because the same
+/// numbers are also emitted as `sc*` query keys for other clients, and the two
+/// must never drift apart.
+const XHTTP_EXTRA_TUNING: &str =
+    r#"{"xPaddingBytes":"100-1000","scMaxEachPostBytes":"1000000","scMinPostsIntervalMs":"0"}"#;
+
 /// Transport and security query parameters shared by VLESS and Trojan.
 ///
 /// Emitted in a stable order. Clients do not care, but a stable order means a
 /// regenerated subscription is byte-identical when nothing changed, which is
 /// what lets a user diff two links and see whether anything actually moved.
-fn common_params(node: &Node, enhanced: bool) -> Vec<(&'static str, String)> {
+fn common_params(
+    node: &Node,
+    enhanced: bool,
+    target: ClientTarget,
+) -> Vec<(&'static str, String)> {
     let mut p: Vec<(&'static str, String)> = Vec::new();
 
     let (net, transport_host, path, mode) = match &node.transport {
@@ -123,6 +149,35 @@ fn common_params(node: &Node, enhanced: bool) -> Vec<(&'static str, String)> {
     }
     if let Some(m) = mode {
         p.push(("mode", m.to_owned()));
+        if target == ClientTarget::PattN {
+            // PattN and PattNG read XHTTP tuning from ONE JSON blob under
+            // `extra` (BaseFmt.ToUriQuery -> TransportExtraItem.XhttpExtra ->
+            // V2rayOutboundService xhttpSettings.extra), not from `sc*` keys.
+            // Verified in both forks: PattN BaseFmt.cs `case nameof(
+            // ETransport.xhttp)` and PattNG FmtBase.kt `config.xhttpExtra =
+            // queryParam["extra"]`. Xray takes this blob verbatim as
+            // `xhttpSettings.extra`, so the keys are Xray's own names.
+            //
+            // Measured 2026-09-28 Phase 3B (fiber, 8 interleaved randomized
+            // rounds, fresh session per run, per-round direct controls, 10 MB
+            // POST): UL medians 512K 1.017 / 1M 1.362 / 1.5M 1.145 / 2M 0.996
+            // MB/s (direct same-window 1.89); 1M also leads DL (2.21 vs 1.90)
+            // and is the only large-chunk family with zero 100-continue
+            // stalls (2M had two, one a 120 s crawl). Paired same-window 1M
+            // beats 2M in 3/4. Cost: 1M doubles DO ops per uploaded byte vs 2M
+            // -- accepted for the +37% UL; 4 MB deadlocks outright (3/3). JEV
+            // decision engine on the full measurement table: 1M, confidence
+            // 0.975.
+            //
+            // 30ms pacing (scMinPostsIntervalMs=30) collapsed tunnelled upload
+            // to ~0.6 Mbps where the same path carries ~14 Mbps direct; 0
+            // pipelines POSTs and the server still guarantees ordering.
+            p.push((
+                "extra",
+                XHTTP_EXTRA_TUNING.to_owned(),
+            ));
+            return p;
+        }
         // Measured 2026-09-28 Phase 3B (fiber, 8 interleaved randomized rounds,
         // fresh session per run, per-round direct controls, 10 MB POST):
         // UL medians 512K 1.017 / 1M 1.362 / 1.5M 1.145 / 2M 0.996 MB/s
@@ -174,8 +229,8 @@ fn query(params: &[(&'static str, String)]) -> String {
 }
 
 /// `vless://uuid@host:port?params#label`
-fn vless(node: &Node, uuid: &str, flow: Flow, enhanced: bool) -> String {
-    let mut p = client_params(node, enhanced);
+fn vless(node: &Node, uuid: &str, flow: Flow, enhanced: bool, target: ClientTarget) -> String {
+    let mut p = client_params(node, enhanced, target);
     // VLESS requires an explicit encryption value; omitting it makes Xray
     // refuse the config outright rather than assume a default.
     p.insert(0, ("encryption", "none".to_owned()));
@@ -199,21 +254,25 @@ fn vless(node: &Node, uuid: &str, flow: Flow, enhanced: bool) -> String {
 /// Emit share-link params. Xray defaults XHTTP to packet-up when `mode` is absent,
 /// so omit `mode` here to avoid the malformed `x-phtml packet-up` shape observed
 /// during client imports.
-fn client_params(node: &Node, enhanced: bool) -> Vec<(&'static str, String)> {
-    let mut out = common_params(node, enhanced);
+fn client_params(
+    node: &Node,
+    enhanced: bool,
+    target: ClientTarget,
+) -> Vec<(&'static str, String)> {
+    let mut out = common_params(node, enhanced, target);
     out.retain(|(k, _)| *k != "mode");
     out
 }
 ///
 /// No `flow` parameter is ever emitted: Xray removed flow for Trojan and now
 /// hard-errors on any non-empty value, so a link carrying one fails to load.
-fn trojan(node: &Node, password: &str, enhanced: bool) -> String {
+fn trojan(node: &Node, password: &str, enhanced: bool, target: ClientTarget) -> String {
     format!(
         "trojan://{}@{}:{}?{}#{}",
         percent(password),
         host_for_uri(&node.server.address),
         node.server.port,
-        query(&client_params(node, enhanced)),
+        query(&client_params(node, enhanced, target)),
         fragment(&node.tag)
     )
 }
@@ -223,8 +282,10 @@ fn trojan(node: &Node, password: &str, enhanced: bool) -> String {
 /// The oddest of the four formats and the least specified — the field names
 /// are short, untyped, and several are strings that look like numbers. This
 /// follows what v2rayN emits, since that is what the ecosystem parses.
-fn vmess(node: &Node, uuid: &str, cipher: VmessCipher, enhanced: bool) -> Result<String, EmitError> {
-    let p: std::collections::HashMap<&str, String> = client_params(node, enhanced).into_iter().collect();
+fn vmess(node: &Node, uuid: &str, cipher: VmessCipher, enhanced: bool,
+    target: ClientTarget,) -> Result<String, EmitError> {
+    let p: std::collections::HashMap<&str, String> =
+        client_params(node, enhanced, target).into_iter().collect();
 
     // Auto must name a real AEAD: sing-box-based importers (Hiddify, Karing,
     // NekoBox) turn scy=auto into VMess security 0x05 (none) on the wire —
@@ -400,6 +461,64 @@ mod tests {
     }
 
     #[test]
+    /// The whole point of the PattN target: its parser reads XHTTP tuning from
+    /// the `extra` JSON blob, not from `sc*` query keys. Verified in both
+    /// forks - PattN `BaseFmt.ToUriQuery` writes `extra` from
+    /// `TransportExtraItem.XhttpExtra`, PattNG `FmtBase.kt` reads
+    /// `queryParam["extra"]`. Xray takes that blob verbatim as
+    /// `xhttpSettings.extra`.
+    #[test]
+    fn pattn_links_carry_xhttp_tuning_in_the_extra_blob() {
+        let n = node(Protocol::Vless { uuid: "abc-123".into(), flow: Flow::None }, xhttp());
+        let uri = to_uri(&n, ClientTarget::PattN, false).expect("emits");
+
+        assert!(uri.contains("type=xhttp"), "transport must still be xhttp");
+        // `mode` is deliberately absent from every link (client_params strips
+        // it: a malformed `x-phtml packet-up` import was observed). Not added
+        // back here - that is a separate, verified concern.
+        assert!(uri.contains("extra="), "PattN/PattNG carry tuning under extra");
+        // The sc* keys are unreadable to these clients: emitting them would
+        // look configured while silently running Xray defaults.
+        for dead in ["scMaxEachPostBytes=", "scMaxConcurrentPosts=", "scMinPostsIntervalMs="] {
+            assert!(!uri.contains(dead), "{dead} is ignored by PattN/PattNG");
+        }
+        let blob = uri.split("extra=").nth(1).expect("extra present").split('#').next().expect("no fragment yet");
+        // `extra` is percent-encoded by the shared `percent()` helper.
+        let decoded = blob
+            .replace("%3A", ":")
+            .replace("%2C", ",")
+            .replace("%22", "\"");
+        // The blob must match what translate::xray emits into xhttpSettings,
+        // or a PattN node would run different tuning from a Full Normal one.
+        for key in ["xPaddingBytes", "scMaxEachPostBytes", "scMinPostsIntervalMs"] {
+            assert!(decoded.contains(key), "the blob must carry {key}: {decoded}");
+        }
+        assert!(decoded.contains("1000000"), "same 1 MB post size as the config path");
+        assert!(decoded.contains("\"scMinPostsIntervalMs\":\"0\""), "0 pipelines POSTs");
+    }
+
+    /// Every other client keeps the sc* keys exactly as before: this target is
+    /// additive and must not move a byte of existing output.
+    #[test]
+    fn non_pattn_clients_keep_the_sc_query_keys() {
+        let n = node(Protocol::Vless { uuid: "abc-123".into(), flow: Flow::None }, xhttp());
+        for target in [ClientTarget::V2rayN, ClientTarget::V2rayNg, ClientTarget::Mihomo] {
+            let uri = to_uri(&n, target, false).expect("emits");
+            assert!(uri.contains("scMaxEachPostBytes=1000000"), "{target:?} lost its sc keys");
+            assert!(uri.contains("scMaxConcurrentPosts=10"), "{target:?} lost its sc keys");
+            assert!(!uri.contains("extra="), "{target:?} must not gain an extra blob");
+        }
+    }
+
+    /// PattN is Xray-capable in this panel, so XHTTP must import and the
+    /// Xray-only fragment gate stays available to it.
+    #[test]
+    fn pattn_is_an_xray_capable_target() {
+        assert_eq!(ClientTarget::PattN.core(), crate::config::model::Core::Xray);
+        assert!(ClientTarget::PattN.supports_xhttp());
+        assert_eq!(ClientTarget::PattN.name(), "PattN / PattNG");
+    }
+
     fn vless_link_has_the_shape_clients_expect() {
         let n = node(Protocol::Vless { uuid: "abc-123".into(), flow: Flow::None }, xhttp());
         let uri = to_uri(&n, ClientTarget::V2rayN, false).expect("emits");

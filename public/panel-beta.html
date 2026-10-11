@@ -1382,6 +1382,7 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
           Full Normal adds Iran bypass rules. It needs the app's GeoIP/GeoSite
           data files (<code>geoip.dat</code> and <code>geosite.dat</code>);
           Xray apps normally keep those up to date themselves.
+          Share-link shapes carry nodes only — apply Iran routing in the app.
         </div>
         <textarea id="export-body" readonly spellcheck="false"></textarea>
       </div>
@@ -3380,7 +3381,7 @@ $("save").onclick = async () => {
 // so the selector is hidden rather than silently ignored.
 // Slugs must match what `bundle::client_from_name` accepts: the panel's export
 // list sends "xray" and "v2rayng".
-const XRAY_EXPORT_SLUGS = new Set(["xray", "v2rayn", "v2rayng"]);
+const XRAY_EXPORT_SLUGS = new Set(["xray", "v2rayn", "v2rayng", "pattn"]);
 function syncExportProfile() {
   const slug = $("export-client").value;
   const xray = XRAY_EXPORT_SLUGS.has(slug);
