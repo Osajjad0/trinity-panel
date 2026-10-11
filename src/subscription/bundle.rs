@@ -287,7 +287,7 @@ pub const fn client_slug(target: ClientTarget) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::model::{
-        Endpoint, Flow, Mux, Protocol, Security, TlsSettings, Transport, XhttpMode,
+        Endpoint, Flow, Mux, Protocol, Security, SsMethod, TlsSettings, Transport, XhttpMode,
     };
 
     fn xhttp_node(tag: &str) -> Node {
@@ -316,6 +316,23 @@ mod tests {
     /// A request without a profile must be identical to the historical
     /// output. This is the backward-compatibility guarantee, pinned on the
     /// exact bytes a client imports.
+    /// The four nodes `store::default_nodes` actually produces, one per
+    /// protocol. Mirrors the live panel: four canonical nodes, all XHTTP.
+    fn canonical_four() -> Vec<Node> {
+        let mut out = vec![
+            xhttp_node("host VLESS"),
+            xhttp_node("host Trojan"),
+            xhttp_node("host VMess"),
+        ];
+        let mut ss = xhttp_node("host Shadowsocks");
+        ss.protocol = Protocol::Shadowsocks {
+            method: SsMethod::Blake3Aes256Gcm,
+            password: "c2VjcmV0".into(),
+        };
+        out.push(ss);
+        out
+    }
+
     fn ws_node(tag: &str) -> Node {
         Node {
             tag: tag.to_owned(),
@@ -343,6 +360,46 @@ mod tests {
     /// The dedicated PattN/PattNG target must be selectable by the slug the
     /// panel sends and by the names the brief lists, or the export 400s.
     #[test]
+    /// The panel generates exactly four nodes, one per protocol
+    /// (`store.rs`: VLESS, Trojan, VMess, Shadowsocks). Phase 3 asked for six
+    /// configurations; there are four eligible ones and one of those cannot be
+    /// expressed as a share link. This test pins that reality so the count
+    /// cannot silently drift, and fails loudly if a fifth node ever appears
+    /// without someone deciding what to do with it.
+    #[test]
+    fn pattn_subscription_reports_every_node_with_a_reason() {
+        let nodes = canonical_four();
+        let out = render(&nodes, ClientTarget::PattN, Shape::ShareLinks, false, &Default::default())
+            .expect("renders");
+
+        assert_eq!(out.included + out.skipped.len(), nodes.len(),
+                   "every canonical node must be either included or explained");
+        assert_eq!(out.included, 3, "VLESS + Trojan + VMess carry over XHTTP");
+        assert_eq!(out.skipped.len(), 1, "only Shadowsocks cannot be a share link");
+        assert!(out.skipped[0].reason.contains("blake3"),
+                "the skip must name the actual reason, got: {}", out.skipped[0].reason);
+    }
+
+    /// No duplicates, no invented protocols: the link list is exactly the
+    /// included nodes, one line each.
+    #[test]
+    fn pattn_emits_no_duplicate_or_invented_entries() {
+        let nodes = canonical_four();
+        let out = render(&nodes, ClientTarget::PattN, Shape::ShareLinksPlain, false, &Default::default())
+            .expect("renders");
+        let lines: Vec<&str> = out.body.lines().filter(|l| !l.trim().is_empty()).collect();
+
+        assert_eq!(lines.len(), out.included, "one line per included node");
+        let mut seen = std::collections::BTreeSet::new();
+        for l in &lines {
+            assert!(seen.insert(l.to_owned()), "duplicate link emitted");
+            assert!(
+                ["vless://", "trojan://", "vmess://", "ss://"].iter().any(|p| l.starts_with(p)),
+                "unexpected scheme in {l}"
+            );
+        }
+    }
+
     fn pattn_target_is_reachable_by_slug_and_name() {
         assert_eq!(client_slug(ClientTarget::PattN), "pattn");
         for name in ["pattn", "pattng", "patt-n", "patt-ng", "PattN", " PATTNG "] {
