@@ -61,6 +61,9 @@ pub fn to_uri(node: &Node, target: ClientTarget, enhanced: bool) -> Result<Strin
 /// matching output. Kept in one place because the same
 /// numbers are also emitted as `sc*` query keys for other clients, and the two
 /// must never drift apart.
+/// The query-key name PattN/PattNG use for the tuning blob.
+const XHTTP_EXTRA_KEY: &str = "extra";
+
 const XHTTP_EXTRA_TUNING: &str =
     r#"{"xPaddingBytes":"100-1000","scMaxEachPostBytes":"1000000","scMinPostsIntervalMs":"0"}"#;
 
@@ -319,6 +322,15 @@ fn vmess(node: &Node, uuid: &str, cipher: VmessCipher, enhanced: bool,
         "alpn": p.get("alpn").cloned().unwrap_or_default(),
         "fp": p.get("fp").cloned().unwrap_or_default(),
     });
+    // This object enumerates keys, so a transport setting that only exists in
+    // `p` would be dropped here. The XHTTP tuning blob is exactly that case:
+    // vmess:// carries net=xhttp but has no `sc*` query keys of its own, so
+    // without this line a PattN vmess node would import and then silently run
+    // Xray's default posting instead of the measured 1 MB / 0 pacing.
+    let mut obj = obj;
+    if let Some(extra) = p.get(XHTTP_EXTRA_KEY) {
+        obj[XHTTP_EXTRA_KEY] = serde_json::Value::String(extra.clone());
+    }
 
     let json = serde_json::to_string(&obj).map_err(|e| EmitError::Serialisation(e.to_string()))?;
     Ok(format!("vmess://{}", base64(json.as_bytes())))
@@ -508,6 +520,39 @@ mod tests {
             assert!(uri.contains("scMaxConcurrentPosts=10"), "{target:?} lost its sc keys");
             assert!(!uri.contains("extra="), "{target:?} must not gain an extra blob");
         }
+    }
+
+    /// The same gap exists on the vmess carrier: `net=xhttp` there is just a
+    /// string, so the blob is the only way the tuning survives the import.
+    /// Decoded independently of our own encoder, like the test above.
+    #[test]
+    fn pattn_vmess_links_carry_the_extra_blob() {
+        let n = node(
+            Protocol::Vmess { uuid: "uid".into(), cipher: VmessCipher::Auto },
+            xhttp(),
+        );
+        let uri = to_uri(&n, ClientTarget::PattN, false).expect("emits");
+        let b64 = uri.strip_prefix("vmess://").expect("has scheme");
+        let b64 = b64.split('#').next().expect("no fragment");
+
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let (mut acc, mut bits) = (0u32, 0u32);
+        let mut out = Vec::new();
+        for c in b64.bytes().filter(|&c| c != b'=') {
+            let v = alphabet.iter().position(|&x| x == c).unwrap_or(0) as u32;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        let json: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+
+        assert_eq!(json["net"], "xhttp");
+        let extra = json["extra"].as_str().expect("extra must be present");
+        assert!(extra.contains("scMaxEachPostBytes"), "real blob, not a placeholder: {extra}");
+        assert!(extra.contains("scMinPostsIntervalMs"));
     }
 
     /// PattN is Xray-capable in this panel, so XHTTP must import and the
