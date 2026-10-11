@@ -1368,10 +1368,21 @@ button.primary:is(:hover,:focus-visible):not(:disabled)::after{transform:transla
               <option value="config">Full configuration file</option>
             </select>
           </div>
+          <div style="min-width:200px;flex:1" id="export-profile-wrap" hidden>
+            <select id="export-profile" title="Xray JSON export profile">
+              <option value="normal">Normal</option>
+              <option value="full-normal">Full Normal (Iran routing)</option>
+            </select>
+          </div>
           <button type="button" id="export-run">Show</button>
           <button type="button" id="export-copy">Copy</button>
         </div>
         <div id="export-note" class="muted"></div>
+        <div id="export-profile-note" class="muted" style="margin:.3rem 0 0" hidden>
+          Full Normal adds Iran bypass rules. It needs the app's GeoIP/GeoSite
+          data files (<code>geoip.dat</code> and <code>geosite.dat</code>);
+          Xray apps normally keep those up to date themselves.
+        </div>
         <textarea id="export-body" readonly spellcheck="false"></textarea>
       </div>
     </details>
@@ -2836,6 +2847,11 @@ function renderClients() {
 
 
 
+$("export-client").onchange = syncExportProfile;
+$("export-shape").onchange = syncExportProfile;
+$("export-profile").onchange = syncExportProfile;
+syncExportProfile();
+
 $("link-client").onchange = renderLinks;
 
 function renderLinks() {
@@ -3364,12 +3380,30 @@ $("save").onclick = async () => {
 
 // ---- export preview --------------------------------------------------------
 
+// The profile applies only to Xray-executed clients. sing-box and Mihomo
+// carry different routing-asset formats and are left at Normal in this phase,
+// so the selector is hidden rather than silently ignored.
+const XRAY_EXPORT_SLUGS = new Set(["v2rayn", "v2rayng"]);
+function syncExportProfile() {
+  const slug = $("export-client").value;
+  const xray = XRAY_EXPORT_SLUGS.has(slug);
+  const shape = $("export-shape").value;
+  const show = xray && shape === "config";
+  $("export-profile-wrap").hidden = !show;
+  $("export-profile-note").hidden =
+    !show || $("export-profile").value !== "full-normal";
+}
+
 $("export-run").onclick = async () => {
   const client = encodeURIComponent($("export-client").value);
   const shape = encodeURIComponent($("export-shape").value);
+  // Omitted for non-Xray targets, so their URLs stay exactly as they were.
+  const profile = XRAY_EXPORT_SLUGS.has($("export-client").value)
+    ? `&profile=${encodeURIComponent($("export-profile").value)}`
+    : "";
   $("export-note").textContent = "";
   try {
-    const out = await send(`export?client=${client}&shape=${shape}`);
+    const out = await send(`export?client=${client}&shape=${shape}${profile}`);
     $("export-body").value = out.body;
     const skipped = out.skipped.map((s) => `${s.tag}: ${s.reason}`).join(" · ");
     $("export-note").textContent =

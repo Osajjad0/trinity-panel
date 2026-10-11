@@ -55,6 +55,35 @@ pub struct Bundle {
     pub included: usize,
 }
 
+/// Xray JSON export profiles.
+///
+/// `Normal` is the historical output, byte for byte. `FullNormal` adds the
+/// documented Iran bypass rules for Xray cores. Explicitly NOT mixed with
+/// `Shape`: it applies only to `Shape::FullConfig` for an Xray-executed
+/// target, and is ignored everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportProfile {
+    /// The historical output, unchanged.
+    #[default]
+    Normal,
+    /// Normal plus Iran-oriented routing rules (`xray::iran_rules`).
+    FullNormal,
+}
+
+impl ExportProfile {
+    /// Parse the `profile` query value. Unknown values are refused, never
+    /// guessed: an exporter pointed at a profile it cannot name would rather
+    /// get an error than a config it did not ask for.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "" | "normal" => Some(Self::Normal),
+            "full-normal" | "fullnormal" | "full_normal" => Some(Self::FullNormal),
+            _ => None,
+        }
+    }
+}
+
 /// Render `nodes` for `target` in `shape`.
 ///
 /// # Errors
@@ -67,11 +96,24 @@ pub fn render(
     enhanced: bool,
     common: &crate::panel::store::CommonSettings,
 ) -> Result<Bundle, EmitError> {
+    render_with_profile(nodes, target, shape, enhanced, common, ExportProfile::Normal)
+}
+
+/// Render with an explicit [`ExportProfile`]. The default-compatible entry is
+/// [`render`]; new callers that need a profile use this one.
+pub fn render_with_profile(
+    nodes: &[Node],
+    target: ClientTarget,
+    shape: Shape,
+    enhanced: bool,
+    common: &crate::panel::store::CommonSettings,
+    profile: ExportProfile,
+) -> Result<Bundle, EmitError> {
     match shape {
         Shape::ShareLinks | Shape::ShareLinksPlain => {
             Ok(share_links(nodes, target, shape == Shape::ShareLinks, enhanced))
         }
-        Shape::FullConfig => full_config(nodes, target, enhanced, common),
+        Shape::FullConfig => full_config(nodes, target, enhanced, common, profile),
     }
 }
 
@@ -107,6 +149,7 @@ fn full_config(
     target: ClientTarget,
     enhanced: bool,
     common: &crate::panel::store::CommonSettings,
+    profile: ExportProfile,
 ) -> Result<Bundle, EmitError> {
     let mut skipped = Vec::new();
     let mut usable = Vec::new();
@@ -128,8 +171,13 @@ fn full_config(
     // Emitters take the whole set, because a multi-node config is not a
     // concatenation of single-node ones: it needs one outbound list, one
     // selector group, and one route block referring to them.
+    // The profile reaches the Xray emitter only. sing-box and mihomo carry
+    // different routing-asset formats (`rule_set`, `geosite:ir`) and need their
+    // own compatibility design — they are deliberately left at Normal here.
     let emitted = match target.core() {
-        Core::Xray => xray::emit_nodes(&usable, target, enhanced, common)?,
+        Core::Xray => {
+            xray::emit_nodes(&usable, target, enhanced, common, profile == ExportProfile::FullNormal)?
+        }
         Core::SingBox => singbox::emit_nodes(&usable, target, enhanced, common)?,
         Core::Mihomo => mihomo::emit_nodes(&usable, target, enhanced, common)?,
     };
@@ -258,6 +306,144 @@ mod tests {
             chain_via: None,
             worker_served: true,
         }
+    }
+
+    /// A request without a profile must be identical to the historical
+    /// output. This is the backward-compatibility guarantee, pinned on the
+    /// exact bytes a client imports.
+    fn ws_node(tag: &str) -> Node {
+        Node {
+            tag: tag.to_owned(),
+            server: Endpoint { address: "example.com".into(), port: 443 },
+            protocol: Protocol::Vless {
+                uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
+                flow: Flow::None,
+            },
+            transport: Transport::WebSocket {
+                path: "/ws".into(),
+                host: None,
+                heartbeat_secs: 0,
+            },
+            security: Security::Tls(TlsSettings {
+                sni: Some("example.com".into()),
+                ..TlsSettings::default()
+            }),
+            mux: Mux::default(),
+            chain_via: None,
+            worker_served: false,
+        }
+    }
+
+    #[test]
+    fn no_profile_renders_exactly_as_before() {
+        let nodes = [xhttp_node("a"), xhttp_node("b")];
+        let legacy = render(&nodes, ClientTarget::V2rayN, Shape::FullConfig, false, &Default::default())
+            .expect("renders");
+        for profile in [ExportProfile::Normal] {
+            let explicit = render_with_profile(
+                &nodes,
+                ClientTarget::V2rayN,
+                Shape::FullConfig,
+                false,
+                &Default::default(),
+                profile,
+            )
+            .expect("renders");
+            assert_eq!(legacy.body, explicit.body, "explicit Normal changed the bytes");
+            assert_eq!(legacy.filename, explicit.filename);
+        }
+    }
+
+    /// Full Normal changes the routing block and nothing else.
+    #[test]
+    fn full_normal_changes_only_the_routing_block() {
+        let nodes = [xhttp_node("a"), xhttp_node("b")];
+        let normal = render(&nodes, ClientTarget::V2rayN, Shape::FullConfig, false, &Default::default())
+            .expect("renders");
+        let full = render_with_profile(
+            &nodes,
+            ClientTarget::V2rayN,
+            Shape::FullConfig,
+            false,
+            &Default::default(),
+            ExportProfile::FullNormal,
+        )
+        .expect("renders");
+
+        let (n, f): (serde_json::Value, serde_json::Value) = (
+            serde_json::from_str(&normal.body).expect("Normal is valid JSON"),
+            serde_json::from_str(&full.body).expect("Full Normal is valid JSON"),
+        );
+        assert_ne!(n["routing"], f["routing"], "Full Normal must add routing rules");
+        let mut n = n;
+        let mut f = f;
+        n["routing"] = serde_json::json!(null);
+        f["routing"] = serde_json::json!(null);
+        assert_eq!(n, f, "Full Normal touched something outside routing");
+    }
+
+    /// Non-Xray targets are untouched: a Full Normal request for sing-box and
+    /// Mihomo renders exactly the Normal bytes, because their routing assets
+    /// (`rule_set`, `geosite:ir`) are a separate compatibility design.
+    #[test]
+    fn non_xray_targets_ignore_the_profile() {
+        // A WS node: every core imports it. An XHTTP node would be refused
+        // outright by upstream sing-box and NekoBox, which tests transport
+        // support rather than the profile.
+        let nodes = [ws_node("a")];
+        for target in [
+            ClientTarget::Hiddify,
+            ClientTarget::Karing,
+            ClientTarget::SingBoxUpstream,
+            ClientTarget::NekoBox,
+            ClientTarget::Mihomo,
+        ] {
+            let normal = render(&nodes, target, Shape::FullConfig, false, &Default::default())
+                .expect("renders");
+            let full = render_with_profile(
+                &nodes,
+                target,
+                Shape::FullConfig,
+                false,
+                &Default::default(),
+                ExportProfile::FullNormal,
+            )
+            .expect("renders");
+            assert_eq!(normal.body, full.body, "{target:?} must not react to the profile");
+        }
+    }
+
+    /// A profile does not resurrect skipped-node reporting or change what is
+    /// included: the node set is decided before the profile is applied.
+    #[test]
+    fn skipped_nodes_are_reported_the_same_for_both_profiles() {
+        // Upstream sing-box never implemented XHTTP: that node is skipped with
+        // a reason instead of failing the whole export.
+        let nodes = vec![ws_node("good"), xhttp_node("bad")];
+        for profile in [ExportProfile::Normal, ExportProfile::FullNormal] {
+            let b = render_with_profile(
+                &nodes,
+                ClientTarget::SingBoxUpstream,
+                Shape::FullConfig,
+                false,
+                &Default::default(),
+                profile,
+            )
+            .expect("renders");
+            assert_eq!(b.included, 1, "{profile:?} included a broken node");
+            assert_eq!(b.skipped.len(), 1, "{profile:?} did not report the skip");
+        }
+    }
+
+    /// Unknown profile names are refused at the parse boundary rather than
+    /// silently downgraded to Normal.
+    #[test]
+    fn unknown_profile_names_are_refused() {
+        for name in ["turbo", "full", "norma", "full-normal-2", "geo"] {
+            assert_eq!(ExportProfile::from_name(name), None, "{name:?} must not parse");
+        }
+        assert_eq!(ExportProfile::from_name("normal"), Some(ExportProfile::Normal));
+        assert_eq!(ExportProfile::from_name("full-normal"), Some(ExportProfile::FullNormal));
     }
 
     #[test]

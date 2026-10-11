@@ -1063,17 +1063,22 @@ pub fn qr_subject<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Option
     }
 }
 
-/// Parse the query of an export request into a client and a shape.
+/// Parse the query of an export request into a client, a shape, and a profile.
+///
+/// `profile` is optional and defaults to [`bundle::ExportProfile::Normal`], so
+/// every export URL that worked before works identically without it.
 #[must_use]
 pub fn export_subject<'a>(
     pairs: impl Iterator<Item = (&'a str, &'a str)>,
-) -> Option<(ClientTarget, Shape)> {
+) -> Option<(ClientTarget, Shape, bundle::ExportProfile)> {
     let mut client = "";
     let mut shape = "";
+    let mut profile = "";
     for (k, v) in pairs {
         match k {
             "client" => client = v,
             "shape" => shape = v,
+            "profile" => profile = v,
             _ => {}
         }
     }
@@ -1084,7 +1089,8 @@ pub fn export_subject<'a>(
         "base64" => Shape::ShareLinks,
         _ => return None,
     };
-    Some((client, shape))
+    let profile = bundle::ExportProfile::from_name(profile)?;
+    Some((client, shape, profile))
 }
 
 #[cfg(test)]
@@ -1413,18 +1419,53 @@ mod tests {
 
     #[test]
     fn export_requests_name_a_client_and_a_shape() {
+        use crate::subscription::bundle::ExportProfile;
+        // No profile: identical to every previous export (Normal).
         assert_eq!(
             export_subject([("client", "mihomo"), ("shape", "config")].into_iter()),
-            Some((ClientTarget::Mihomo, Shape::FullConfig))
+            Some((ClientTarget::Mihomo, Shape::FullConfig, ExportProfile::Normal))
         );
         assert_eq!(
             export_subject([("client", "v2rayn"), ("shape", "links")].into_iter()),
-            Some((ClientTarget::V2rayN, Shape::ShareLinksPlain))
+            Some((ClientTarget::V2rayN, Shape::ShareLinksPlain, ExportProfile::Normal))
         );
         assert_eq!(export_subject([("client", "v2rayn")].into_iter()), None);
         assert_eq!(
             export_subject([("client", "v2rayn"), ("shape", "exe")].into_iter()),
             None
+        );
+        // Explicit Normal is the same as omitting the profile.
+        assert_eq!(
+            export_subject(
+                [("client", "v2rayn"), ("shape", "config"), ("profile", "normal")].into_iter()
+            ),
+            Some((ClientTarget::V2rayN, Shape::FullConfig, ExportProfile::Normal))
+        );
+        // Full Normal spellings.
+        for name in ["full-normal", "FullNormal", "full_normal", " FULL-NORMAL "] {
+            assert_eq!(
+                export_subject(
+                    [("client", "v2rayn"), ("shape", "config"), ("profile", name)].into_iter()
+                ),
+                Some((ClientTarget::V2rayN, Shape::FullConfig, ExportProfile::FullNormal)),
+                "profile {name:?} must parse"
+            );
+        }
+        // An unknown profile is refused, never guessed.
+        assert_eq!(
+            export_subject(
+                [("client", "v2rayn"), ("shape", "config"), ("profile", "turbo")].into_iter()
+            ),
+            None
+        );
+        // The profile is orthogonal to the shape: it rides along on links too,
+        // but the emitter ignores it there (share links have no routing block).
+        assert_eq!(
+            export_subject(
+                [("client", "v2rayn"), ("shape", "links"), ("profile", "full-normal")]
+                    .into_iter()
+            ),
+            Some((ClientTarget::V2rayN, Shape::ShareLinksPlain, ExportProfile::FullNormal))
         );
     }
 

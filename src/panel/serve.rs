@@ -609,19 +609,22 @@ struct Export {
 
 async fn export(req: &Request, env: &Env) -> Result<Response> {
     let pairs = query(req);
-    let Some((target, shape)) =
+    let Some((target, shape, profile)) =
         api::export_subject(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
     else {
         return refuse("That export could not be read.");
     };
 
     let settings = load_settings(env, &host_of(req)).await;
-    match bundle::render(
+    // `render_with_profile` with the default profile is `render`; a request
+    // without `profile=` is byte-identical to every previous export.
+    match bundle::render_with_profile(
         &settings.nodes,
         target,
         shape,
         settings.enhanced_reachability,
         &settings.common,
+        profile,
     ) {
         Ok(b) => json(&Export {
             body: b.body,

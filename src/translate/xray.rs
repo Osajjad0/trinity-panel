@@ -95,7 +95,7 @@ impl Emit for XrayEmitter {
     }
 
     fn emit(&self, node: &Node, target: ClientTarget) -> Result<Emitted, EmitError> {
-        emit_nodes(core::slice::from_ref(node), target, false, &Default::default())
+        emit_nodes(core::slice::from_ref(node), target, false, &Default::default(), false)
     }
 }
 
@@ -111,11 +111,15 @@ impl Emit for XrayEmitter {
 /// [`EmitError::Refused`] when the list is empty, when tags collide or are
 /// unusable, when the target is not executed by Xray, or when any node is
 /// rejected by [`gate`].
+///
+/// `iran` selects the Full Normal profile: the documented Iran bypass rules are
+/// added. `false` is Normal and must be byte-identical to the previous output.
 pub fn emit_nodes(
     nodes: &[Node],
     target: ClientTarget,
     enhanced: bool,
     common: &crate::panel::store::CommonSettings,
+    iran: bool,
 ) -> Result<Emitted, EmitError> {
     if target.core() != Core::Xray {
         return Err(EmitError::Refused(vec![format!(
@@ -174,7 +178,7 @@ pub fn emit_nodes(
         "dns": dns_block(common),
         "inbounds": [ socks_inbound(common.lan_access, common.fakedns) ],
         "outbounds": outbounds,
-        "routing": routing(nodes, common),
+        "routing": routing(nodes, common, iran),
     });
     // fakedns rides at the top level and only when enabled.
     let root = if common.fakedns {
@@ -329,6 +333,31 @@ fn dns_block(common: &crate::panel::store::CommonSettings) -> Value {
     } })
 }
 
+/// Iran-oriented bypass rules, emitted only for the Full Normal profile.
+///
+/// Order is deliberate: they sit AFTER the private-range rule (which must win,
+/// it never needs a geodata file) and BEFORE the primary-node pin rule, so they
+/// only re-route IR traffic that would otherwise reach the pin. The two rules
+/// select on different keys — domains vs IPs — so neither duplicates the other,
+/// and neither overlaps the pin rule's inbound-only selector.
+fn iran_rules() -> [serde_json::Value; 2] {
+    [
+        // Iranian domains bypass the proxy. Requires `geosite.dat`; both tags
+        // exist in the v2fly domain-list-community release.
+        json!({
+            "type": "field",
+            "domain": ["geosite:category-ir", "geosite:category-ads-ir"],
+            "outboundTag": DIRECT_TAG
+        }),
+        // Iranian IPs bypass the proxy. Requires `geoip.dat` (`geoip:ir`).
+        json!({
+            "type": "field",
+            "ip": ["geoip:ir"],
+            "outboundTag": DIRECT_TAG
+        }),
+    ]
+}
+
 /// Routing: keep local traffic local, and fan out across nodes when there are
 /// several.
 ///
@@ -336,7 +365,11 @@ fn dns_block(common: &crate::panel::store::CommonSettings) -> Value {
 /// because the latter needs `geoip.dat` next to the binary, and a config that
 /// fails to load on a bare install is worse than one carrying a handful of
 /// extra lines.
-fn routing(nodes: &[Node], common: &crate::panel::store::CommonSettings) -> Value {
+fn routing(
+    nodes: &[Node],
+    common: &crate::panel::store::CommonSettings,
+    iran: bool,
+) -> Value {
     let mut rules = vec![json!({
         "type": "field",
         "ip": [
@@ -345,6 +378,10 @@ fn routing(nodes: &[Node], common: &crate::panel::store::CommonSettings) -> Valu
         ],
         "outboundTag": DIRECT_TAG
     })];
+
+    if iran {
+        rules.extend(iran_rules());
+    }
 
     let mut out = Map::new();
     // `AsIs` (Auto) is Xray's own default and today's behaviour; Prefer/Off
@@ -844,6 +881,87 @@ mod tests {
         &v["outbounds"][0]
     }
 
+    fn rules_of(v: &Value) -> Vec<&Value> {
+        v["routing"]["rules"].as_array().expect("rules is an array").iter().collect()
+    }
+
+    fn profile_config(iran: bool) -> Value {
+        let e = emit_nodes(&[xhttp_node()], ClientTarget::V2rayN, false, &Default::default(), iran)
+            .expect("emits");
+        parse(&e)
+    }
+
+    /// Normal is byte-identical to the previous output: `iran=false` adds
+    /// nothing anywhere. If this fails, the default profile changed behaviour.
+    #[test]
+    fn normal_adds_no_iran_rules() {
+        let v = profile_config(false);
+        assert_eq!(rules_of(&v).len(), 1, "single node: only the private-range rule");
+        assert!(v["routing"].get("balancers").is_none());
+        let text = serde_json::to_string(&v["routing"]).expect("serialises");
+        assert!(!text.contains("geoip:"), "no geodata dependency in Normal");
+        assert!(!text.contains("geosite:"), "no geodata dependency in Normal");
+    }
+
+    /// Full Normal adds exactly two rules in a fixed position and touches
+    /// nothing else. Valid JSON is already proven by `parse`.
+    #[test]
+    fn full_normal_adds_exactly_the_iran_bypass_rules() {
+        let v = profile_config(true);
+        let rules = rules_of(&v);
+        assert_eq!(rules.len(), 3, "private + IR-domains + IR-IPs");
+
+        // 0: the pre-existing private-range rule, unchanged.
+        assert_eq!(rules[0]["outboundTag"], "direct");
+        assert!(rules[0].get("domain").is_none());
+
+        // 1: Iranian domains bypass. Both tags were verified to exist in the
+        // v2fly domain-list-community release and to load in Xray 26.7.28
+        // against the real geosite.dat. There is no `category-ir-ads` tag: a
+        // config naming it resolves nothing and fails to load.
+        assert_eq!(rules[1]["outboundTag"], "direct");
+        assert_eq!(
+            rules[1]["domain"],
+            serde_json::json!(["geosite:category-ir", "geosite:category-ads-ir"]),
+            "both tags must exist in the shipped geosite.dat"
+        );
+
+        // 2: Iranian IPs bypass (`geoip:ir`, verified against geoip.dat).
+        assert_eq!(rules[2]["outboundTag"], "direct");
+        assert_eq!(rules[2]["ip"], serde_json::json!(["geoip:ir"]));
+    }
+
+    /// The Iran rules must not override proxy routing: the primary-node pin
+    /// still exists, still points at the first node, and still comes AFTER the
+    /// bypass rules, so it only ever sees non-IR traffic.
+    #[test]
+    fn full_normal_keeps_the_primary_pin_after_the_bypass_rules() {
+        let a = xhttp_node();
+        let b = Node { tag: "second".into(), ..xhttp_node() };
+        let e = emit_nodes(&[a, b], ClientTarget::V2rayN, false, &Default::default(), true)
+            .expect("two nodes are emittable");
+        let v = parse(&e);
+        let rules = rules_of(&v);
+        assert_eq!(rules.len(), 4, "private + 2 IR + pin");
+        let pin = rules.iter().find(|r| r.get("inboundTag").is_some()).expect("a pinning rule exists");
+        assert_eq!(pin["outboundTag"], json!("proxy"));
+        let pin_at = rules.iter().position(|r| r.get("inboundTag").is_some()).expect("pin");
+        let ir_at = rules.iter().position(|r| r.get("domain").is_some()).expect("ir rule");
+        assert!(pin_at > ir_at, "the pin must come after the IR bypass rules");
+        assert!(v["routing"].get("balancers").is_none());
+    }
+
+    /// No catch-all was introduced: every Full Normal rule selects on domain,
+    /// ip, or inbound. A rule with no selector would swallow all traffic.
+    #[test]
+    fn full_normal_has_no_catch_all_rule() {
+        for r in rules_of(&profile_config(true)) {
+            let has_selector =
+                r.get("domain").is_some() || r.get("ip").is_some() || r.get("inboundTag").is_some();
+            assert!(has_selector, "a rule without a selector is a catch-all: {r}");
+        }
+    }
+
     #[test]
     fn emits_the_legacy_transport_key_spellings() {
         // §9.1: `method` and `rawSettings` do not exist before v26.7.11.
@@ -994,7 +1112,7 @@ mod tests {
         // §9.8: a second member of vnext[] is a hard error, not a shorthand.
         let a = xhttp_node();
         let b = Node { tag: "second".into(), ..xhttp_node() };
-        let e = emit_nodes(&[a, b], ClientTarget::V2rayN, false, &Default::default()).expect("two nodes are emittable");
+        let e = emit_nodes(&[a, b], ClientTarget::V2rayN, false, &Default::default(), false).expect("two nodes are emittable");
         let v = parse(&e);
 
         let obs = v["outbounds"].as_array().expect("outbounds is an array");
@@ -1026,14 +1144,14 @@ mod tests {
     fn duplicate_and_reserved_tags_are_refused() {
         let dup = [xhttp_node(), xhttp_node()];
         assert!(matches!(
-            emit_nodes(&dup, ClientTarget::V2rayN, false, &Default::default()),
+            emit_nodes(&dup, ClientTarget::V2rayN, false, &Default::default(), false),
             Err(EmitError::Refused(_))
         ));
 
         for bad in ["direct", "socks-in", "  "] {
             let n = Node { tag: bad.into(), ..xhttp_node() };
             assert!(
-                matches!(emit_nodes(&[n], ClientTarget::V2rayN, false, &Default::default()), Err(EmitError::Refused(_))),
+                matches!(emit_nodes(&[n], ClientTarget::V2rayN, false, &Default::default(), false), Err(EmitError::Refused(_))),
                 "tag {bad:?} must be refused"
             );
         }
@@ -1045,7 +1163,7 @@ mod tests {
         let node = Node { chain_via: Some("hop".into()), ..xhttp_node() };
 
         // Hop present: no complaint.
-        let e = emit_nodes(&[hop, node.clone()], ClientTarget::V2rayN, false, &Default::default()).expect("emittable");
+        let e = emit_nodes(&[hop, node.clone()], ClientTarget::V2rayN, false, &Default::default(), false).expect("emittable");
         assert!(e.dropped.iter().all(|d| d.field != "chain_via"));
         let v = parse(&e);
         assert_eq!(
@@ -1170,7 +1288,7 @@ mod tests {
     #[test]
     fn an_empty_node_list_is_refused_rather_than_producing_an_inert_config() {
         assert!(matches!(
-            emit_nodes(&[], ClientTarget::V2rayN, false, &Default::default()),
+            emit_nodes(&[], ClientTarget::V2rayN, false, &Default::default(), false),
             Err(EmitError::Refused(_))
         ));
     }
@@ -1248,7 +1366,7 @@ mod tests {
         ];
 
         for (name, nodes) in samples {
-            emit_nodes(&nodes, ClientTarget::V2rayN, false, &Default::default())
+            emit_nodes(&nodes, ClientTarget::V2rayN, false, &Default::default(), false)
                 .unwrap_or_else(|err| panic!("{name} should emit: {err}"));
         }
     }
@@ -1285,7 +1403,7 @@ mod enhanced_tests {
     }
 
     fn enhanced(n: Node) -> Emitted {
-        emit_nodes(&[n], ClientTarget::V2rayN, true, &Default::default()).expect("enhanced should emit")
+        emit_nodes(&[n], ClientTarget::V2rayN, true, &Default::default(), false).expect("enhanced should emit")
     }
 
     fn parse(e: &Emitted) -> Value {
@@ -1383,7 +1501,7 @@ mod enhanced_tests {
     #[test]
     fn enhanced_on_and_off_differ_only_in_the_enhanced_fields() {
         let off: Value = serde_json::from_str(
-            &emit_nodes(&[node()], ClientTarget::V2rayN, false, &Default::default())
+            &emit_nodes(&[node()], ClientTarget::V2rayN, false, &Default::default(), false)
                 .expect("off emits")
                 .config,
         )
@@ -1430,7 +1548,7 @@ mod common_tests {
     }
 
     fn emit_with(common: &CommonSettings) -> Value {
-        let e = emit_nodes(&[node()], ClientTarget::V2rayN, false, common).expect("emits");
+        let e = emit_nodes(&[node()], ClientTarget::V2rayN, false, common, false).expect("emits");
         serde_json::from_str(&e.config).expect("valid json")
     }
 
